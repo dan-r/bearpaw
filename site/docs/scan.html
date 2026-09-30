@@ -89,7 +89,7 @@
         <ul>
           <li>
             <strong>The big line</strong> shows the channel's
-            <strong>alpha tag</strong> (its saved name, like "FIRE DISPATCH") if
+            <strong><a href="glossary.html#alpha-tag">alpha tag</a></strong> (its saved name, like "FIRE DISPATCH") if
             it has one. A channel with no name shows the
             <strong>frequency</strong> instead.
           </li>
@@ -153,7 +153,8 @@
         <p>
           <strong>Lockout</strong> tells the scanner to skip something, which is
           handy for a frequency you don't care about. The <strong>L/O</strong>
-          button opens a small menu with two choices:
+          button opens a small menu with two choices. Both act on the
+          <em>channel</em> you're stopped on.
         </p>
         <ul>
           <li>
@@ -171,7 +172,15 @@
           channel and whether it was enabled or cleared.
         </p>
         <p>
-          If you set a permanent lockout by mistake, choose
+          Note that both of these act on a <em>channel</em>. If a pager or a data
+          carrier keeps stopping a <em>search</em>, neither will help — a search
+          isn't on a channel. For that you want the scanner's avoid list: press
+          L/O on the scanner itself while a search is stopped on the frequency.
+          Bearpaw shows that list, and can remove entries from it, under
+          <a href="locked-channels.html">Device → Locked Channels</a>.
+        </p>
+        <p>
+          If you set a permanent <a href="glossary.html#lockout">lockout</a> by mistake, choose
           <strong>Permanent</strong> again while on that channel to clear it, or
           remove it from the
           <a href="locked-channels.html">Locked Channels</a> list on the
@@ -183,20 +192,27 @@
         </h3>
         <p>
           Along the bottom are ten buttons: <strong>1 through 9, then 0</strong>
-          (that last one is bank 10). Your 500 channels are split into ten
-          <a href="glossary.html#bank">banks</a> of 50, and these buttons turn
-          each bank on or off <em>for scanning</em>:
+          (that last one is bank 10). Your channels are split evenly into ten
+          <a href="glossary.html#bank">banks</a>, and these buttons turn each
+          bank on or off <em>for scanning</em>:
         </p>
         <ul>
           <li>
-            <strong>Highlighted</strong> (filled, amber number): the bank's 50
+            <strong>Highlighted</strong> (filled, amber number): that bank's
             channels are <strong>included</strong> in the scan.
           </li>
           <li>
-            <strong>Outlined</strong> (dark number): the bank's 50 channels are
+            <strong>Outlined</strong> (dark number): that bank's channels are
             <strong>skipped</strong>.
           </li>
         </ul>
+        <p>
+          How many channels that is depends on your radio: a BC125AT-family
+          scanner holds <strong>500 channels in banks of 50</strong>, a BC75XLT
+          <strong>300 in banks of 30</strong>. Either way it's ten banks, and
+          which bank a channel belongs to is fixed by its number — you can't
+          move a channel between banks.
+        </p>
 
         <h2 id="activity-tracking">Activity tracking</h2>
         <p>

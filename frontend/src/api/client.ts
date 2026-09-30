@@ -339,6 +339,14 @@ export class ScannerAPIClient {
     return this.request<LockoutsResponse>(`/lockouts${query}`);
   }
 
+  /** Remove one frequency from the global avoid list (`ULF`). */
+  async removeGlobalLockout(frequency: number): Promise<{ status: string; frequency: number }> {
+    return this.request<{ status: string; frequency: number }>('/lockouts/frequencies', {
+      method: 'DELETE',
+      body: JSON.stringify({ frequency }),
+    });
+  }
+
   async clearTemporaryLockouts(): Promise<{ cleared: number[]; failed: number[] }> {
     return this.request<{ cleared: number[]; failed: number[] }>('/lockouts/temporary/clear', {
       method: 'POST',
@@ -379,8 +387,22 @@ export class ScannerAPIClient {
     });
   }
 
-  async getSyncStatus(): Promise<{ in_progress: boolean; task_id: string | null }> {
-    return this.request<{ in_progress: boolean; task_id: string | null }>('/memory/sync/status');
+  /**
+   * `synced_at` is epoch seconds for when channel memory was last read from
+   * the scanner, or null if it never has been (#413). It survives a restart —
+   * channel memory is cached in SQLite and the timestamp is restored with it —
+   * so it reports when the RADIO was read, not when the cache was written.
+   */
+  async getSyncStatus(): Promise<{
+    in_progress: boolean;
+    task_id: string | null;
+    synced_at: number | null;
+  }> {
+    return this.request<{
+      in_progress: boolean;
+      task_id: string | null;
+      synced_at: number | null;
+    }>('/memory/sync/status');
   }
 
   async exportBc125atSs(): Promise<string> {

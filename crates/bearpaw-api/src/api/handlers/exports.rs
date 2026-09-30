@@ -4,14 +4,170 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 
 use crate::protocol::capabilities::ScannerCapabilities;
-use crate::protocol::tones::dcs_code_to_label;
+use crate::protocol::tones::dcs_code_to_number;
 use crate::state::{ChannelData, ToneSquelchKind};
 
 use super::super::security::validate_wire_field;
 use super::super::{
-    command_sender, csv_escape, flags_to_bools, on_off, send_raw_command, split_command_parts,
-    write_channel_no_readback, ApiError, AppState, ProgramModeGuard,
+    command_sender, csv_escape, flags_to_bools, on_off, read_frequency_lockouts_walk,
+    send_raw_command, split_command_parts, write_channel_to_scanner, ApiError, AppState,
+    ProgramModeGuard,
 };
+
+/// Format a channel's modulation for the `C-Freq` modulation column.
+///
+/// Uniden writes `Auto` in title case and `FM` / `AM` / `NFM` in upper case.
+/// Confirmed across three files its own software produced (a blank, a
+/// round-trip, and a read-from-scanner): `Auto` x497-500, with the three
+/// explicit modulations upper case wherever they appear.
+///
+/// Bearpaw wrote the raw `CIN` value, which is `AUTO`. That is COSMETIC, not
+/// data loss -- a round-trip through BC125AT SS preserved `FM`, `AM` and `NFM`
+/// exactly, so the parser reads our casing and normalises on write (#507).
+/// Matched anyway, because since #520 and #521 the tone column reproduces
+/// Uniden's spellings exactly, and leaving modulation as the one deliberate
+/// mismatch invites someone to "fix" the wrong one.
+fn ss_modulation_label(modulation: &str) -> String {
+    // Empty maps to `Auto` too. A BC125AT `CIN` always reports a modulation, so
+    // empty only arises from a `ChannelData` that predates a memory sync -- and
+    // Uniden's own blank file writes `Auto` on all 500 unprogrammed rows, so
+    // that is the value an unset channel takes. Passing the empty string
+    // through would emit a column no real file has.
+    if modulation.is_empty() || modulation.eq_ignore_ascii_case("AUTO") {
+        "Auto".to_string()
+    } else {
+        modulation.to_ascii_uppercase()
+    }
+}
+
+/// Number of frequency slots in an `AvoidFreqs` line.
+///
+/// The line is 18 tab-separated fields: the keyword, then 17. Field 1 is never
+/// a frequency -- every observed file leaves it empty -- so values occupy
+/// fields 2..=17.
+const AVOID_FREQS_SLOTS: usize = 16;
+
+/// Build the `AvoidFreqs` line, or `None` when there are no global lockouts.
+///
+/// Measured 2026-08-29 (#459): two lockouts set on a real BC125AT in a known
+/// order, read back by BC125AT SS, produced
+///
+/// ```text
+/// AvoidFreqs<TAB><TAB>116733300<TAB>122883300<TAB>...14 empties
+///            fld1  fld2       fld3
+/// ```
+///
+/// So it is a PACKED list offset by one: values start at field 2 and fill
+/// forward in the order `GLF` returned them, which is insertion order because
+/// `LOF` appends rather than sorting (#502). Frequencies are integer Hz, the
+/// same encoding `C-Freq` uses; the walk yields 100 Hz units, hence `* 100`.
+///
+/// The section is ABSENT ENTIRELY at zero lockouts -- confirmed by the blank
+/// reference file -- which is why this returns Option rather than an empty
+/// line. Emitting an all-empty `AvoidFreqs` would be a shape no real file has.
+fn build_avoid_freqs_line(raw_100hz: &[u32]) -> Option<String> {
+    if raw_100hz.is_empty() {
+        return None;
+    }
+    // No silent truncation: every observed file has exactly 17 trailing fields
+    // and none has ever carried more than one value, so behaviour past 16 is
+    // unobserved. The radio holds far more than that, so a wide list is
+    // reachable -- log rather than quietly drop, and keep the line the shape
+    // Uniden writes instead of guessing at a longer one.
+    if raw_100hz.len() > AVOID_FREQS_SLOTS {
+        tracing::warn!(
+            total = raw_100hz.len(),
+            written = AVOID_FREQS_SLOTS,
+            "AvoidFreqs holds {} slots; {} global lockouts were not exported",
+            AVOID_FREQS_SLOTS,
+            raw_100hz.len() - AVOID_FREQS_SLOTS
+        );
+    }
+    let mut fields: Vec<String> = vec![String::new(); AVOID_FREQS_SLOTS + 1];
+    for (i, raw) in raw_100hz.iter().take(AVOID_FREQS_SLOTS).enumerate() {
+        // field 1 stays empty; values begin at field 2
+        fields[i + 1] = (u64::from(*raw) * 100).to_string();
+    }
+    Some(format!("AvoidFreqs\t{}", fields.join("\t")))
+}
+
+/// Format a channel's tone for the `C-Freq` tone column of a `.bc125at_ss`.
+///
+/// REGRESSION GUARD (#516): these spellings are Uniden's, not ours, and they
+/// are NOT the labels the UI uses. Measured 2026-08-29 by writing a CTCSS and
+/// a DCS channel to a real BC125AT, then having BC125AT SS read the radio and
+/// save: it wrote `C100.0` and `D023`.
+///
+/// Bearpaw previously wrote `100.0` and `DCS 023`. Uniden's parser cannot read
+/// either and silently defaults the column to `Off` -- verified by round-
+/// tripping a Bearpaw file through the tool, where both tones came back `Off`
+/// while everything else survived. That is silent data loss on every export of
+/// a channel carrying a tone, and no golden test could see it: every reference
+/// file in `fixtures/` is `Off` on all 500 rows, so the column had never been
+/// exercised with a value.
+///
+/// Do NOT reuse `dcs_code_to_label` here. It renders `DCS 023` for the live
+/// display and is correct for that; this column needs `D023`.
+pub(crate) fn ss_tone_label(ch: &ChannelData) -> String {
+    match ch.tone_squelch_kind {
+        ToneSquelchKind::Ctcss => ch
+            .tone_squelch
+            .map(|hz| format!("C{:.1}", hz))
+            .unwrap_or_else(|| "Off".to_string()),
+        ToneSquelchKind::Dcs => ch
+            .tone_dcs_code
+            .and_then(dcs_code_to_number)
+            .map(|n| format!("D{:03}", n))
+            .unwrap_or_else(|| "Off".to_string()),
+        // VERIFIED 2026-08-29: set a channel's tone to Search in BC125AT SS and
+        // saved -- exactly one line changed, and it wrote `Srch`. Notably NOT
+        // the one-letter-prefix scheme the other two kinds use (`C100.0`,
+        // `D023`), which is why it was worth measuring rather than deriving.
+        ToneSquelchKind::Search => "Srch".to_string(),
+        ToneSquelchKind::None => "Off".to_string(),
+    }
+}
+
+/// Refuse to export unless the shadow is a COMPLETE image of the radio.
+///
+/// An export is the user's backup, and since #636 an empty `.ss` row is an
+/// explicit CLEAR -- so a file written from a partial shadow is not merely
+/// incomplete on disk, it is a set of instructions that will be written BACK
+/// to the radio on the next restore.
+///
+/// The three exporters failed differently from this one cause, which is why
+/// the check lives here rather than being patched into each:
+///
+/// - `export_bc75xlt_ss_file` INVENTED a row for a missing channel
+///   (`ch.map(..).unwrap_or(false)`), producing `freq 0, lockout Off,
+///   priority Off` -- indistinguishable from a real empty slot, and wrong.
+///   Observed on the dev unit 2026-09-02: 49 slots absent from the shadow
+///   after an import, all exported as `lockout Off` where the radio reports
+///   `On`.
+/// - `export_bc125at_ss_file` OMITTED it (`if let Some(..) = by_index.get`),
+///   writing a file with fewer than `channel_count` `C-Freq` rows. Uniden's
+///   own tool always writes every slot, so that file is malformed too.
+/// - `export_csv` omits it as well.
+///
+/// `is_complete_image` is the same predicate the cache-write side uses (#567,
+/// #569) and asks exactly this question: `channel_count` entries covering
+/// `1..=channel_count`. Reusing it keeps one answer to one question instead of
+/// three call sites each guessing.
+///
+/// 409 rather than 500: nothing is broken, the caller just has to sync first.
+/// It matches `sync_in_progress`, which the `.ss` exporters already return.
+fn require_complete_channel_image(state: &AppState) -> Result<(), ApiError> {
+    let channel_count = state.capabilities().channel_count;
+    let complete = {
+        let shadow = state.shadow.read().unwrap();
+        crate::api::channel_cache::is_complete_image(&shadow.channels, channel_count)
+    };
+    if complete {
+        Ok(())
+    } else {
+        Err(ApiError::Conflict("memory_not_synced".to_string()))
+    }
+}
 
 pub(crate) async fn export_bc125at_ss_file(
     State(state): State<AppState>,
@@ -20,6 +176,7 @@ pub(crate) async fn export_bc125at_ss_file(
     if state.sync_task_id.lock().unwrap().is_some() {
         return Err(ApiError::Conflict("sync_in_progress".to_string()));
     }
+    require_complete_channel_image(&state)?;
     // Capability, not a substring match on the model name. The old gate --
     // `model.contains("BC125AT")` -- worked only by luck: "BC125AT" is a
     // substring of "BCT125AT". The BC75XLT has its own settings-file layout
@@ -105,12 +262,19 @@ pub(crate) async fn export_bc125at_ss_file(
             custom_ranges.push((idx, lower_hz, upper_hz));
         }
 
-        // Channels come from the shadow cache (populated by memory sync), not
-        // a live CIN walk. Re-reading all 500 channels over the wire took
-        // ~150s (300ms x 500) and blew past client timeouts, so the export
-        // "did nothing". CSV export already reads the cache; this matches it.
-        // Both reflect the last memory sync. The tone column is rebuilt to the
+        // Channels come from the shadow cache, not a live CIN walk. Re-reading
+        // all 500 channels over the wire took ~150s (300ms x 500) and blew past
+        // client timeouts, so the export "did nothing". CSV export already
+        // reads the cache; this matches it. The tone column is rebuilt to the
         // same label format the CIN walk produced (`tone_code_label`).
+        //
+        // Since #413 the shadow may have been adopted from SQLite at connect
+        // rather than read from the radio this session, so what this exports is
+        // "the last memory sync, whenever that was" -- possibly days ago, and
+        // possibly out of date if the channels were edited on the scanner's own
+        // keypad in between. That is the same staleness the Channels tab
+        // renders, which is the point of the cache; `synced_at` is how a user
+        // sees how old it is.
         // (index, name, frequency_hz, modulation, tone, lockout, delay, priority)
         type SsChannelRow = (u16, String, i64, String, String, String, String, String);
         let channels: Vec<SsChannelRow> = {
@@ -120,23 +284,12 @@ pub(crate) async fn export_bc125at_ss_file(
             cached
                 .into_iter()
                 .map(|ch| {
-                    let tone = match ch.tone_squelch_kind {
-                        ToneSquelchKind::Ctcss => ch
-                            .tone_squelch
-                            .map(|hz| format!("{:.1}", hz))
-                            .unwrap_or_else(|| "Off".to_string()),
-                        ToneSquelchKind::Dcs => ch
-                            .tone_dcs_code
-                            .and_then(dcs_code_to_label)
-                            .unwrap_or_else(|| "Off".to_string()),
-                        ToneSquelchKind::Search => "Srch".to_string(),
-                        ToneSquelchKind::None => "Off".to_string(),
-                    };
+                    let tone = ss_tone_label(&ch);
                     (
                         ch.index,
                         ch.alpha_tag,
                         (ch.frequency * 1_000_000.0).round() as i64,
-                        ch.modulation,
+                        ss_modulation_label(&ch.modulation),
                         tone,
                         on_off(if ch.lockout { "1" } else { "0" }).to_string(),
                         ch.delay.to_string(),
@@ -275,6 +428,17 @@ pub(crate) async fn export_bc125at_ss_file(
             on_off(&search_code)
         ));
 
+        // `AvoidFreqs` sits between GeneralSearch and the first Conventional
+        // line, and only when the list is non-empty (#459). Read here rather
+        // than from a cache because nothing caches it -- and we are already
+        // inside this export's ProgramModeGuard, so the walk needs no bracket
+        // of its own. `read_frequency_lockouts_walk` is the UNBRACKETED helper
+        // on purpose; `read_frequency_lockouts_from_scanner` sends its own
+        // PRG/EPG and would nest program mode inside this one.
+        if let Some(line) = build_avoid_freqs_line(&read_frequency_lockouts_walk(&state).await?) {
+            lines.push(line);
+        }
+
         // Banks and channels INTERLEAVE: each `Conventional` line is followed
         // by that bank's own 50 channels, not ten bank lines and then all 500.
         //
@@ -356,10 +520,17 @@ const BC75XLT_SS_CHANNEL_DELAY: u8 = 2;
 
 /// Custom-search ranges as the BC75XLT tool writes them, in Hz.
 ///
-/// `CSP` has never been probed on this model, so Bearpaw does not send it --
-/// an unanswered command inside the PRG bracket is the #436 failure again.
+/// Bearpaw does not read `CSP` here even though that command is now known to
+/// work on this model (write -> read-back -> match, hardware 2026-08-28). The
+/// reason is the format, not the wire: Uniden's own tool writes these constant
+/// factory ranges into a `.bc75xlt_ss` rather than reading the radio, and this
+/// export matches the tool. Reading `CSP` would produce a DIFFERENT file from
+/// the one the vendor writes for the same scanner.
+///
 /// These are the values present in real exported files; they are the radio's
-/// factory ranges and differ from the BC125AT's.
+/// factory ranges and differ from the BC125AT's. The 2026-08-28 probe read all
+/// ten back off a real unit and they match this table exactly -- two
+/// independent recoveries agreeing.
 const BC75XLT_CUSTOM_RANGES: [(u32, u32); 10] = [
     (25_000_000, 27_995_000),
     (28_000_000, 29_695_000),
@@ -392,10 +563,11 @@ const BC75XLT_CUSTOM_RANGES: [(u32, u32); 10] = [
 /// ```
 ///
 /// Only commands this model is known to answer are sent -- `KBP` (inside PRG),
-/// `SQL`, `PRI`, `SCO`, `CLC`, `SCG`, per the wire capture in
-/// `docs/wire_captures/2026-08-26/`. `BLT`/`BSV`/`CNT`/`WXS` reply `ERR` here
-/// and are never sent; their `Misc` slots go out empty, which is exactly what
-/// the real files contain.
+/// `SQL`, `PRI`, `SCO`, `CLC`, `SCG`, `CSG`, and per-service `SSP`. The last
+/// two preserve the search settings represented by the native file instead of
+/// filling them with constants. `BLT`/`BSV`/`CNT`/`WXS` reply `ERR` here and
+/// are never sent; their `Misc` slots go out empty, which is exactly what the
+/// real files contain.
 pub(crate) async fn export_bc75xlt_ss_file(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -403,6 +575,7 @@ pub(crate) async fn export_bc75xlt_ss_file(
     if state.sync_task_id.lock().unwrap().is_some() {
         return Err(ApiError::Conflict("sync_in_progress".to_string()));
     }
+    require_complete_channel_image(&state)?;
     let caps = state.capabilities();
     if caps.ss_format != "bc75xlt" {
         return Err(ApiError::BadRequest("unsupported_model".to_string()));
@@ -424,13 +597,32 @@ pub(crate) async fn export_bc75xlt_ss_file(
             .cloned()
             .unwrap_or_else(|| "0".to_string());
         let sco = split_command_parts(&send_raw_command(&state, "SCO", false).await?);
-        let search_delay = sco.first().cloned().unwrap_or_else(|| "2".to_string());
+        let search_delay = bc75_ss_delay(sco.first().map(String::as_str).unwrap_or("1"));
         let search_code = sco.get(1).cloned().unwrap_or_default();
+        let search_direction = bc75_ss_direction(sco.get(2).map(String::as_str).unwrap_or("0"));
         let clc = split_command_parts(&send_raw_command(&state, "CLC", false).await?);
         let scan_flags = split_command_parts(&send_raw_command(&state, "SCG", false).await?)
             .first()
             .cloned()
             .unwrap_or_else(|| "1111111111".to_string());
+        let csg = split_command_parts(&send_raw_command(&state, "CSG", false).await?);
+        let custom_flags = csg
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "1111111111".to_string());
+        let custom_delay = bc75_ss_delay(csg.get(1).map(String::as_str).unwrap_or("1"));
+        let custom_direction = bc75_ss_direction(csg.get(2).map(String::as_str).unwrap_or("0"));
+        let mut service_settings = Vec::with_capacity(BC75XLT_SERVICE_NAMES.len());
+        for index in 1..=BC75XLT_SERVICE_NAMES.len() {
+            let fields = split_command_parts(
+                &send_raw_command(&state, &format!("SSP,{index}"), false).await?,
+            );
+            // SSP echoes its index before the two values.
+            service_settings.push((
+                bc75_ss_delay(fields.get(1).map(String::as_str).unwrap_or("1")),
+                bc75_ss_direction(fields.get(2).map(String::as_str).unwrap_or("0")),
+            ));
+        }
 
         let mut lines = Vec::new();
 
@@ -448,35 +640,36 @@ pub(crate) async fn export_bc75xlt_ss_file(
         ));
         lines.push(format!("Priority\t{}", on_off(&priority)));
 
-        // Direction is "Up" in every observed file and has no confirmed wire
-        // source on this model; the delay column mirrors the search delay.
         for (idx, name) in BC75XLT_SERVICE_NAMES.iter().enumerate() {
+            let (delay, direction) = service_settings[idx];
             lines.push(format!(
-                "Service\t{}\t{}\t\t{}\tUp",
+                "Service\t{}\t{}\t\t{}\t{}",
                 idx + 1,
                 name,
-                search_delay
+                delay,
+                direction
             ));
         }
-        lines.push(format!("CustomSearch\t{}\tUp", search_delay));
+        lines.push(format!(
+            "CustomSearch\t{}\t{}",
+            custom_delay, custom_direction
+        ));
 
         // "Search Bank", not the BC125AT's "Search Bnak" -- Uniden fixed the
         // typo in this tool, and the real files prove it.
+        let custom_enabled = flags_to_bools(&custom_flags);
         for (idx, (lower, upper)) in BC75XLT_CUSTOM_RANGES.iter().enumerate() {
             lines.push(format!(
-                "Custom\t{}\tSearch Bank{}\t{}\t{}\tOff",
+                "Custom\t{}\tSearch Bank{}\t{}\t{}\t{}",
                 idx + 1,
                 idx + 1,
                 lower,
-                upper
+                upper,
+                on_off_bool(custom_enabled.get(idx).copied().unwrap_or(false))
             ));
         }
 
-        let cc_mode = match clc.first().map(String::as_str) {
-            Some("1") => "Pri",
-            Some("2") => "Pri",
-            _ => "Off",
-        };
+        let cc_mode = bc75_ss_close_call_mode(clc.first().map(String::as_str).unwrap_or("0"));
         lines.push(format!(
             "CloseCall\t{}\t{}\t{}\t",
             cc_mode,
@@ -485,7 +678,13 @@ pub(crate) async fn export_bc75xlt_ss_file(
         ));
         // Band 4 is empty rather than "Off": this model has no 225-380 MHz
         // band at all, and the real files leave that slot blank.
-        let cc_bands = flags_to_bools(clc.get(3).map(String::as_str).unwrap_or("11111"));
+        let cc_bands: Vec<bool> = clc
+            .get(3)
+            .map(String::as_str)
+            .unwrap_or("00000")
+            .chars()
+            .map(|bit| bit == '1')
+            .collect();
         lines.push(format!(
             "CloseCallBands\t{}\t{}\t{}\t\t{}",
             on_off_bool(cc_bands.first().copied().unwrap_or(false)),
@@ -494,8 +693,8 @@ pub(crate) async fn export_bc75xlt_ss_file(
             on_off_bool(cc_bands.get(4).copied().unwrap_or(false))
         ));
         lines.push(format!(
-            "GeneralSearch\t{}\t{}\tUp",
-            search_delay, search_code
+            "GeneralSearch\t{}\t{}\t{}",
+            search_delay, search_code, search_direction
         ));
 
         // Banks and channels INTERLEAVE: each `Conventional` line is followed
@@ -564,6 +763,33 @@ pub(crate) async fn export_bc75xlt_ss_file(
     ))
 }
 
+/// Search delay is boolean on this model's wire, while its native file stores
+/// the fixed two-second delay as `2` when enabled.
+fn bc75_ss_delay(wire: &str) -> &'static str {
+    if wire == "1" {
+        "2"
+    } else {
+        "0"
+    }
+}
+
+fn bc75_ss_direction(wire: &str) -> &'static str {
+    if wire == "1" {
+        "Down"
+    } else {
+        "Up"
+    }
+}
+
+fn bc75_ss_close_call_mode(wire: &str) -> &'static str {
+    match wire {
+        "1" => "Pri",
+        "2" => "DND",
+        "3" => "Only",
+        _ => "Off",
+    }
+}
+
 /// `true`/`false` -> the `On`/`Off` the settings file uses.
 fn on_off_bool(v: bool) -> &'static str {
     if v {
@@ -573,16 +799,26 @@ fn on_off_bool(v: bool) -> &'static str {
     }
 }
 
-pub(crate) async fn export_csv(State(state): State<AppState>) -> impl IntoResponse {
+pub(crate) async fn export_csv(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, ApiError> {
+    // Same reason as the `.ss` exporters: a CSV written from a partial shadow
+    // is a partial backup that looks whole. This one omits rows rather than
+    // inventing them, which is less dangerous and still wrong.
+    require_complete_channel_image(&state)?;
     let mut rows = Vec::new();
     rows.push(
         "Index,Frequency,Modulation,Alpha Tag,Delay,Lockout,Priority,CTCSS/DCS,Bank".to_string(),
     );
 
-    let shadow = state.shadow.read().unwrap();
-    let mut channels: Vec<ChannelData> = shadow.channels.values().cloned().collect();
-    channels.sort_by_key(|c| c.index);
-    for ch in channels {
+    // REGRESSION GUARD (`an_exported_csv_re_imports`): read through
+    // `channels_with_banks`, never the cache directly. Bank is not a wire field
+    // -- `parse_cin_response` leaves it 0 and only this accessor derives it from
+    // the connected scanner's memory model (see the third-rail table in
+    // CLAUDE.md). Exporting the raw 0 wrote a Bank column the importer rejects
+    // with "Invalid bank: 0", so Bearpaw's own CSV could not be re-imported.
+    // It sorts by index, so the caller does not.
+    for ch in state.channels_with_banks() {
         rows.push(format!(
             "{},{},{},{},{},{},{},{},{}",
             ch.index,
@@ -597,13 +833,13 @@ pub(crate) async fn export_csv(State(state): State<AppState>) -> impl IntoRespon
         ));
     }
 
-    (
+    Ok((
         [
             ("content-type", "text/csv"),
             ("content-disposition", "attachment; filename=channels.csv"),
         ],
         rows.join("\n"),
-    )
+    ))
 }
 
 pub(crate) async fn import_csv(
@@ -680,19 +916,34 @@ pub(crate) async fn import_csv(
             // wire hiccup under load) would otherwise permanently fail one
             // channel; the protocol's timeout policy is "retry once, then
             // fail". Only genuine rejections (NG/ERR twice) become errors.
-            let mut result = write_channel_no_readback(&state, &payload).await;
+            // REGRESSION GUARD (#556, findings 3/4/5): the import stores what the
+            // SCANNER reports, not what the file said.
+            //
+            // This used `write_channel_no_readback`, which returns nothing
+            // verified, so the loop cached its own intent. The firmware
+            // silently refuses an in-place priority 1->0, so every imported row
+            // disagreeing on that field was cached as a lie -- and since #413
+            // the lie is flushed to SQLite and re-adopted at every connect.
+            //
+            // `write_channel_to_scanner` writes, reads back, and returns the
+            // readback. It costs one extra CIN per row: about +5 s on a full
+            // 500-channel import, measured against the ~5 s a 500-channel read
+            // takes. It also picks up the #595 priority-displacement re-read,
+            // so a row that takes priority no longer leaves the bank's previous
+            // holder stale.
+            let mut result = write_channel_to_scanner(&state, &payload).await;
             if result.is_err() {
-                result = write_channel_no_readback(&state, &payload).await;
+                result = write_channel_to_scanner(&state, &payload).await;
             }
             match result {
-                Ok(()) => {
+                Ok(verified) => {
                     imported += 1;
                     state
                         .shadow
                         .write()
                         .unwrap()
                         .channels
-                        .insert(payload.index, payload);
+                        .insert(verified.index, verified);
                 }
                 Err(err) => errors.push(json!({ "row": row, "error": format!("{:?}", err) })),
             }
@@ -799,15 +1050,25 @@ fn parse_import_csv_row(
         ));
     }
 
-    let bank: u8 = row
-        .get("Bank")
-        .map(|s| s.as_str())
-        .unwrap_or("1")
-        .parse()
-        .map_err(|_| "Invalid bank".to_string())?;
-    if !(1..=10).contains(&bank) {
-        return Err(format!("Invalid bank: {}", bank));
-    }
+    // REGRESSION GUARD (`an_import_row_derives_its_bank_and_ignores_the_file`,
+    // `an_import_row_with_the_old_zero_bank_still_lands`): the Bank column is
+    // DECORATIVE. Derive it from the index; never read it from the file.
+    //
+    // Bank membership is positional and there is no wire field for it --
+    // `build_cin_write_payload_for` does not reference `bank` at all. This used
+    // to parse the column, range-check it against `(1..=10)`, and discard the
+    // whole row on a mismatch, for a value it then never sent anywhere.
+    //
+    // The check also punished the more careful user: the `.unwrap_or("1")`
+    // default meant DELETING the Bank column imported fine, while KEEPING it
+    // with a wrong value killed the row. And #603's export wrote `Bank,0` for
+    // every channel, so Bearpaw's own export failed every programmed row on
+    // re-import -- 350 of 350 on the dev unit.
+    //
+    // Derivation is per-model (50 channels per bank on a BC125AT, 30 on a
+    // BC75XLT), which is why this reads `caps` rather than dividing by a
+    // constant. See the bank-derivation third rail in CLAUDE.md.
+    let bank = caps.index_to_bank(index);
 
     let tone_squelch = row
         .get("CTCSS/DCS")
@@ -856,6 +1117,7 @@ fn parse_import_csv_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::default_state;
     use crate::protocol::capabilities::{BC125AT_FAMILY, BC75XLT};
 
     fn row(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -879,6 +1141,18 @@ mod tests {
             flags_to_bools("01001"),
             vec![true, false, true, true, false]
         );
+    }
+
+    #[test]
+    fn bc75_file_values_cover_every_search_and_close_call_state() {
+        assert_eq!(bc75_ss_delay("0"), "0");
+        assert_eq!(bc75_ss_delay("1"), "2");
+        assert_eq!(bc75_ss_direction("0"), "Up");
+        assert_eq!(bc75_ss_direction("1"), "Down");
+        assert_eq!(bc75_ss_close_call_mode("0"), "Off");
+        assert_eq!(bc75_ss_close_call_mode("1"), "Pri");
+        assert_eq!(bc75_ss_close_call_mode("2"), "DND");
+        assert_eq!(bc75_ss_close_call_mode("3"), "Only");
     }
 
     #[test]
@@ -1003,5 +1277,406 @@ mod tests {
             out.matches("\r\n").count(),
             "no bare LF may survive -- the real files contain none"
         );
+    }
+
+    /// REGRESSION GUARD (#507): Uniden writes `Auto` in title case and the
+    /// three explicit modulations in upper case. Confirmed across three files
+    /// its own software produced -- a blank, a round-trip, and a
+    /// read-from-scanner -- all agreeing.
+    ///
+    /// Bearpaw wrote the raw `CIN` value (`AUTO`). Cosmetic rather than data
+    /// loss, since the parser preserved `FM`/`AM`/`NFM` through a round-trip,
+    /// but matched anyway so the tone and modulation columns are not
+    /// inconsistent about whose spelling they follow.
+    #[test]
+    fn ss_modulation_column_uses_unidens_casing() {
+        assert_eq!(ss_modulation_label("AUTO"), "Auto");
+        assert_eq!(ss_modulation_label("FM"), "FM");
+        assert_eq!(ss_modulation_label("AM"), "AM");
+        assert_eq!(ss_modulation_label("NFM"), "NFM");
+
+        // Only reachable from a ChannelData that predates a memory sync. The
+        // blank reference file writes `Auto` on all 500 unprogrammed rows.
+        assert_eq!(ss_modulation_label(""), "Auto");
+    }
+
+    /// REGRESSION GUARD (#459): `AvoidFreqs` is a PACKED list OFFSET BY ONE.
+    ///
+    /// Measured 2026-08-29: two global lockouts set on a real BC125AT in a
+    /// known order, read back by BC125AT SS. Values landed in fields 2 and 3
+    /// with field 1 empty:
+    ///
+    /// ```text
+    /// AvoidFreqs<TAB><TAB>116733300<TAB>122883300<TAB>...14 empties
+    /// ```
+    ///
+    /// The single pre-existing sample had its one value at field 2 too, which
+    /// alone could not distinguish this from fixed positions. Two values in a
+    /// known order settle it. Writing from field 1 instead would shift every
+    /// entry by one slot -- a file Uniden's tool would read as a different set
+    /// of frequencies, not as an error.
+    #[test]
+    fn avoid_freqs_packs_from_field_two() {
+        // 100 Hz units, as the GLF walk yields them.
+        let line = build_avoid_freqs_line(&[1_167_333, 1_228_833]).expect("non-empty");
+        let f: Vec<&str> = line.split('\t').collect();
+
+        assert_eq!(f.len(), 18, "keyword plus 17 slots");
+        assert_eq!(f[0], "AvoidFreqs");
+        assert_eq!(f[1], "", "field 1 is never a frequency");
+        assert_eq!(f[2], "116733300", "first value at field 2, in integer Hz");
+        assert_eq!(f[3], "122883300", "second at field 3, insertion order");
+        assert!(f[4..].iter().all(|v| v.is_empty()), "rest empty");
+
+        // Byte-exact against the measured line.
+        assert_eq!(
+            line,
+            "AvoidFreqs\t\t116733300\t122883300\t\t\t\t\t\t\t\t\t\t\t\t\t\t"
+        );
+    }
+
+    /// The section is ABSENT at zero lockouts -- confirmed by the blank
+    /// reference file. An all-empty `AvoidFreqs` line is a shape no real file
+    /// has, so this must be None rather than a padded line.
+    #[test]
+    fn avoid_freqs_is_absent_when_there_are_no_lockouts() {
+        assert!(build_avoid_freqs_line(&[]).is_none());
+    }
+
+    /// Over-long lists are truncated to the slots the format has, not silently
+    /// widened into a line shape nothing has ever produced.
+    #[test]
+    fn avoid_freqs_truncates_to_the_slots_the_format_has() {
+        let many: Vec<u32> = (1..=20).map(|i| 1_000_000 + i).collect();
+        let line = build_avoid_freqs_line(&many).expect("non-empty");
+        let f: Vec<&str> = line.split('\t').collect();
+        assert_eq!(f.len(), 18, "line stays 18 fields no matter the input");
+        assert_eq!(f[2], "100000100", "first written");
+        assert_eq!(f[17], "100001600", "16th written, last slot");
+    }
+
+    /// REGRESSION GUARD (#516): the `.bc125at_ss` tone column uses Uniden's
+    /// spellings, which are NOT the UI's labels.
+    ///
+    /// Measured 2026-08-29: a CTCSS and a DCS channel were written to a real
+    /// BC125AT, then BC125AT SS read the radio and saved. It wrote `C100.0` and
+    /// `D023`. Bearpaw had been writing `100.0` and `DCS 023`; round-tripping a
+    /// Bearpaw file through the tool brought both back as `Off` while every
+    /// other field survived -- silent data loss on any channel with a tone.
+    ///
+    /// The golden test cannot catch this. It compares section/field-count
+    /// shape, and every reference file in `fixtures/` is `Off` on all 500 rows,
+    /// so the column has never been exercised with a value by anything else.
+    #[test]
+    fn ss_tone_column_uses_unidens_spellings() {
+        let ctcss = ChannelData {
+            tone_squelch_kind: ToneSquelchKind::Ctcss,
+            tone_squelch: Some(100.0),
+            ..Default::default()
+        };
+        assert_eq!(ss_tone_label(&ctcss), "C100.0", "CTCSS takes a C prefix");
+
+        // 128 is the wire code for DCS 023 (protocol/tones.rs). The column wants
+        // the Motorola number zero-padded to three digits, not the wire code and
+        // not the `DCS 023` display label.
+        let dcs = ChannelData {
+            tone_squelch_kind: ToneSquelchKind::Dcs,
+            tone_dcs_code: Some(128),
+            ..Default::default()
+        };
+        assert_eq!(
+            ss_tone_label(&dcs),
+            "D023",
+            "DCS takes a D prefix, no space"
+        );
+
+        // Verified on every reference file: an untoned channel is `Off`.
+        assert_eq!(ss_tone_label(&ChannelData::default()), "Off");
+
+        // Verified 2026-08-29 the same way as the other two: set to Search in
+        // BC125AT SS and saved. It does NOT take a one-letter prefix.
+        let search = ChannelData {
+            tone_squelch_kind: ToneSquelchKind::Search,
+            ..Default::default()
+        };
+        assert_eq!(ss_tone_label(&search), "Srch");
+
+        // A kind set with its value missing must not emit a half-written tone.
+        let broken = ChannelData {
+            tone_squelch_kind: ToneSquelchKind::Ctcss,
+            tone_squelch: None,
+            ..Default::default()
+        };
+        assert_eq!(ss_tone_label(&broken), "Off");
+    }
+
+    // REGRESSION GUARD (`an_exported_csv_re_imports`): every row `export_csv`
+    // writes must survive `parse_import_csv_row`. Export -> import is the round
+    // trip users actually perform, and nothing pinned it end to end.
+    //
+    // `parse_cin_response` deliberately leaves `bank: 0` (#421 moved bank
+    // derivation out of the pure parser; see the third-rail table in CLAUDE.md),
+    // so the cache holds 0 for every channel and only `channels_with_banks`
+    // fills it in. `export_csv` read the cache directly and wrote that 0 into
+    // the Bank column, which the importer rejects with "Invalid bank: 0" -- so
+    // Bearpaw's own export could not be re-imported. Measured on the dev unit
+    // 2026-09-01: 350 programmed channels, 350 errors, 0 imported. The 150
+    // cleared rows returned `Ok(None)` and were dropped from BOTH counts, which
+    // is why the toast under-reported the damage.
+    //
+    // This drives the REAL `export_csv`. Every neighbouring test in this module
+    // hand-builds its row with `("Bank", "1")` -- a value the export never
+    // produced -- so all of them passed for the entire life of the bug.
+    // `parse_empty_slot_is_skipped_not_error` even cites "the hundreds of import
+    // errors bug", having fixed only the cleared-channel half of it.
+    //
+    // Asserting the derived VALUE, not merely that the row parses, is what makes
+    // this mutation-proof: an export hardcoding 1 would satisfy a
+    // parses-without-error check while misfiling every channel above bank 1.
+    #[tokio::test]
+    async fn an_exported_csv_re_imports() {
+        let state = default_state();
+        state.device.write().unwrap().capabilities = Some(BC125AT_FAMILY);
+        {
+            let mut shadow = state.shadow.write().unwrap();
+            // The whole map, because `require_complete_channel_image` refuses
+            // to export a partial shadow (#639) -- an export is a backup, and a
+            // backup written from an incomplete image is wrong in a way the
+            // file cannot show. The fill is a PRECONDITION, not the subject:
+            // only indices 1, 60 and 500 are asserted below.
+            //
+            // Every slot is programmed. A cleared slot would be skipped by
+            // `parse_import_csv_row` before the bank check, which is the
+            // silent half of #604 and would hide rows from the assertion.
+            for index in 1..=BC125AT_FAMILY.channel_count {
+                shadow.channels.insert(
+                    index,
+                    ChannelData {
+                        index,
+                        frequency: 146.52,
+                        alpha_tag: "Round Trip".to_string(),
+                        // As the parser leaves it, and as the cache holds it.
+                        bank: 0,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
+        let response = export_csv(State(state)).await.into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let csv = String::from_utf8(bytes.to_vec()).unwrap();
+
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(csv.as_bytes());
+        let mut seen = Vec::new();
+        for result in rdr.deserialize::<HashMap<String, String>>() {
+            let row = result.expect("export must emit parseable CSV");
+            let parsed = parse_import_csv_row(&row, &BC125AT_FAMILY)
+                .unwrap_or_else(|e| panic!("exported row failed to re-import: {e} -- {row:?}"))
+                .expect("a programmed row must not be skipped as empty");
+            seen.push((parsed.index, parsed.bank));
+        }
+
+        // EVERY row must survive the round trip -- the bug this guards was
+        // "350 programmed channels, 350 errors, 0 imported".
+        assert_eq!(seen.len(), BC125AT_FAMILY.channel_count as usize);
+
+        // Banks 1, 2 and 10 on a 50-per-bank model. Index 1 is deliberately
+        // included: it derives to bank 1, so a hardcoded 1 would pass on that
+        // row alone and fail on the other two.
+        seen.sort();
+        let sampled: Vec<(u16, u8)> = seen
+            .iter()
+            .copied()
+            .filter(|(index, _)| matches!(index, 1 | 60 | 500))
+            .collect();
+        assert_eq!(
+            sampled,
+            vec![(1u16, 1u8), (60, 2), (500, 10)],
+            "export must write the bank derived from the connected scanner"
+        );
+    }
+
+    /// REGRESSION GUARD (#639): an export from an INCOMPLETE shadow is
+    /// refused, not invented.
+    ///
+    /// `export_bc75xlt_ss_file` filled a missing channel with
+    /// `ch.map(..).unwrap_or(false)`, emitting `freq 0, lockout Off, priority
+    /// Off` -- a row indistinguishable from a real empty slot and wrong.
+    /// Observed on the dev unit 2026-09-02: 49 slots absent from the shadow
+    /// after an import, every one exported as `lockout Off` where the radio
+    /// reports `On`. The other two exporters OMIT the row instead, which is a
+    /// short file rather than a lying one, and still not a backup.
+    ///
+    /// Since #636 an empty `.ss` row is an explicit CLEAR, so such a file is
+    /// not merely wrong on disk -- restoring it writes the invented state to
+    /// the radio.
+    ///
+    /// The shape asserted is the one actually seen: a shadow holding only the
+    /// PROGRAMMED channels, with the empty slots absent. Seeding an empty
+    /// shadow would pass for a build that only rejects `is_empty()`.
+    #[tokio::test]
+    async fn an_export_from_an_incomplete_shadow_is_refused() {
+        for caps in [BC125AT_FAMILY, BC75XLT] {
+            let state = default_state();
+            state.device.write().unwrap().capabilities = Some(caps);
+            {
+                // Every slot but the last: exactly what an import of a file
+                // with one empty row leaves behind.
+                let mut shadow = state.shadow.write().unwrap();
+                for index in 1..caps.channel_count {
+                    shadow.channels.insert(
+                        index,
+                        ChannelData {
+                            index,
+                            frequency: 146.52,
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+
+            let err = require_complete_channel_image(&state)
+                .expect_err("a partial shadow must not be exportable");
+            // The CODE matters, not just that it errored: the frontend keys
+            // its "sync first" message off it, and a different 409 would send
+            // the user somewhere useless.
+            assert!(
+                matches!(&err, ApiError::Conflict(code) if code == "memory_not_synced"),
+                "{}: got {err:?}",
+                caps.ss_format
+            );
+
+            let response = export_csv(State(state)).await.into_response();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::CONFLICT,
+                "{}: csv export must refuse too",
+                caps.ss_format
+            );
+        }
+    }
+
+    /// The paired half: a COMPLETE shadow still exports, with a row per slot.
+    ///
+    /// Without this, a build that refuses every export passes the guard above
+    /// perfectly. The row count is asserted rather than "it returned 200",
+    /// because omitting rows is one of the two failure modes being fixed.
+    #[tokio::test]
+    async fn a_complete_shadow_still_exports_every_row() {
+        let state = default_state();
+        state.device.write().unwrap().capabilities = Some(BC125AT_FAMILY);
+        {
+            let mut shadow = state.shadow.write().unwrap();
+            for index in 1..=BC125AT_FAMILY.channel_count {
+                shadow.channels.insert(
+                    index,
+                    ChannelData {
+                        index,
+                        frequency: 146.52,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
+        require_complete_channel_image(&state).expect("a full shadow is exportable");
+
+        let response = export_csv(State(state)).await.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let csv = String::from_utf8(bytes.to_vec()).unwrap();
+        assert_eq!(
+            csv.lines().count(),
+            BC125AT_FAMILY.channel_count as usize + 1,
+            "one header plus one row per slot"
+        );
+    }
+
+    // REGRESSION GUARD (#604): the Bank column is DECORATIVE. The import
+    // derives bank from the channel index and ignores whatever the file said.
+    //
+    // Bank membership is positional on both families -- channels 1-50 are bank
+    // 1 on a BC125AT, 1-30 on a BC75XLT -- and there is no wire field for it at
+    // all. `build_cin_write_payload_for` never reads `bank`, so the importer
+    // was parsing a value, validating it, discarding whole rows over it, and
+    // then not using it.
+    //
+    // The old check was `(1..=10).contains(&bank)` with a `.unwrap_or("1")`
+    // default, which punished the more careful user: DELETING the Bank column
+    // imported fine, while KEEPING it with a wrong value killed the row. #603's
+    // export wrote `Bank,0` for every channel, so Bearpaw's own export failed
+    // every programmed row on re-import.
+    //
+    // Both models are asserted because the derivation is per-model and the two
+    // disagree at this index: channel 31 is bank 1 on a 50-per-bank BC125AT and
+    // bank 2 on a 30-per-bank BC75XLT. A single-model assertion would pass for
+    // a build that hardcoded either width -- the bank-derivation third rail in
+    // CLAUDE.md is exactly that mistake, made in three places at once.
+    #[test]
+    fn an_import_row_derives_its_bank_and_ignores_the_file() {
+        // Channel 31, with a Bank column that is wrong under BOTH models.
+        let r = row(&[
+            ("Index", "31"),
+            ("Frequency", "145.13"),
+            ("Modulation", "AUTO"),
+            ("Alpha Tag", "Derived"),
+            // 0 is the only delay valid on BOTH families: a BC75XLT takes a
+            // boolean (`valid_delays` is [0, 1]) and rejects the BC125AT's 2.
+            ("Delay", "0"),
+            ("Lockout", "false"),
+            ("Priority", "false"),
+            ("Bank", "7"),
+        ]);
+
+        let on_125 = parse_import_csv_row(&r, &BC125AT_FAMILY)
+            .expect("a wrong bank must not fail the row")
+            .expect("a programmed row must not be skipped");
+        assert_eq!(
+            on_125.bank, 1,
+            "channel 31 is bank 1 on a 50-per-bank model, whatever the file claims"
+        );
+
+        let on_75 = parse_import_csv_row(&r, &BC75XLT)
+            .expect("a wrong bank must not fail the row")
+            .expect("a programmed row must not be skipped");
+        assert_eq!(
+            on_75.bank, 2,
+            "channel 31 is bank 2 on a 30-per-bank model, whatever the file claims"
+        );
+    }
+
+    /// REGRESSION GUARD (#604), paired with
+    /// `an_import_row_derives_its_bank_and_ignores_the_file`.
+    ///
+    /// `Bank,0` is the specific value #603's export wrote for every channel,
+    /// and the value the old `(1..=10)` check rejected. Any file written by a
+    /// Bearpaw build before #603 still carries it, so this has to keep working
+    /// after the derivation guard above is satisfied — a build that derived the
+    /// bank but kept the range check would pass that test and still reject
+    /// every row of an old export.
+    #[test]
+    fn an_import_row_with_the_old_zero_bank_still_lands() {
+        let r = row(&[
+            ("Index", "60"),
+            ("Frequency", "145.13"),
+            ("Modulation", "AUTO"),
+            ("Alpha Tag", "Old Export"),
+            ("Delay", "2"),
+            ("Lockout", "false"),
+            ("Priority", "false"),
+            ("Bank", "0"),
+        ]);
+
+        let ch = parse_import_csv_row(&r, &BC125AT_FAMILY)
+            .expect("Bank,0 is what every pre-#603 export wrote; it must import")
+            .expect("a programmed row must not be skipped");
+        assert_eq!(ch.bank, 2, "channel 60 is bank 2 on a 50-per-bank model");
     }
 }

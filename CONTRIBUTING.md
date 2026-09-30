@@ -1,9 +1,9 @@
 # Contributing to Bearpaw
 
-Thanks for your interest in Bearpaw — a desktop control interface for the Uniden
-BC125AT scanner.
+Thanks for your interest in Bearpaw — a desktop control interface for supported
+Uniden analog handheld scanners.
 
-Bearpaw is in public beta. The architecture is strictly client/server: a Rust
+Bearpaw has stable releases. The architecture is strictly client/server: a Rust
 backend ([`crates/bearpaw-api/`](crates/bearpaw-api/)) owns all state and
 hardware communication, and a React frontend ([`frontend/`](frontend/)) is a
 replaceable display layer. [`CLAUDE.md`](CLAUDE.md) is the fullest map of how the
@@ -28,6 +28,11 @@ binds, so set `usb_vid`/`usb_pid` in `config.yaml` to force the direct-USB path.
 See [`CLAUDE.md`](CLAUDE.md) for the details.
 
 ## The bar for a change
+
+[`docs/PROCESS.md`](docs/PROCESS.md) is the full description of how work is
+filed, labelled, built, documented and released, and each rule there names the
+check that enforces it. The short version:
+
 
 1. **Small, single-purpose PRs.** One concern per PR, independently revertible,
    reviewable in under ten minutes. If a change grows past ~250 lines, split it.
@@ -62,9 +67,15 @@ npm run format:check     # Prettier
 
 The Prettier check is the one most easily forgotten — don't skip it.
 
+## Cutting a release
+
+Follow the [`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md) before
+creating a version tag. It keeps the supported scanners, security policy,
+release notes, and packaged version metadata in sync.
+
 ## Working on the wire protocol
 
-The BC125AT speaks an ASCII line protocol over USB. If you touch anything in
+The supported scanners speak an ASCII line protocol over USB. If you touch anything in
 [`crates/bearpaw-api/src/protocol/`](crates/bearpaw-api/src/protocol/), the
 transports, or the poll/memory-sync loops, one rule governs everything:
 

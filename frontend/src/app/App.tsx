@@ -3,12 +3,14 @@ import { AnimatePresence, MotionConfig, motion } from 'motion/react';
 import { Toaster, toast } from 'sonner';
 import { SyncSpinner } from './components/SyncSpinner';
 import { ImportProgressOverlay } from './components/ImportProgressOverlay';
-import { StatusBar } from './components/ScannerUI';
+import { StatusBar, type LockoutKind } from './components/ScannerUI';
 import { ScanAnnouncer } from './components/ScanAnnouncer';
 import { getAPI, API_BASE } from '../api/useApi';
-import { useStore, type Preferences } from '../store/useStore';
+import { useStore, mapStoredPreferences } from '../store/useStore';
 import { useWebSocket } from '../websocket/useWebSocket';
 import { useActivityLogHydrate } from '../hooks/useActivityLogHydrate';
+import { useAutoMemorySync } from '../hooks/useAutoMemorySync';
+import { useBankRefresh } from '../hooks/useBankRefresh';
 import { useActivityLogTracker } from '../hooks/useActivityLogTracker';
 import { useConnectionStatus } from '../hooks/useConnectionStatus';
 import { useDashboardAnalytics } from '../hooks/useDashboardAnalytics';
@@ -221,18 +223,7 @@ export default function App() {
         if (response.ok) {
           const prefs = await response.json();
           console.log('[Preferences] Loaded from backend:', prefs);
-          const frontendPrefs: Partial<Preferences> = {
-            theme: prefs.theme === 'field' ? 'field' : 'night',
-            displayMode: prefs.displayMode || 'frequency',
-            reducedMotion: prefs.reduced_motion || false,
-            hitMinDuration: prefs.hit_min_duration || 2,
-            dataRetentionDays: prefs.data_retention_days || 30,
-            audioOutputDevice: prefs.audio_output_device || 'default',
-            // `??`, not `||`: this defaults to true, so `||` would coerce a
-            // stored `false` back to `true` and the toggle would silently
-            // revert on every launch. Only null/undefined mean "unset".
-            checkUpdatesOnLaunch: prefs.check_updates_on_launch ?? true,
-          };
+          const frontendPrefs = mapStoredPreferences(prefs);
           console.log('[Preferences] Setting in store:', frontendPrefs);
           updatePreferences(frontendPrefs);
           console.log(
@@ -269,8 +260,53 @@ export default function App() {
 
     const unsubscribeDeviceInfo = ws.on('device_info', (message) => {
       const payload = message as unknown as { data?: import('../types').DeviceInfo };
-      if (payload?.data) {
-        setDeviceInfo(payload.data);
+      if (!payload?.data) return;
+      const wasConnected = useStore.getState().deviceInfo?.connection_status === 'connected';
+      setDeviceInfo(payload.data);
+
+      // REGRESSION GUARD (#413, check 1): refetch channels when the scanner
+      // becomes connected. The backend adopts cached channel memory during
+      // `update_device_info_from_mdl` and broadcasts AFTER that, so by the time
+      // this message arrives the channel list is already populated server-side.
+      // Without the refetch the store keeps whatever the mount fetch saw --
+      // usually nothing, because that fetch races the poll loop's connect --
+      // and the auto-sync effect then starts a full memory sync the cache
+      // exists to avoid.
+      //
+      // Deliberately gated on the EDGE. `broadcast_device_info` only fires on
+      // edges today, but a future caller that broadcast every tick would turn
+      // an unconditional refetch into a 5 Hz channel fetch.
+      //
+      // `useStore.getState()` rather than a closed-over value, and no new deps:
+      // this effect owns four WS subscriptions and re-registering it on store
+      // changes is the #144/#102-adjacent churn its guard exists to prevent.
+      if (payload.data.connection_status === 'connected' && !wasConnected) {
+        api
+          .getChannels()
+          .then((channelData) => setChannels(channelData))
+          .catch((error) => console.warn('Failed to refresh channels on connect', error));
+
+        // REGRESSION GUARD (#572): refetch the SYNC STATUS here too, for the
+        // same reason and on the same edge.
+        //
+        // `synced_at` only becomes knowable once `load_channel_cache` has set
+        // `shadow.last_sync`, which happens inside
+        // `update_device_info_from_mdl` -- i.e. just before this broadcast.
+        // The frontend otherwise learns it in only two places: the WS-connect
+        // probe and sync completion. On a Tauri cold launch the WS connects in
+        // milliseconds while the poll loop is still opening the port, so the
+        // probe answers null; and with `reread_memory_on_connect` OFF no sync
+        // ever runs, so it stayed null for the entire session.
+        //
+        // The cost was the whole point of #413 going missing on its own happy
+        // path: the Scan bar showed no age, and the Channels tab's age +
+        // Refresh block is gated on that label, so it did not render at all.
+        // It appeared only if the user switched tabs (`currentTab` is in the
+        // probe effect's deps) and never for a `?tab=channels` deep link.
+        api
+          .getSyncStatus()
+          .then((status) => updateSync({ syncedAt: status.synced_at ?? null }))
+          .catch((error) => console.warn('Failed to refresh sync status on connect', error));
       }
     });
 
@@ -333,6 +369,16 @@ export default function App() {
           setIsInProgramMode(normalizedMode === 'PGM');
         }, 500);
 
+        // The sync just moved `synced_at` forward; re-read it rather than
+        // stamping the client clock, so the status bar agrees with the value
+        // the cache actually persisted.
+        api
+          .getSyncStatus()
+          .then((status) => updateSync({ syncedAt: status.synced_at ?? null }))
+          .catch(() => {
+            /* a missing timestamp only blanks the label; never surface it */
+          });
+
         api
           .getChannels()
           .then((channelData) => setChannels(channelData))
@@ -351,20 +397,22 @@ export default function App() {
                 toastOnError: true,
               });
             }
-            // Background bank refresh — fire-and-forget so a 409/timeout
-            // doesn't take scan-resume down with it. Failure here just
-            // means the UI's bank state stays at whatever it was; the
-            // existing bank-refetch useEffect is a second chance.
-            api
-              .getBanks()
-              .then((result) => {
-                if (Array.isArray(result.banks) && result.banks.length === 10) {
-                  setBanks(result.banks);
-                }
-              })
-              .catch((error) => {
-                console.warn('Failed to refresh banks after sync', error);
-              });
+            // REGRESSION GUARD (#584): NO bank read here. The bank-refetch
+            // effect below already re-runs when `sync.inProgress` flips false,
+            // which is exactly "the sync is done, re-ask the scanner".
+            //
+            // Both firing meant two program-mode brackets back to back at the
+            // end of every sync -- and `get_banks` is a whole bracket, not one
+            // command: `PRG`, a 100 ms settle, `SCG`, then `EPG` on guard drop.
+            // Serialized behind the 5 Hz poll loop with a 3-second budget each,
+            // the second queued behind the first and blew its deadline. Over a
+            // ~17 hour hardware run that was 37 "Failed to refresh banks after
+            // sync" warnings and 18 backend `command_timeout`s -- the warning
+            // appearing TWICE per sync was the tell.
+            //
+            // This one was the redundant half: its own comment called the
+            // effect "a second chance", which had it backwards. The effect is
+            // the primary.
           })
           .catch((error) =>
             console.warn('[Progress] Failed to refresh channels after sync', error),
@@ -445,6 +493,12 @@ export default function App() {
       .getSyncStatus()
       .then((status) => {
         if (!active) return;
+        // Record how old the channel memory is, on every connect. This is the
+        // one place the frontend learns it: channel memory persists across
+        // restarts (#413), so a session that adopted a cache has a real
+        // `synced_at` and no sync of its own. Set unconditionally, before the
+        // branching below, so it lands whichever branch runs.
+        updateSync({ syncedAt: status.synced_at ?? null });
         const currentSync = useStore.getState().sync;
         if (!currentSync.inProgress && status.in_progress) {
           updateSync({
@@ -541,58 +595,30 @@ export default function App() {
     // this effect no longer reads banks (#393).
   }, [api, setChannels, setDeviceInfo, updateLiveState]);
 
-  useEffect(() => {
-    // Refetch banks once the scanner is reachable AND any initial memory
-    // sync has settled. The initial `Promise.allSettled` mount-time
-    // fetch races against `startMemorySync` (both want PRG mode); if
-    // sync wins, the bank fetch errors out and the store keeps its
-    // all-enabled default. This effect closes the gap by re-asking the
-    // scanner once sync is done (or once we know sync isn't needed
-    // because channels are already populated).
-    if (!deviceInfo || deviceInfo.connection_status !== 'connected') return;
-    if (sync.inProgress) return; // wait for the sync to release PRG mode
-    let active = true;
-    api
-      .getBanks()
-      .then((result) => {
-        if (!active) return;
-        if (Array.isArray(result.banks) && result.banks.length === 10) {
-          setBanks(result.banks);
-        }
-      })
-      .catch((error) => {
-        console.warn('Failed to refresh banks after sync', error);
-      });
-    return () => {
-      active = false;
-    };
-  }, [api, deviceInfo, sync.inProgress, sync.hasSyncedInitially, setBanks]);
+  // Bank refresh lives in `useBankRefresh` (#596). It was lifted out of this
+  // file so the "how often does this run?" question can be answered by
+  // mounting it -- the deps-array guard it used to carry was happy while the
+  // effect fired twice per connect.
+  useBankRefresh({
+    api,
+    connectionStatus: deviceInfo?.connection_status,
+    syncInProgress: sync.inProgress,
+    setBanks,
+  });
 
-  useEffect(() => {
-    if (!deviceInfo || deviceInfo.connection_status !== 'connected') return;
-    if (useStore.getState().sync.inProgress) return;
-    if (channels.length > 0) return;
-
-    let active = true;
-    const startMemorySync = async () => {
-      try {
-        updateSync({ message: 'Loading channels from device...' });
-        const result = await api.syncMemory();
-        if (!active) return;
-        if (result.status === 'started' || result.status === 'already_running') {
-          updateSync({ inProgress: true, taskId: result.task_id || null });
-        }
-      } catch (error) {
-        if (active) {
-          console.warn('Failed to start memory sync', error);
-        }
-      }
-    };
-    startMemorySync();
-    return () => {
-      active = false;
-    };
-  }, [api, channels.length, deviceInfo, updateSync]);
+  // The auto-sync decision lives in `useAutoMemorySync` (#568). It was lifted
+  // out of this file so it can be exercised by MOUNTING it: the guards it
+  // carries are source-level, precise about shape and blind to timing, and the
+  // bug they missed was a timing one -- a preference toggled mid-session
+  // re-ran the effect and drove the radio.
+  useAutoMemorySync({
+    api,
+    channels,
+    deviceInfo,
+    preferencesLoaded,
+    updateSync,
+    setChannels,
+  });
 
   useEffect(() => {
     // One-shot animation pass on mount so the bar chart slides in once.
@@ -892,6 +918,11 @@ export default function App() {
     }
   }, [api, connected, getScannerMode, toggleBusy]);
 
+  // No scan resume in either lockout handler: the backend resumes after the
+  // lockout's PRG/EPG bracket itself (#678), so the Ctrl+L shortcut, which
+  // never came through here, gets it too. The resume used to live here gated
+  // on HOLD, which a scanning user never produces.
+  //
   // See the preserve-manual-memoization note on handleToggle above.
   // eslint-disable-next-line react-hooks/preserve-manual-memoization
   const triggerTemporaryLockout = useCallback(async () => {
@@ -916,14 +947,11 @@ export default function App() {
             ? `Temporary lockout cleared for CH ${lockoutChannel}`
             : 'Temporary lockout cleared',
       );
-      if (getScannerMode() === 'HOLD') {
-        requestScanResume('temporary lockout', { delayMs: 1000 });
-      }
     } catch (error) {
       console.warn('Failed to toggle lockout', error);
       toast.error('Failed to toggle lockout');
     }
-  }, [api, connected, getScannerMode, liveState?.channel, liveState?.frequency, requestScanResume]);
+  }, [api, connected, liveState?.channel, liveState?.frequency]);
 
   // See the preserve-manual-memoization note on handleToggle above.
   // eslint-disable-next-line react-hooks/preserve-manual-memoization
@@ -940,29 +968,34 @@ export default function App() {
       toast.info(
         `Permanent lockout ${updated.lockout ? 'enabled' : 'cleared'} for CH ${updated.index}`,
       );
-      if (getScannerMode() === 'HOLD') {
-        requestScanResume('permanent lockout', { delayMs: 1000 });
-      }
     } catch (error) {
       console.warn('Failed to toggle lockout', error);
       toast.error('Failed to toggle lockout');
     }
-  }, [
-    api,
-    channels,
-    connected,
-    getScannerMode,
-    liveState?.channel,
-    requestScanResume,
-    setChannels,
-  ]);
+  }, [api, channels, connected, liveState?.channel, setChannels]);
 
+  // Switch on every variant explicitly rather than
+  // `if (permanent) ... else temporary`.
+  //
+  // `tsconfig` has `strict: false`, so `strictFunctionTypes` is off and
+  // function params compare BIVARIANTLY: a handler typed for two variants is
+  // accepted where three are required, with NO type error. #522 briefly added
+  // a third L/O item and the else-branch shape silently routed it to a
+  // temporary channel lockout while `npm run type-check` stayed green. That
+  // item was removed again in #531, but the hazard is a property of the
+  // tsconfig, not of that item -- the next variant added here would hit it.
+  //
+  // No test names this: the failure needs a variant that does not exist yet.
+  // The shape is the guard.
   const handleLockout = useCallback(
-    (type: 'temporary' | 'permanent') => {
-      if (type === 'permanent') {
-        void triggerPermanentLockout();
-      } else {
-        void triggerTemporaryLockout();
+    (type: LockoutKind) => {
+      switch (type) {
+        case 'permanent':
+          void triggerPermanentLockout();
+          break;
+        case 'temporary':
+          void triggerTemporaryLockout();
+          break;
       }
     },
     [triggerPermanentLockout, triggerTemporaryLockout],
@@ -1094,7 +1127,38 @@ export default function App() {
           problem is still true while the scanner is connected and everything
           else looks fine, which is exactly how the migration failure it
           exists for stayed invisible. */}
-        <DataDiagnosticBanner message={deviceInfo?.data_diagnostic_message} />
+        {/* FIXED, not in flow. In normal flow these push the tab bar and the
+            whole app down the moment they appear, which on launch reads as the
+            window jumping. Overlaying leaves the app where it is.
+
+            `top-14` clears the tab bar. Full-bleed at `top-0` covered
+            Scan/Channels/Device and left the user unable to navigate until they
+            dismissed it -- a bad trade for an informational message. Inset and
+            centred instead, so it reads as a temporary card over the content
+            rather than as part of the window chrome.
+
+            `z-40`, deliberately below the `z-50` used by dialogs, the sync
+            overlay and the dropdown/select menus: a modal must cover a card,
+            never the other way round.
+
+            `pointer-events-none` on the full-width container with
+            `pointer-events-auto` on the card, or the container would swallow
+            clicks on the content to either side of it.
+
+            One container holding both, because both CAN be set at once --
+            preferences upgrading while analytics fails -- and two
+            independently-fixed elements would sit on top of each other. */}
+        <div className="pointer-events-none fixed inset-x-0 top-14 z-40 flex justify-center px-4">
+          <div className="pointer-events-auto flex w-full max-w-3xl flex-col gap-2">
+            <DataDiagnosticBanner message={deviceInfo?.data_diagnostic_message} />
+            {/* Upgrading the database is a one-way door -- older versions refuse
+                data written by a newer one -- and it used to happen silently.
+                The backend sets this only on the launch that actually upgraded
+                an existing database, so it shows once and never on a fresh
+                install. */}
+            <DataDiagnosticBanner message={deviceInfo?.data_notice_message} variant="notice" />
+          </div>
+        </div>
         {/* `expand` + `gap` make stacked toasts spread vertically instead of
           piling. Colors come from sonner's own CSS variables (not `unstyled`)
           so its stacking/expand layout stays intact — a darker `--normal-bg`
@@ -1178,6 +1242,7 @@ export default function App() {
           currentTab={currentTab}
           sessionStats={currentTab === 'Scan' ? sessionStats : null}
           showChannelCount={capabilities.reports_live_channel}
+          syncedAt={sync.syncedAt}
         />
 
         {/* Announces scan-hit / scanning / connection transitions to screen

@@ -3,11 +3,13 @@
 //! Compatibility-first API surface so the Rust backend can replace the Python backend
 //! without frontend contract regressions.
 
+mod channel_cache;
 mod control;
 mod handlers;
 mod memory_sync;
 mod poll;
 mod program_mode;
+mod scanner_registry;
 mod security;
 mod ws;
 
@@ -20,7 +22,7 @@ pub use poll::spawn_poll_loop;
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Json},
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use serde::Serialize;
@@ -32,7 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::protocol::capabilities::ScannerCapabilities;
 use crate::protocol::{classify_response, parse_cin_response, tones, ScannerReply};
@@ -74,6 +76,20 @@ impl AppState {
     /// Defaults rather than `None` so callers never handle a third state that
     /// exists only between process start and the first `MDL` reply. Matches
     /// the frontend's `useScannerCapabilities()` fallback for the same reason.
+    /// The profile key for whichever scanner is attached.
+    ///
+    /// Falls back to the shared placeholder when no profile has been resolved --
+    /// before the first `MDL`, or when the profile database could not be
+    /// written. That fallback IS the pre-#414 behaviour, so an unusable
+    /// registry degrades to one shared cache rather than to no cache.
+    pub fn scanner_id(&self) -> String {
+        self.device
+            .read()
+            .ok()
+            .and_then(|d| d.scanner_id.clone())
+            .unwrap_or_else(|| channel_cache::PLACEHOLDER_SCANNER_ID.to_string())
+    }
+
     pub fn capabilities(&self) -> crate::protocol::capabilities::ScannerCapabilities {
         self.device
             .read()
@@ -161,8 +177,38 @@ pub struct ActiveHit {
     pub bank: Option<u8>,
 }
 
-const PREFERENCES_SCHEMA_VERSION: i32 = 1;
+const PREFERENCES_SCHEMA_VERSION: i32 = 3;
+
+/// How often the channel cache is snapshotted to SQLite.
+///
+/// The flush writes the WHOLE map unconditionally — that is what makes it
+/// impossible to miss one of the eleven `shadow.channels` mutation sites — so
+/// the interval is the only lever on how much redundant writing an idle app
+/// does. At 5 s an 8-hour session would run ~5,760 transactions and keep the
+/// disk awake for nothing.
+///
+/// 30 s is safe because this is not the only flush: a completed memory sync
+/// persists immediately, and shutdown persists before exit. Those cover the two
+/// moments worth protecting. What this interval actually bounds is how much a
+/// *hard kill* (SIGKILL, panic, power loss) can lose — and losing it costs a
+/// re-sync, never data, because every write reaches the scanner first.
+const CHANNEL_CACHE_FLUSH_SECS: u64 = 30;
+/// How long shutdown waits for the poll thread to finish its tick and drop the
+/// scanner session (#688). One USB tick is at worst three 500 ms transfers plus
+/// the 200 ms interval, so 3 s covers it with room; past that, exit anyway.
+const POLL_LOOP_STOP_TIMEOUT: Duration = Duration::from_secs(3);
 const ANALYTICS_SCHEMA_VERSION: i32 = 2;
+
+/// How many recorded hits are loaded into the in-memory activity log at
+/// startup, **per scanner**.
+///
+/// Per scanner, not in total: #415 called this out before it could bite. A
+/// global cap takes the newest N rows across the whole table, so a chatty
+/// radio fills the entire budget and a quieter one's history never reaches the
+/// activity view or any dashboard derived from it — while its rows sit intact
+/// in SQLite, which makes it look like a display bug rather than a load one.
+/// The cost is that N scanners can load N times this many rows.
+const ANALYTICS_HIT_LOAD_CAP: usize = 5000;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -231,10 +277,6 @@ pub fn router(state: AppState) -> Router {
             get(handlers::settings::get_custom_range).post(handlers::settings::set_custom_range),
         )
         .route(
-            "/api/v1/settings/custom-search/defaults",
-            get(handlers::settings::get_custom_search_defaults),
-        )
-        .route(
             "/api/v1/settings/weather",
             get(handlers::settings::get_weather).post(handlers::settings::set_weather),
         )
@@ -243,6 +285,10 @@ pub fn router(state: AppState) -> Router {
             get(handlers::settings::get_contrast).post(handlers::settings::set_contrast),
         )
         .route("/api/v1/lockouts", get(handlers::lockouts::get_lockouts))
+        .route(
+            "/api/v1/lockouts/frequencies",
+            delete(handlers::lockouts::remove_global_lockout),
+        )
         .route(
             "/api/v1/lockouts/temporary/clear",
             post(handlers::lockouts::clear_temporary_lockouts),
@@ -341,6 +387,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/ws", get(ws::ws_handler))
         .layer(security::cors_layer())
+        .layer(axum::middleware::from_fn(security::validate_origin))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().level(tracing::Level::INFO))
@@ -493,6 +540,7 @@ pub enum ApiError {
     BadRequest(String),
     NotFound(String),
     Conflict(String),
+    Internal(String),
 }
 
 impl IntoResponse for ApiError {
@@ -503,6 +551,7 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.as_str()),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.as_str()),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg.as_str()),
+            ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.as_str()),
         };
         (
             status,
@@ -516,12 +565,58 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// Resolve when the process is asked to stop.
+///
+/// REGRESSION GUARD (`the_shipped_server_has_a_reachable_shutdown`): this
+/// exists because `run_server` used to pass `std::future::pending()`, a future
+/// that never resolves. `with_graceful_shutdown` therefore never fired, the
+/// `.await?` on the server never returned, and EVERYTHING after it was
+/// unreachable in the shipped binary -- including the final
+/// `flush_channel_cache`, which CLAUDE.md lists as one of the three flush
+/// callers and describes as "the one that makes a clean quit lose nothing".
+///
+/// It went unnoticed because the only tested entry point is
+/// `run_server_with_shutdown`, and the shipped one is `run_server`.
+///
+/// Both signals matter: SIGINT is Ctrl-C in a terminal, SIGTERM is `kill` and
+/// what a supervisor -- including the Tauri shell stopping its sidecar --
+/// sends. Neither had a handler, so the process died mid-poll with the USB
+/// interface still claimed and transfers in flight, which is the precondition
+/// #513's wedge is reproduced from.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            // A process that cannot install the handler should still run, and
+            // still stop on Ctrl-C.
+            Err(e) => {
+                warn!("could not install SIGTERM handler: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("received SIGINT; shutting down"),
+        _ = terminate => info!("received SIGTERM; shutting down"),
+    }
+}
+
 pub async fn run_server(
     bind: &str,
     state: AppState,
     serial_port: Option<(String, u32, bool)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    run_server_with_shutdown(bind, state, serial_port, std::future::pending()).await
+    run_server_with_shutdown(bind, state, serial_port, shutdown_signal()).await
 }
 
 /// Like `run_server` but accepts a shutdown future. When the future resolves,
@@ -536,10 +631,17 @@ pub async fn run_server_with_shutdown(
     serial_port: Option<(String, u32, bool)>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut poll_loop = None;
     if let Some((port_name, baud, assert_dtr)) = serial_port {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         state.command_tx = Arc::new(Mutex::new(Some(cmd_tx)));
-        spawn_poll_loop(state.clone(), port_name, baud, assert_dtr, cmd_rx);
+        poll_loop = Some(spawn_poll_loop(
+            state.clone(),
+            port_name,
+            baud,
+            assert_dtr,
+            cmd_rx,
+        ));
         if let Ok(mut d) = state.device.write() {
             d.connection_status = "connecting".to_string();
             d.diagnostic_code = None;
@@ -576,6 +678,24 @@ pub async fn run_server_with_shutdown(
         }
     });
 
+    // Periodic channel-cache snapshot. Sleeps FIRST so a fresh start does not
+    // write before the first sync has produced anything; the flush's own
+    // empty-map guard makes that harmless either way, but there is no reason to
+    // open the database to learn there is nothing to write.
+    let flush_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(CHANNEL_CACHE_FLUSH_SECS)).await;
+            let s = flush_state.clone();
+            // spawn_blocking: this is synchronous SQLite on a runtime worker.
+            let _ =
+                tokio::task::spawn_blocking(move || channel_cache::flush_channel_cache(&s)).await;
+        }
+    });
+
+    // `router(state)` moves the state, so take the shutdown handle first.
+    let shutdown_state = state.clone();
+
     let listener = tokio::net::TcpListener::bind(bind).await?;
     info!("Bearpaw API listening on http://{}", bind);
     let allowed_hosts = security::allowed_hosts_for_bind(bind);
@@ -586,6 +706,26 @@ pub async fn run_server_with_shutdown(
     axum::serve(listener, app.into_make_service())
         .with_graceful_shutdown(shutdown)
         .await?;
+    // Stop the poll thread before exit (#688), so the scanner session drops and
+    // releases its interface instead of dying mid-transfer. After `serve`, so
+    // in-flight requests -- and any PRG bracket they hold open -- have drained.
+    if let Some(poll_loop) = poll_loop {
+        let stopped =
+            tokio::task::spawn_blocking(move || poll_loop.stop_and_join(POLL_LOOP_STOP_TIMEOUT))
+                .await
+                .unwrap_or(false);
+        if !stopped {
+            warn!(
+                "poll loop did not stop within {:?}; exiting with it running",
+                POLL_LOOP_STOP_TIMEOUT
+            );
+        }
+    }
+    // Final flush before exit. This is the one that makes a clean quit lose
+    // nothing: without it, up to CHANNEL_CACHE_FLUSH_SECS of channel edits
+    // would be absent from the cache on next launch, and the user would see
+    // stale values for changes they watched succeed.
+    channel_cache::flush_channel_cache(&shutdown_state);
     info!("Bearpaw API server shut down gracefully");
     Ok(())
 }
@@ -598,11 +738,27 @@ pub fn default_state() -> AppState {
     // surfaces with no frontend change. Bearpaw is offline-first and starts
     // with no network, so this cannot be an error dialog or a stall -- the
     // diagnostic channel is the right surface.
-    let migration_error = init_preferences_db(&preferences_db_path)
-        .err()
-        .or_else(|| init_analytics_db(&analytics_db_path).err());
+    let preferences_result = init_preferences_db(&preferences_db_path);
+    let analytics_result = init_analytics_db(&analytics_db_path);
+    // Upgrading is a ONE-WAY DOOR, so say so. `check_not_from_the_future`
+    // refuses a database whose `user_version` is newer than the running build,
+    // which is right -- old code against a newer schema is silent misbehaviour
+    // -- but it used to happen invisibly. The first a user heard of it was an
+    // error during a downgrade they had already committed to.
+    //
+    // Only fires when a REAL earlier database was upgraded, never on a fresh
+    // install, and only on the launch that did the upgrading: the next start
+    // finds the schema current and reports nothing. That makes it
+    // self-clearing with no "dismissed" flag to store.
+    let upgraded = matches!(preferences_result, Ok(true)) || matches!(analytics_result, Ok(true));
+    let migration_error = preferences_result.err().or(analytics_result.err());
     if let Some(err) = &migration_error {
         tracing::error!("database migration failed: {}", err);
+    }
+    if upgraded {
+        tracing::info!(
+            "database upgraded to this version; a backup of the previous data was written alongside it"
+        );
     }
     let loaded_preferences = load_preferences_from_db(&preferences_db_path);
     let loaded_hits = load_analytics_hits_from_db(&analytics_db_path);
@@ -626,6 +782,13 @@ pub fn default_state() -> AppState {
                 .as_ref()
                 .map(|_| "migration_failed".to_string()),
             data_diagnostic_message: migration_error.as_ref().map(|e| e.to_string()),
+            data_notice_code: upgraded.then(|| "database_upgraded".to_string()),
+            data_notice_message: upgraded.then(|| {
+                "Your saved channels, settings and activity history were upgraded to \
+                 this version's format. A backup of the previous data was saved next to \
+                 it. Older versions of Bearpaw can no longer open this data."
+                    .to_string()
+            }),
             ..Default::default()
         })),
         shadow: Arc::new(std::sync::RwLock::new(ShadowState::default())),
@@ -665,6 +828,18 @@ pub(crate) fn default_preferences() -> Map<String, Value> {
     // the behaviour it shipped with — but the app is offline-first, so a
     // user who wants zero network traffic needs a way to turn it off.
     m.insert("check_updates_on_launch".to_string(), Value::Bool(true));
+    // #413 follow-on: whether channel memory is re-read from the scanner at
+    // every connect, or rendered from the SQLite cache until the user asks.
+    //
+    // Defaults ON, which is the pre-cache behaviour. A user poll (n=20,
+    // 2026-08-30) found 45% program their scanner on its own keypad "all the
+    // time" and 65% do so at least sometimes -- for them the cache is stale
+    // before Bearpaw opens, and being quietly wrong is worse than being
+    // visibly slow. A full walk costs ~5 s on a BC125AT over direct USB.
+    //
+    // Users who only program from a computer turn it off and get the instant
+    // startup the cache was built for; their cache is never stale.
+    m.insert("reread_memory_on_connect".to_string(), Value::Bool(true));
     // Whether the Scan page's analytics count only the connected scanner
     // ("scanner", the default) or every scanner ever attached ("all").
     //
@@ -831,12 +1006,22 @@ fn analytics_retention_days(state: &AppState) -> u32 {
     extract_retention_days(&prefs)
 }
 
-fn init_preferences_db(path: &str) -> Result<(), MigrationError> {
+/// Returns whether an EXISTING database was upgraded.
+///
+/// `true` only when there was a real earlier database to lose. A fresh install
+/// also travels 0 -> N, and telling a brand-new user their data was upgraded
+/// and they cannot go back would be both false and alarming. See
+/// `a_fresh_database_does_not_claim_an_upgrade`.
+fn init_preferences_db(path: &str) -> Result<bool, MigrationError> {
     match open_sqlite(path) {
-        Some(conn) => migrate_preferences_db(path, &conn),
+        Some(conn) => {
+            let before = schema_version(&conn);
+            migrate_preferences_db(path, &conn)?;
+            Ok(before > 0 && before < PREFERENCES_SCHEMA_VERSION)
+        }
         // Unopenable is not a migration failure -- every read and write below
         // already degrades to defaults when the file cannot be opened.
-        None => Ok(()),
+        None => Ok(false),
     }
 }
 
@@ -865,62 +1050,160 @@ fn load_preferences_from_db(path: &str) -> Map<String, Value> {
     prefs
 }
 
-pub(crate) fn save_preference_to_db(path: &str, key: &str, value: &Value) {
-    if let Some(conn) = open_sqlite(path) {
-        let _ = conn.execute(
-            "CREATE TABLE IF NOT EXISTS preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at REAL NOT NULL)",
-            [],
-        );
-        let _ = conn.execute(
-            "INSERT OR REPLACE INTO preferences (key, value, updated_at) VALUES (?1, ?2, strftime('%s','now'))",
-            rusqlite::params![key, value.to_string()],
-        );
+#[derive(Debug)]
+pub(crate) struct PreferencePersistenceError {
+    operation: &'static str,
+    detail: String,
+}
+
+impl PreferencePersistenceError {
+    fn new(operation: &'static str, error: impl std::fmt::Display) -> Self {
+        Self {
+            operation,
+            detail: error.to_string(),
+        }
     }
 }
 
-pub(crate) fn reset_preferences_db(path: &str) {
-    if let Some(conn) = open_sqlite(path) {
-        let _ = conn.execute(
-            "CREATE TABLE IF NOT EXISTS preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at REAL NOT NULL)",
-            [],
-        );
-        let _ = conn.execute("DELETE FROM preferences", []);
+impl std::fmt::Display for PreferencePersistenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.operation, self.detail)
     }
 }
 
-fn init_analytics_db(path: &str) -> Result<(), MigrationError> {
+impl std::error::Error for PreferencePersistenceError {}
+
+fn open_preferences_db_for_write(
+    path: &str,
+) -> Result<rusqlite::Connection, PreferencePersistenceError> {
+    let path = PathBuf::from(path);
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| PreferencePersistenceError::new("create database directory", error))?;
+    }
+    let conn = rusqlite::Connection::open(path)
+        .map_err(|error| PreferencePersistenceError::new("open preferences database", error))?;
+    conn.busy_timeout(Duration::from_secs(5)).map_err(|error| {
+        PreferencePersistenceError::new("configure preferences database", error)
+    })?;
+    Ok(conn)
+}
+
+pub(crate) fn save_preference_to_db(
+    path: &str,
+    key: &str,
+    value: &Value,
+) -> Result<(), PreferencePersistenceError> {
+    let mut values = Map::new();
+    values.insert(key.to_string(), value.clone());
+    save_preferences_to_db(path, &values)
+}
+
+pub(crate) fn save_preferences_to_db(
+    path: &str,
+    values: &Map<String, Value>,
+) -> Result<(), PreferencePersistenceError> {
+    let mut conn = open_preferences_db_for_write(path)?;
+    let transaction = conn
+        .transaction()
+        .map_err(|error| PreferencePersistenceError::new("start preference transaction", error))?;
+    transaction
+        .execute(
+            "CREATE TABLE IF NOT EXISTS preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at REAL NOT NULL)",
+            [],
+        )
+        .map_err(|error| PreferencePersistenceError::new("create preferences schema", error))?;
+    for (key, value) in values {
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO preferences (key, value, updated_at) VALUES (?1, ?2, strftime('%s','now'))",
+                rusqlite::params![key, value.to_string()],
+            )
+            .map_err(|error| PreferencePersistenceError::new("write preference", error))?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| PreferencePersistenceError::new("commit preference transaction", error))
+}
+
+pub(crate) fn reset_preferences_db(path: &str) -> Result<(), PreferencePersistenceError> {
+    let mut conn = open_preferences_db_for_write(path)?;
+    let transaction = conn
+        .transaction()
+        .map_err(|error| PreferencePersistenceError::new("start preference reset", error))?;
+    transaction
+        .execute(
+            "CREATE TABLE IF NOT EXISTS preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at REAL NOT NULL)",
+            [],
+        )
+        .map_err(|error| PreferencePersistenceError::new("create preferences schema", error))?;
+    transaction
+        .execute("DELETE FROM preferences", [])
+        .map_err(|error| PreferencePersistenceError::new("delete preferences", error))?;
+    transaction
+        .commit()
+        .map_err(|error| PreferencePersistenceError::new("commit preference reset", error))
+}
+
+/// Returns whether an EXISTING database was upgraded. See
+/// `init_preferences_db` for why a fresh install must answer `false`.
+fn init_analytics_db(path: &str) -> Result<bool, MigrationError> {
     match open_sqlite(path) {
-        Some(conn) => migrate_analytics_db(path, &conn),
-        None => Ok(()),
+        Some(conn) => {
+            let before = schema_version(&conn);
+            migrate_analytics_db(path, &conn)?;
+            Ok(before > 0 && before < ANALYTICS_SCHEMA_VERSION)
+        }
+        None => Ok(false),
     }
 }
 
 fn load_analytics_hits_from_db(path: &str) -> Vec<ActivityHit> {
     let mut out = Vec::new();
     if let Some(conn) = open_sqlite(path) {
-        let _ = conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS scan_hits (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp REAL NOT NULL,
-                frequency REAL NOT NULL,
-                channel INTEGER,
-                alpha_tag TEXT,
-                modulation TEXT NOT NULL,
-                rssi INTEGER NOT NULL,
-                duration REAL,
-                mode TEXT NOT NULL,
-                bank INTEGER,
-                session_id TEXT NOT NULL,
-                ended_at REAL
-            );
-            ",
-        );
+        // REGRESSION GUARD (`loading_hits_does_not_create_the_table`): the READ
+        // path does not define schema. `migrate_analytics_db` owns it.
+        //
+        // There used to be a `CREATE TABLE IF NOT EXISTS scan_hits (...)` here
+        // that omitted `scanner_id`, while the SELECT below reads it --
+        // `scanner_id` arrived in analytics schema v2 (#440) via ALTER TABLE and
+        // this second copy was never updated to match. Two definitions of one
+        // table that had to be edited in lockstep, which is precisely what
+        // failed.
+        //
+        // Harmless in production only because the migration runs first, making
+        // the IF NOT EXISTS a no-op. Where it did fire -- an unmigrated
+        // database -- it created the table WITHOUT `scanner_id` and turned every
+        // later `prepare` into a silent empty result.
+        // REGRESSION GUARD (`the_hit_load_cap_applies_per_scanner`): the cap is
+        // PER SCANNER, which is what the window function buys.
+        //
+        // This was `ORDER BY timestamp DESC LIMIT 5000` over the whole table.
+        // With two radios attached that starves the quieter one: the chatty
+        // scanner's rows are newer, so they fill the entire budget and the
+        // other's history never reaches the in-memory log, the activity view,
+        // or any dashboard built from it. The rows are intact in SQLite the
+        // whole time, which makes it present as a display bug rather than a
+        // load one.
+        //
+        // A NULL `scanner_id` forms its own partition, and that is deliberate:
+        // #440 kept pre-attribution hits as a real group meaning "recorded
+        // before Bearpaw tracked this", so they get their own allowance rather
+        // than competing with an identified scanner.
         if let Ok(mut stmt) = conn.prepare(
             "SELECT id, timestamp, frequency, channel, alpha_tag, modulation, rssi, duration, mode, bank, session_id, ended_at, scanner_id
-             FROM scan_hits ORDER BY timestamp DESC LIMIT 5000",
+             FROM (
+                 SELECT *, ROW_NUMBER() OVER (
+                     PARTITION BY scanner_id ORDER BY timestamp DESC
+                 ) AS rn
+                 FROM scan_hits
+             )
+             WHERE rn <= ?1",
         ) {
-            let rows = stmt.query_map([], |row| {
+            let rows = stmt.query_map([ANALYTICS_HIT_LOAD_CAP as i64], |row| {
                 let id: i64 = row.get(0)?;
                 let timestamp: f64 = row.get(1)?;
                 let frequency: f64 = row.get(2)?;
@@ -953,6 +1236,26 @@ fn load_analytics_hits_from_db(path: &str) -> Vec<ActivityHit> {
             if let Ok(rows) = rows {
                 out.extend(rows.flatten());
             }
+        } else if let Err(e) = conn.prepare("SELECT 1 FROM scan_hits LIMIT 1") {
+            // A query that cannot be prepared is a bug, not an empty result set
+            // (#608). The old code swallowed it: `if let Ok(mut stmt) = ...`
+            // skipped the block and returned an empty Vec, so a malformed
+            // SELECT and a database with no hits were indistinguishable to the
+            // caller and produced an empty activity log with nothing logged.
+            //
+            // Re-probing with a trivial query separates the two causes worth
+            // telling apart: no table at all (an unmigrated or fresh database,
+            // which is expected and benign) versus a table whose columns do not
+            // match what this function reads (a real schema drift).
+            warn!(
+                error = %e,
+                "analytics hits could not be read: scan_hits is missing or unreadable"
+            );
+        } else {
+            error!(
+                "analytics hits could not be read: scan_hits exists but does not \
+                 match the columns this build expects — schema drift, not an empty log"
+            );
         }
         out.sort_by(|a, b| {
             a.timestamp
@@ -1135,7 +1438,34 @@ impl std::fmt::Display for MigrationError {
 ///
 /// Nothing in Bearpaw deletes these files. Pruning them to reclaim disk would
 /// remove the documented way back from an upgrade.
+///
+/// REGRESSION GUARD (`the_backup_includes_uncheckpointed_wal_data`): this is
+/// `VACUUM INTO`, run through SQLite, NOT `std::fs::copy` (#574).
+///
+/// `open_sqlite` sets `journal_mode = WAL`, so a committed transaction lives in
+/// the `-wal` sidecar until something checkpoints it. Copying the main file
+/// alone silently dropped every uncommitted-to-main frame -- and restoring such
+/// a backup over a database whose newer `-wal` still sat beside it produced a
+/// MISMATCHED PAIR rather than the old database. The 30-second channel-cache
+/// flush makes the at-risk volume much larger than when this was written.
+///
+/// `VACUUM INTO` is consistent by construction: SQLite reads through its own
+/// MVCC snapshot, so the WAL is included without anyone having to get a
+/// checkpoint ordering right. It also emits ONE self-contained file, which
+/// matters because the recovery instruction is "put this file back" -- a
+/// backup that needed its own sidecars to be complete would recreate the
+/// mismatched-pair problem at restore time.
+///
+/// Preserving `user_version` is load-bearing, not incidental: the version is
+/// what tells the pre-migration build which schema it is looking at, and a
+/// backup that lost it would make that build re-run every migration. The guard
+/// asserts it.
+///
+/// Takes the live connection rather than reopening `path`: a second connection
+/// would see the same WAL but adds a failure mode for nothing, and the caller
+/// (`migrate_preferences_db`) already holds one.
 fn backup_db_if_needed(
+    conn: &rusqlite::Connection,
     path: &str,
     label: &str,
     from_version: i32,
@@ -1167,10 +1497,11 @@ fn backup_db_if_needed(
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join(backup_name);
-    std::fs::copy(&source, &backup_path).map_err(|e| MigrationError::BackupFailed {
-        path: backup_path.display().to_string(),
-        source: e.to_string(),
-    })?;
+    conn.execute("VACUUM INTO ?1", [backup_path.to_string_lossy().as_ref()])
+        .map_err(|e| MigrationError::BackupFailed {
+            path: backup_path.display().to_string(),
+            source: e.to_string(),
+        })?;
     Ok(Some(backup_path))
 }
 
@@ -1262,13 +1593,77 @@ fn migrate_preferences_db(path: &str, conn: &rusqlite::Connection) -> Result<(),
     let current = schema_version(conn);
     check_not_from_the_future(path, current, PREFERENCES_SCHEMA_VERSION)?;
     if current > 0 || has_user_tables(conn) {
-        backup_db_if_needed(path, "preferences", current, PREFERENCES_SCHEMA_VERSION)?;
+        backup_db_if_needed(
+            conn,
+            path,
+            "preferences",
+            current,
+            PREFERENCES_SCHEMA_VERSION,
+        )?;
     }
     if current < 1 {
         run_migration_step(
             conn,
             1,
             "CREATE TABLE IF NOT EXISTS preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at REAL NOT NULL);",
+        )?;
+    }
+    if current < 2 {
+        run_migration_step(
+            conn,
+            2,
+            "
+            CREATE TABLE IF NOT EXISTS channel_memory (
+                scanner_id       TEXT NOT NULL,
+                channel_index    INTEGER NOT NULL,
+                frequency        REAL NOT NULL,
+                modulation       TEXT NOT NULL DEFAULT '',
+                alpha_tag        TEXT NOT NULL DEFAULT '',
+                delay            INTEGER NOT NULL,
+                lockout          INTEGER NOT NULL,
+                priority         INTEGER NOT NULL,
+                tone_kind        TEXT NOT NULL DEFAULT 'none',
+                tone_squelch_hz  REAL,
+                tone_dcs_code    INTEGER,
+                synced_at        REAL NOT NULL,
+                PRIMARY KEY (scanner_id, channel_index)
+            );
+            ",
+        )?;
+    }
+    if current < 3 {
+        // #414: one row per physical scanner Bearpaw has seen.
+        //
+        // `scanner_id` is a generated key, NOT a discriminator. Recognition has
+        // to come from what the hardware volunteers, and a generated id would
+        // have to live either on the scanner (whose only writable storage is
+        // channel memory, wiped by a factory reset) or on the host (circular --
+        // the lookup key would be the thing we lack). So `match_index` does the
+        // recognising and `scanner_id` is a stable internal key, which means
+        // renaming a scanner or adding a better signal later does not rewrite
+        // every foreign key.
+        //
+        // ACCEPTED LIMITATION: two units of the SAME model share one profile.
+        // A BC125AT reports usb_serial `0001` for every unit -- it is a firmware
+        // constant, not a per-unit id (measured on hardware 2026-08-26). Only
+        // the BC75XLT has a real serial, and only because its CP2104 bridge is
+        // programmed per-unit by Silicon Labs. Correct and permanent for one
+        // BC125AT plus one BC75XLT; detectable and fixable if a second
+        // same-model unit ever appears, because the real key is a UUID.
+        run_migration_step(
+            conn,
+            3,
+            "
+            CREATE TABLE IF NOT EXISTS scanners (
+                scanner_id   TEXT PRIMARY KEY,
+                match_index  TEXT NOT NULL UNIQUE,
+                model        TEXT NOT NULL,
+                usb_serial   TEXT,
+                display_name TEXT,
+                first_seen   REAL NOT NULL,
+                last_seen    REAL NOT NULL
+            );
+            ",
         )?;
     }
     Ok(())
@@ -1278,7 +1673,7 @@ fn migrate_analytics_db(path: &str, conn: &rusqlite::Connection) -> Result<(), M
     let current = schema_version(conn);
     check_not_from_the_future(path, current, ANALYTICS_SCHEMA_VERSION)?;
     if current > 0 || has_user_tables(conn) {
-        backup_db_if_needed(path, "analytics", current, ANALYTICS_SCHEMA_VERSION)?;
+        backup_db_if_needed(conn, path, "analytics", current, ANALYTICS_SCHEMA_VERSION)?;
     }
     if current < 1 {
         run_migration_step(
@@ -1453,17 +1848,15 @@ pub(crate) fn parse_command_parts(response: &str, command: &str) -> Vec<String> 
 pub(crate) async fn read_frequency_lockouts_from_scanner(
     state: &AppState,
 ) -> Result<Vec<u32>, ApiError> {
-    let _ = send_raw_command(state, "PRG", false).await?;
     // REGRESSION GUARD (#138): run the GLF walk in a helper so EPG is ALWAYS
-    // sent afterward, even if a GLF read errors mid-walk. A `?` that returned
-    // early before the EPG would strand the scanner in program mode and leave
-    // the poll loop suspended (program_mode_active never clears).
+    // sent afterward, even if a GLF read errors mid-walk.
+    let prg = ProgramModeGuard::enter_or_join(state).await?;
     let result = read_frequency_lockouts_walk(state).await;
-    let _ = send_raw_command(state, "EPG", false).await;
+    prg.close().await;
     result
 }
 
-async fn read_frequency_lockouts_walk(state: &AppState) -> Result<Vec<u32>, ApiError> {
+pub(crate) async fn read_frequency_lockouts_walk(state: &AppState) -> Result<Vec<u32>, ApiError> {
     // GLF is a bare-command cursor iterator: send `GLF` repeatedly and the
     // scanner steps through its lockout list, replying `GLF,<freq8>` per
     // entry and `GLF,-1` at the end. Verified on hardware 2026-07-08
@@ -1503,7 +1896,7 @@ pub(crate) async fn read_settings_snapshot_from_scanner(
         parts.join(",").trim().to_string()
     };
 
-    let _ = send_raw_command(state, "PRG", false).await?;
+    let prg = ProgramModeGuard::enter_or_join(state).await?;
     // Per-section strictness (#143): a section whose reply is NG/ERR or whose
     // primary field doesn't parse becomes `null` instead of a fabricated
     // zero/default. `get_config` merges only non-null sections over the
@@ -1647,7 +2040,14 @@ pub(crate) async fn read_settings_snapshot_from_scanner(
                 _ => Value::Null,
             }
         }
-        let service_search = {
+        // `SSG` is absent from the BC75XLT's command table -- that model has
+        // service search but no way to enable or disable a band remotely. Skip
+        // the read rather than burn a guaranteed-ERR round-trip inside the
+        // bracket, the same reasoning as the `KBP` skip above. This runs on
+        // every Device tab visit.
+        let service_search = if !caps.has_service_search_groups {
+            Value::Null
+        } else {
             let resp = send_raw_command(state, "SSG", false).await?;
             if usable(&resp) {
                 group_mask(&resp, "SSG")
@@ -1726,7 +2126,7 @@ pub(crate) async fn read_settings_snapshot_from_scanner(
         }))
     }
     .await;
-    let _ = send_raw_command(state, "EPG", false).await;
+    prg.close().await;
     result
 }
 
@@ -1734,14 +2134,9 @@ pub(crate) async fn read_channel_from_scanner(
     state: &AppState,
     index: u16,
 ) -> Result<ChannelData, ApiError> {
-    let in_program_mode = state.program_mode_active.load(Ordering::Relaxed);
-    if !in_program_mode {
-        let _ = send_raw_command(state, "PRG", false).await?;
-    }
+    let prg = ProgramModeGuard::enter_or_join(state).await?;
     let response = send_raw_command(state, &format!("CIN,{}", index), false).await;
-    if !in_program_mode {
-        let _ = send_raw_command(state, "EPG", false).await;
-    }
+    prg.close().await;
     let response = response?;
     parse_cin_response(index, &response)
         .ok_or_else(|| ApiError::BadRequest("channel_read_failed".to_string()))
@@ -1865,24 +2260,17 @@ pub(crate) fn build_cin_write_payload_for(
     ))
 }
 
-/// Write one channel without the per-channel read-back verify, for bulk
-/// import. The caller MUST already hold a `ProgramModeGuard` — this sends only
-/// `CIN,<idx>,...` and checks the reply, matching Uniden Sentinel's bulk-write
-/// path (one wire command per channel). Correctness is recovered by a single
-/// full read-back after the whole import, not per channel — 500 inline
-/// read-backs are what made import take ~8 minutes instead of ~30 seconds.
-pub(crate) async fn write_channel_no_readback(
-    state: &AppState,
-    channel: &ChannelData,
-) -> Result<(), ApiError> {
-    let payload = build_cin_write_payload_for(channel, &state.capabilities())?;
-    let write_cmd = format!("CIN,{},{}", channel.index, payload);
-    match classify_response(&send_raw_command(state, &write_cmd, false).await?) {
-        ScannerReply::Ok => Ok(()),
-        ScannerReply::Ng => Err(ApiError::BadRequest("channel_write_wrong_mode".to_string())),
-        _ => Err(ApiError::BadRequest("channel_write_rejected".to_string())),
-    }
-}
+/// NOTE (#556): there is deliberately no `write_channel_no_readback`.
+///
+/// It existed for the import loops, and returned nothing verified -- so all
+/// three of them cached what they INTENDED to write. The firmware silently
+/// refuses an in-place priority 1->0, so every imported row disagreeing on
+/// that field was stored as a lie, and since #413 the lie survives restarts.
+///
+/// The imports use `write_channel_to_scanner` now. It costs one extra `CIN`
+/// per row -- about +5 s on a full 500-channel import, against the ~5 s a
+/// 500-channel read takes -- which is the whole price of a cache that only
+/// holds values a scanner actually reported.
 
 /// Read-back-verify comparison: does the channel we read back match what we
 /// wrote? `wrote_alpha` is the sanitised alpha (comma-stripped, 16-char cap,
@@ -2052,17 +2440,84 @@ pub(crate) async fn write_channel_to_scanner(
 ) -> Result<ChannelData, ApiError> {
     let payload = build_cin_write_payload_for(channel, &state.capabilities())?;
 
-    let in_program_mode = state.program_mode_active.load(Ordering::Relaxed);
-    if !in_program_mode {
-        let _ = send_raw_command(state, "PRG", false).await?;
-    }
+    let prg = ProgramModeGuard::enter_or_join(state).await?;
     let write_cmd = format!("CIN,{},{}", channel.index, payload);
     let write_response = send_raw_command(state, &write_cmd, false).await;
     let read_response = send_raw_command(state, &format!("CIN,{}", channel.index), false).await;
+
+    // REGRESSION GUARD (`a_priority_write_re_reads_the_channel_it_displaced`):
+    // a `CIN` write with priority=1 clears the bank's PREVIOUS holder on
+    // hardware without naming it (#556, finding 2; the displacement is
+    // documented at `set_channel_priority` and was captured live).
+    //
+    // Only the written index was updated, so the displaced channel kept
+    // `priority: true` in the shadow and the bank showed two priority channels.
+    // Not destructive -- `needs_priority_clear` re-reads before any `DCH` --
+    // but it mis-aims the next swap's plan, and since #413 the wrong flag is
+    // flushed to SQLite and re-adopted at every connect instead of dying with
+    // the session.
+    //
+    // Read INSIDE the bracket that is already open. Doing it after the `EPG`
+    // would mean a second `PRG`/`EPG` round trip back to back -- the shape
+    // #584 was about, where the second bracket queued behind the first and
+    // blew its deadline.
+    //
+    // Candidates come from the shadow, and the guard is dropped before any
+    // await: a std `RwLock` guard held across one would block the poll thread.
+    // Only channels the cache BELIEVES hold priority are re-read, so the usual
+    // cost is one extra `CIN` and often zero.
+    let mut displaced: Vec<ChannelData> = Vec::new();
+    if channel.priority {
+        let caps = state.capabilities();
+        let bank = caps.index_to_bank(channel.index);
+        let candidates: Vec<u16> = {
+            match state.shadow.read() {
+                Ok(shadow) => shadow
+                    .channels
+                    .values()
+                    .filter(|c| {
+                        c.index != channel.index
+                            && c.priority
+                            && caps.index_to_bank(c.index) == bank
+                    })
+                    .map(|c| c.index)
+                    .collect(),
+                Err(_) => Vec::new(),
+            }
+        };
+        for other in candidates {
+            match send_raw_command(state, &format!("CIN,{}", other), false).await {
+                Ok(resp) => {
+                    if let Some(ch) = parse_cin_response(other, &resp) {
+                        displaced.push(ch);
+                    }
+                }
+                // Best-effort: the user's write succeeded, and a failed
+                // re-read of a bystander must not turn that into an error.
+                // The stale flag survives to the next read of that channel,
+                // which is where it started.
+                Err(e) => warn!(
+                    index = other,
+                    error = ?e,
+                    "could not re-read the channel displaced by a priority write"
+                ),
+            }
+        }
+    }
+
     // REGRESSION GUARD (#138): EPG must be sent before any early return so
     // the scanner isn't left stuck in program mode with polling suspended.
-    if !in_program_mode {
-        let _ = send_raw_command(state, "EPG", false).await;
+    prg.close().await;
+
+    // Store the displaced reads before any early return below: they are
+    // verified reads, and they are true whether or not the write we came here
+    // to make turns out to have persisted.
+    if !displaced.is_empty() {
+        if let Ok(mut shadow) = state.shadow.write() {
+            for ch in displaced {
+                shadow.channels.insert(ch.index, ch);
+            }
+        }
     }
 
     match classify_response(&write_response?) {
@@ -2097,6 +2552,22 @@ pub(crate) async fn write_channel_to_scanner(
             read_back = %read_response.trim(),
             "CIN write not persisted as sent"
         );
+        // REGRESSION GUARD
+        // (`a_failed_channel_write_still_stores_what_the_scanner_reported`):
+        // store the readback even though this returns Err (#556, findings
+        // 8/11).
+        //
+        // The `CIN` has already landed and been acknowledged; `readback` is
+        // what the radio holds now. Callers update the shadow only on `Ok`, so
+        // discarding it left the pre-write value cached -- and since #413 that
+        // survives restarts rather than dying with the session.
+        //
+        // Paired with the identical guard in `set_channel_lockout_on_scanner`:
+        // two copies of one mistake in two functions, so fixing either alone
+        // leaves the other live.
+        if let Ok(mut shadow) = state.shadow.write() {
+            shadow.channels.insert(channel.index, readback);
+        }
         return Err(ApiError::BadRequest("channel_not_persisted".to_string()));
     }
     Ok(readback)
@@ -2128,7 +2599,23 @@ async fn clear_channel_priority_locked(
     let current = read_channel_from_scanner(state, index).await?;
 
     // 2. No-op if nothing to clear.
+    //
+    // REGRESSION GUARD (`a_no_op_priority_clear_heals_a_stale_shadow`): store
+    // the read even though nothing is being changed. Reaching here means the
+    // radio says this channel does NOT hold priority -- which is exactly the
+    // state a stale shadow produces, because a plain `CIN` write can set
+    // priority and displace the bank's previous holder without naming it (the
+    // #198 guard above). The read is already paid for, and since #413 a stale
+    // flag is no longer cleared by the next launch's sync: it is flushed to
+    // SQLite and re-adopted at every connect. Storing it here is what makes
+    // this path self-healing rather than a permanent disagreement.
     if !needs_priority_clear(&current) {
+        state
+            .shadow
+            .write()
+            .unwrap()
+            .channels
+            .insert(index, current.clone());
         return Ok(current);
     }
 
@@ -2181,6 +2668,18 @@ async fn clear_channel_priority_locked(
             "priority_clear_not_persisted".to_string(),
         ));
     }
+    // REGRESSION GUARD (`a_priority_clear_updates_the_shadow`): store the
+    // verified readback. `set_channel_priority` inserts into the shadow at
+    // every step of a swap; this function returned the same class of value and
+    // dropped it, so the cache kept showing a priority flag the radio had just
+    // wiped. Under #413 that survives a restart instead of dying with the
+    // session.
+    state
+        .shadow
+        .write()
+        .unwrap()
+        .channels
+        .insert(index, readback.clone());
     Ok(readback)
 }
 
@@ -2201,21 +2700,34 @@ pub(crate) async fn set_channel_priority(
     let _guard = ProgramModeGuard::enter(state).await?; // ONE bracket for the whole swap
     let mut changed = Vec::new();
 
-    // REGRESSION GUARD (priority swap atomicity): clear the OLD priority channel
-    // BEFORE setting the new one, inside a SINGLE program-mode bracket, and
-    // propagate the clear's error with `?` so a failed clear ABORTS the swap.
-    // Setting first, ignoring the clear error, or dropping/re-entering the guard
-    // between clear and set can leave a bank with two priority channels, a
-    // DCH-deleted channel, or an interleaved command mid-swap. See the priority spec.
+    // REGRESSION GUARD (priority swap atomicity): on a model where Bearpaw
+    // clears, clear the OLD priority channel BEFORE setting the new one, inside
+    // a SINGLE program-mode bracket, and propagate the clear's error with `?` so
+    // a failed clear ABORTS the swap. Setting first, ignoring the clear error, or
+    // dropping/re-entering the guard between clear and set can leave a bank with
+    // two priority channels, a DCH-deleted channel, or an interleaved command
+    // mid-swap. See the priority spec.
+    //
+    // `has_priority_clear` is false where the RADIO owns the swap. A BC75XLT has
+    // no `DCH` and refuses an in-place clear, but moves the flag within a bank
+    // itself -- measured in both directions on hardware 2026-08-28, see
+    // docs/wire_captures/2026-08-28/findings.md §8. Running the clear there was
+    // not merely unnecessary, it was the one step that could not work: every
+    // swap failed with `priority_clear_dch_failed` (#479).
     if let Some(old) = old_to_clear {
-        let cleared = clear_channel_priority_locked(state, old).await?; // locked: no inner guard
-        state
-            .shadow
-            .write()
-            .unwrap()
-            .channels
-            .insert(old, cleared.clone());
-        changed.push(cleared);
+        if caps.has_priority_clear {
+            let cleared = clear_channel_priority_locked(state, old).await?; // locked: no inner guard
+            state
+                .shadow
+                .write()
+                .unwrap()
+                .channels
+                .insert(old, cleared.clone());
+            changed.push(cleared);
+        }
+        // Otherwise the old channel is cleared by the SET below, as a side
+        // effect. It is re-read after that write, not before -- reading first
+        // reports a state the next command undoes.
     }
 
     // Set the new priority channel with a plain CIN write (SET works in place).
@@ -2248,6 +2760,64 @@ pub(crate) async fn set_channel_priority(
         .channels
         .insert(new_to_set, readback.clone());
     changed.push(readback);
+
+    // Where the firmware owns the swap, the old channel dropped its flag as a
+    // side effect of the write above. Re-read it: without this the shadow cache
+    // -- and so the UI -- keeps showing a priority channel the radio has already
+    // cleared, which is the same stale-view failure #402 produced by a different
+    // route.
+    //
+    // REGRESSION GUARD (priority swap atomicity): this read is INFORMATIONAL and
+    // its error must not propagate. See
+    // `priority_swap_survives_a_failed_post_set_reread`. The write above
+    // has already been sent and verified by readback, so the swap is committed
+    // before this line runs -- a `?` here reports a failure for a change the
+    // scanner has made, on the one model whose bridge is documented to `ERR` a
+    // first command (CLAUDE.md backend pitfall #11). The clear-before-set read
+    // higher up is the opposite case and DOES propagate: nothing is committed
+    // yet there, so failing aborts the swap as the atomicity contract requires.
+    if let Some(old) = old_to_clear {
+        if !caps.has_priority_clear {
+            match read_channel_from_scanner(state, old).await {
+                Ok(cleared) => {
+                    if cleared.priority {
+                        // Contradicts the 2026-08-28 measurement. Report the truth
+                        // rather than a tidy fiction: the requested channel DID get
+                        // priority, so this is not a failed request, but the bank now
+                        // holds two and nothing here can fix that.
+                        tracing::warn!(
+                            old,
+                            new = new_to_set,
+                            "firmware did not clear the previous priority channel; bank now holds two"
+                        );
+                    }
+                    state
+                        .shadow
+                        .write()
+                        .unwrap()
+                        .channels
+                        .insert(old, cleared.clone());
+                    // Contract: cleared-old first, then the new one.
+                    changed.insert(0, cleared);
+                }
+                Err(err) => {
+                    // Same principle as the branch above, one step further: we
+                    // cannot even observe the old channel. Leave its cache entry
+                    // alone and omit it from `changed` rather than writing a
+                    // cleared state the scanner never confirmed. The entry stays
+                    // stale until the next refresh, which is a visible and
+                    // recoverable view -- unlike a fabricated one.
+                    tracing::warn!(
+                        old,
+                        new = new_to_set,
+                        ?err,
+                        "could not re-read the previous priority channel after the swap; \
+                         its cached state may be stale until the next refresh"
+                    );
+                }
+            }
+        }
+    }
     Ok(changed)
 }
 
@@ -2262,50 +2832,24 @@ pub(crate) async fn set_channel_lockout_on_scanner(
     // with the has_tone heuristic and, for the common tone=0 layout, wrote
     // into the TONE field instead (#132) — "unlock" reported success while
     // leaving the channel locked.
-    let in_program_mode = state.program_mode_active.load(Ordering::Relaxed);
-    if !in_program_mode {
-        let _ = send_raw_command(state, "PRG", false).await?;
+    // REGRESSION GUARD (#138): a read or build error inside the bracket must
+    // still leave program mode, so the bracket body is one block and `close`
+    // runs after it whatever it returned.
+    let prg = ProgramModeGuard::enter_or_join(state).await?;
+    let bracket = async {
+        let response = send_raw_command(state, &format!("CIN,{}", index), false).await?;
+        let mut updated = parse_cin_response(index, &response)
+            .ok_or_else(|| ApiError::BadRequest("lockout_failed".to_string()))?;
+        updated.lockout = locked;
+        let payload = build_cin_write_payload_for(&updated, &state.capabilities())?;
+        let write_cmd = format!("CIN,{},{}", index, payload);
+        let write_response = send_raw_command(state, &write_cmd, false).await;
+        let read_response = send_raw_command(state, &format!("CIN,{}", index), false).await;
+        Ok::<_, ApiError>((write_response, read_response))
     }
-    let response = send_raw_command(state, &format!("CIN,{}", index), false).await;
-    // REGRESSION GUARD (#138): send EPG before propagating a read error so the
-    // scanner isn't left in program mode with polling suspended.
-    let response = match response {
-        Ok(r) => r,
-        Err(e) => {
-            if !in_program_mode {
-                let _ = send_raw_command(state, "EPG", false).await;
-            }
-            return Err(e);
-        }
-    };
-    let channel = match parse_cin_response(index, &response) {
-        Some(c) => c,
-        None => {
-            if !in_program_mode {
-                let _ = send_raw_command(state, "EPG", false).await;
-            }
-            return Err(ApiError::BadRequest("lockout_failed".to_string()));
-        }
-    };
-
-    let mut updated = channel;
-    updated.lockout = locked;
-    let payload = match build_cin_write_payload_for(&updated, &state.capabilities()) {
-        Ok(p) => p,
-        Err(e) => {
-            if !in_program_mode {
-                let _ = send_raw_command(state, "EPG", false).await;
-            }
-            return Err(e);
-        }
-    };
-
-    let write_cmd = format!("CIN,{},{}", index, payload);
-    let write_response = send_raw_command(state, &write_cmd, false).await;
-    let read_response = send_raw_command(state, &format!("CIN,{}", index), false).await;
-    if !in_program_mode {
-        let _ = send_raw_command(state, "EPG", false).await;
-    }
+    .await;
+    prg.close().await;
+    let (write_response, read_response) = bracket?;
 
     match classify_response(&write_response?) {
         ScannerReply::Ok => {}
@@ -2321,6 +2865,23 @@ pub(crate) async fn set_channel_lockout_on_scanner(
             read_back = readback.lockout,
             "lockout write not persisted as sent"
         );
+        // REGRESSION GUARD
+        // (`a_failed_lockout_write_still_stores_what_the_scanner_reported`):
+        // store the readback even though this returns Err (#556, findings
+        // 7/12).
+        //
+        // `readback` was just parsed off the wire -- it is what the radio
+        // actually holds. Callers update the shadow only on `Ok`, so
+        // discarding it here left the cache on its PRE-write value: a
+        // description already known to be wrong, kept in preference to one
+        // just read from the scanner.
+        //
+        // Reporting the failure is right; throwing away the truth on the way
+        // out is not. #413 made it durable -- the shadow is flushed to SQLite
+        // within 30 s and re-adopted at every connect.
+        if let Ok(mut shadow) = state.shadow.write() {
+            shadow.channels.insert(index, readback);
+        }
         return Err(ApiError::BadRequest("lockout_not_persisted".to_string()));
     }
     Ok(readback)
@@ -2341,7 +2902,7 @@ mod tests {
     use super::*;
     use crate::protocol::capabilities::BC125AT_FAMILY;
     use axum::body::{to_bytes, Body};
-    use axum::http::{Method, Request};
+    use axum::http::{header, Method, Request};
     use std::path::PathBuf;
     use tower::util::ServiceExt;
 
@@ -2350,6 +2911,19 @@ mod tests {
             .await
             .expect("read response body");
         serde_json::from_slice(&bytes).expect("valid json")
+    }
+
+    fn state_with_unwritable_preferences_db() -> AppState {
+        let mut state = default_state();
+        // The normal database is already a file, so treating it as a parent
+        // directory fails on every platform without relying on permissions.
+        state.preferences_db_path = Arc::new(
+            PathBuf::from(state.preferences_db_path.as_str())
+                .join("child.db")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        state
     }
 
     fn test_channel() -> ChannelData {
@@ -2645,16 +3219,34 @@ mod tests {
         assert_eq!(payload, "Test Chan,01451300,FM,0,-10,0,1");
     }
 
-    /// What the scanner reads back for any empty slot: the factory-empty
-    /// signature `AUTO,00000000,AUTO,0,2,1,0` as parse_cin_response produces it
-    /// (alpha_tag="AUTO", delay=2, lockout=1, priority=0, no tone).
-    fn factory_empty_readback() -> ChannelData {
+    /// What the scanner reads back for an empty slot, as `parse_cin_response`
+    /// produces it -- per model, because the two families do not agree.
+    ///
+    /// ```text
+    /// BC125AT  CIN,10,AUTO,00000000,AUTO,0,2,1,0  -> alpha "AUTO", mod "AUTO", delay 2
+    /// BC75XLT  CIN,299,,00000000,,,0,1,0          -> alpha "",     mod "",     delay 0
+    /// ```
+    ///
+    /// This used to hardcode the BC125AT signature, so every test built on it
+    /// asserted BC125AT behaviour only and the BC75XLT path through
+    /// `readback_matches` was unguarded -- the #435 pattern exactly. Lockout is
+    /// `true` on both, so it stays a literal.
+    fn factory_empty_readback(caps: &ScannerCapabilities) -> ChannelData {
         ChannelData {
             index: 10,
             frequency: 0.0,
-            modulation: "AUTO".to_string(),
-            alpha_tag: "AUTO".to_string(),
-            delay: 2,
+            // An empty CIN field stays empty; it is `[RSV]` on a BC75XLT.
+            modulation: if caps.has_per_channel_modulation {
+                "AUTO".to_string()
+            } else {
+                String::new()
+            },
+            alpha_tag: if caps.has_alpha_tags {
+                "AUTO".to_string()
+            } else {
+                String::new()
+            },
+            delay: caps.cleared_delay,
             lockout: true,
             priority: false,
             tone_squelch: None,
@@ -2663,6 +3255,10 @@ mod tests {
             bank: 1,
         }
     }
+
+    /// Both descriptors, for tests that must not pass by agreeing with one.
+    const BOTH_MODELS: [ScannerCapabilities; 2] =
+        [BC125AT_FAMILY, crate::protocol::capabilities::BC75XLT];
 
     fn empty_channel_readback() -> ChannelData {
         let mut c = test_channel();
@@ -2725,11 +3321,28 @@ mod tests {
     fn readback_accepts_factory_empty_ignoring_sent_delay_and_lockout() {
         // Live repro: wrote CIN,10,...,0,0,0 (delay 0, lockout 0, prio 0),
         // scanner forced ...,2,1,0. Both delay AND lockout diverge.
-        let mut wrote = factory_empty_readback();
-        wrote.delay = 0;
-        wrote.lockout = false;
-        let readback = factory_empty_readback(); // delay=2, lockout=1
-        assert!(readback_matches(&wrote, &readback, "AUTO", &BC125AT_FAMILY));
+        //
+        // Run against BOTH models. The delay we "send" is picked as any valid
+        // value that is NOT this model's cleared delay, so it genuinely
+        // diverges on each -- hardcoding 0 would make the BC75XLT case a
+        // no-divergence test, since 0 IS its cleared delay.
+        for caps in BOTH_MODELS {
+            let sent_delay = *caps
+                .valid_delays
+                .iter()
+                .find(|d| **d != caps.cleared_delay)
+                .expect("every model has a delay other than its cleared one");
+            let mut wrote = factory_empty_readback(&caps);
+            wrote.delay = sent_delay;
+            wrote.lockout = false;
+            let readback = factory_empty_readback(&caps);
+            let alpha = readback.alpha_tag.clone();
+            assert!(
+                readback_matches(&wrote, &readback, &alpha, &caps),
+                "cleared slot must verify on a scanner with cleared_delay={}",
+                caps.cleared_delay
+            );
+        }
     }
 
     #[test]
@@ -2752,16 +3365,22 @@ mod tests {
     fn readback_rejects_empty_write_that_did_not_go_factory_empty() {
         // Freq 0 but the read-back is NOT the factory signature (delay 5) —
         // something genuinely wrong; do not silently pass it.
-        let mut wrote = factory_empty_readback();
-        wrote.delay = 0;
-        let mut readback = factory_empty_readback();
-        readback.delay = 5;
-        assert!(!readback_matches(
-            &wrote,
-            &readback,
-            "AUTO",
-            &BC125AT_FAMILY
-        ));
+        //
+        // 5 is not a valid delay on either model's cleared slot, so this reads
+        // the same on both -- and running both proves the rejection is not an
+        // accident of the BC125AT's cleared_delay being 2.
+        for caps in BOTH_MODELS {
+            let mut wrote = factory_empty_readback(&caps);
+            wrote.delay = caps.cleared_delay;
+            let mut readback = factory_empty_readback(&caps);
+            readback.delay = 5;
+            let alpha = readback.alpha_tag.clone();
+            assert!(
+                !readback_matches(&wrote, &readback, &alpha, &caps),
+                "a non-factory delay must not pass as cleared (cleared_delay={})",
+                caps.cleared_delay
+            );
+        }
     }
 
     // REGRESSION GUARD (#198): priority is bank-exclusive — a programmed
@@ -2839,6 +3458,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disallowed_browser_origins_are_rejected_before_any_handler_runs() {
+        let state = default_state();
+        state
+            .preferences
+            .lock()
+            .unwrap()
+            .insert("theme".to_string(), json!("origin-guard-sentinel"));
+        let inspection = state.clone();
+        let app = router(state);
+
+        let routes = [
+            (Method::POST, "/api/v1/preferences/reset"),
+            (Method::POST, "/api/v1/commands/hold"),
+            (Method::POST, "/api/v1/commands/scan"),
+            (Method::POST, "/api/v1/memory/sync"),
+            (Method::POST, "/api/v1/memory/sync/cancel"),
+            (Method::POST, "/api/v1/memory/program-mode/start"),
+            (Method::POST, "/api/v1/memory/program-mode/end"),
+            (Method::POST, "/api/v1/lockouts/temporary/clear"),
+            (Method::POST, "/api/v1/lockouts/clear"),
+            (Method::POST, "/api/v1/lockouts/channels/clear"),
+            (Method::DELETE, "/api/v1/lockouts/frequencies"),
+            (Method::GET, "/api/v1/memory/export/bc125at_ss"),
+        ];
+
+        for (method, uri) in routes {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header(header::ORIGIN, "https://attacker.example")
+                        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
+        }
+
+        assert_eq!(
+            inspection.preferences.lock().unwrap()["theme"],
+            "origin-guard-sentinel",
+            "the rejected reset must not mutate preferences"
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_browser_and_originless_local_requests_still_reach_routes() {
+        for origin in [
+            Some("tauri://localhost"),
+            Some("http://localhost:5173"),
+            None,
+        ] {
+            let mut request = Request::builder().method(Method::GET).uri("/api/v1/health");
+            if let Some(origin) = origin {
+                request = request.header(header::ORIGIN, origin);
+            }
+            let response = router(default_state())
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "origin={origin:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn settings_all_requires_scanner_when_disconnected() {
         let app = router(default_state());
         let response = app
@@ -2873,6 +3561,84 @@ mod tests {
         let body = json_body(response).await;
         assert!(body.get("theme").is_some());
         assert!(body.get("mqtt_enabled").is_some());
+    }
+
+    #[tokio::test]
+    async fn preference_write_failure_returns_500_without_changing_memory() {
+        let state = state_with_unwritable_preferences_db();
+        let inspection = state.clone();
+        let original = inspection.preferences.lock().unwrap()["theme"].clone();
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/v1/preferences/theme")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"value":"light"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            json_body(response).await["error"],
+            "preference_persistence_failed"
+        );
+        assert_eq!(inspection.preferences.lock().unwrap()["theme"], original);
+    }
+
+    #[tokio::test]
+    async fn bulk_preference_write_failure_is_atomic_in_memory() {
+        let state = state_with_unwritable_preferences_db();
+        let inspection = state.clone();
+        let before = inspection.preferences.lock().unwrap().clone();
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/v1/preferences")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"theme":"light","analytics_scope":"all"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            json_body(response).await["error"],
+            "preference_persistence_failed"
+        );
+        assert_eq!(*inspection.preferences.lock().unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn preference_reset_failure_keeps_the_current_values() {
+        let state = state_with_unwritable_preferences_db();
+        state
+            .preferences
+            .lock()
+            .unwrap()
+            .insert("theme".to_string(), json!("field"));
+        let inspection = state.clone();
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/preferences/reset")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            json_body(response).await["error"],
+            "preference_persistence_failed"
+        );
+        assert_eq!(inspection.preferences.lock().unwrap()["theme"], "field");
     }
 
     // REGRESSION GUARD (#143): out-of-range channel indexes must be rejected
@@ -2919,11 +3685,34 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
+    async fn post_lockout_channel(
+        caps: crate::protocol::capabilities::ScannerCapabilities,
+        mode: &str,
+        channel: u16,
+    ) -> StatusCode {
+        let state = default_state();
+        state.device.write().unwrap().capabilities = Some(caps);
+        router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/commands/lockout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"mode":"{mode}","channel":{channel}}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
     // REGRESSION GUARD (#143): post_lockout must range-check the channel index.
     #[tokio::test]
     async fn post_lockout_rejects_out_of_range_channel() {
-        let app = router(default_state());
-        let response = app
+        let state = default_state();
+        let response = router(state)
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -2937,6 +3726,94 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = json_body(response).await;
         assert_eq!(body["error"], "channel_out_of_range");
+    }
+
+    /// REGRESSION GUARD (#556, finding 1): a permanent lockout with NO scanner
+    /// attached must fail, not invent a channel.
+    ///
+    /// The handler used to fall back to building a `ChannelData` out of live
+    /// state -- with a hardcoded `delay: 2` -- inserting it into
+    /// `shadow.channels`, and returning HTTP 200. Nothing reached the radio.
+    ///
+    /// That is a direct violation of the rule in `channel_cache`'s module
+    /// header: the cache is a READ ACCELERATOR, and nothing may write to it and
+    /// upload later. The value never came back from a scanner read, because
+    /// there was no scanner.
+    ///
+    /// #413 changed the severity without changing this code. The shadow is
+    /// flushed to SQLite within 30 s and re-adopted at every connect, so an
+    /// invented row now persists. Worse, `save_channels` DELETEs a profile's
+    /// rows before inserting: a one-entry fabricated map replaces the entire
+    /// cached image on disk. The completeness guard added in #578 refuses that
+    /// flush now, but the fabrication is still a lie in memory and the API
+    /// still told the user it worked.
+    ///
+    /// Returning `device_disconnected` is the honest answer, and it is what
+    /// every other write path here already does.
+    #[tokio::test]
+    async fn a_permanent_lockout_without_a_scanner_fails_instead_of_inventing_a_channel() {
+        let state = default_state();
+        // Precondition: no command sender, i.e. nothing to write to.
+        assert!(
+            state.command_tx.lock().unwrap().is_none(),
+            "precondition: this test is about the no-scanner path"
+        );
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/commands/lockout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mode":"permanent","channel":7}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a write with no radio attached is not a success"
+        );
+        let body = json_body(response).await;
+        assert_eq!(body["error"], "device_disconnected");
+
+        assert!(
+            state.shadow.read().unwrap().channels.get(&7).is_none(),
+            "and nothing may be invented into the channel cache: {:?}",
+            state.shadow.read().unwrap().channels.get(&7)
+        );
+    }
+
+    /// REGRESSION GUARD (#435): the bound follows the CONNECTED scanner.
+    ///
+    /// The guard above posts channel 600, which is out of range on both
+    /// families -- so it passed whether the bound read `ScannerCapabilities` or
+    /// a hardcoded 500, and it did in fact hide a hardcoded 500 in
+    /// `handlers::commands`. Channel 350 is the index where the models
+    /// disagree: valid on a BC125AT, past the end of a BC75XLT's 300. This is
+    /// the CH31 lesson from #429 applied to the lockout bound.
+    ///
+    /// Both modes are covered because both are reachable from the same UI
+    /// control and each carried its own copy of the literal.
+    #[tokio::test]
+    async fn post_lockout_bound_follows_the_connected_scanner() {
+        use crate::protocol::capabilities::{BC125AT_FAMILY, BC75XLT};
+
+        for mode in ["temporary", "permanent"] {
+            assert_eq!(
+                post_lockout_channel(BC75XLT, mode, 350).await,
+                StatusCode::BAD_REQUEST,
+                "{mode}: channel 350 is past the end of a BC75XLT's 300"
+            );
+            assert_ne!(
+                post_lockout_channel(BC125AT_FAMILY, mode, 350).await,
+                StatusCode::BAD_REQUEST,
+                "{mode}: channel 350 is valid on a BC125AT -- a bound that \
+                 rejects it everywhere is just a different wrong constant"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2955,29 +3832,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = json_body(response).await;
         assert!(body.as_array().is_some());
-    }
-
-    #[tokio::test]
-    async fn custom_search_defaults_returns_ten_ranges() {
-        let app = router(default_state());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/api/v1/settings/custom-search/defaults")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = json_body(response).await;
-        let ranges = body.get("ranges").and_then(|v| v.as_array()).unwrap();
-        assert_eq!(ranges.len(), 10);
-        // Spot-check the first entry (25.0–27.995 MHz, "CB / 11m").
-        assert_eq!(ranges[0].get("index"), Some(&serde_json::json!(1)));
-        assert_eq!(ranges[0].get("lower"), Some(&serde_json::json!(25.0)));
-        assert_eq!(ranges[0].get("label"), Some(&serde_json::json!("CB / 11m")));
     }
 
     fn temp_db_file(name: &str) -> PathBuf {
@@ -3016,7 +3870,8 @@ mod tests {
         // And writes must not cross over. A deliberately non-default value, so
         // the assertion cannot pass by matching what a fresh database returns.
         let sentinel = Value::from("only-in-a");
-        save_preference_to_db(&a.preferences_db_path, "theme", &sentinel);
+        save_preference_to_db(&a.preferences_db_path, "theme", &sentinel)
+            .expect("preference write");
         assert_eq!(
             load_preferences_from_db(&a.preferences_db_path)
                 .get("theme")
@@ -3143,6 +3998,168 @@ mod tests {
         assert!(check_not_from_the_future(p, 2, 1).is_err());
     }
 
+    /// A v1 preferences database gains `channel_memory` and reports v2, and
+    /// existing preference rows survive the step.
+    ///
+    /// The columns are asserted by name because the schema is the contract
+    /// Task 2 and #414 both build on: a silently renamed column would not fail
+    /// a round-trip test that uses the same names on both sides.
+    #[test]
+    fn preferences_v1_migrates_to_channel_memory_v2() {
+        let path = temp_db_file("channel-memory-v1-to-v2");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("create db");
+            conn.execute_batch(
+                "CREATE TABLE preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at REAL NOT NULL);",
+            )
+            .expect("v1 schema");
+            conn.execute(
+                "INSERT INTO preferences (key, value, updated_at) VALUES ('theme', '\"dark\"', 0)",
+                [],
+            )
+            .expect("seed a preference");
+            conn.pragma_update(None, "user_version", 1)
+                .expect("mark as v1");
+        }
+
+        init_preferences_db(path.to_str().unwrap()).expect("migration must succeed");
+
+        let conn = rusqlite::Connection::open(&path).expect("reopen");
+        // Every pending step runs, so a v1 database lands on the current
+        // version, not on 2. Compared against the constant so a future bump
+        // does not fail this test for a reason unrelated to what it checks.
+        assert_eq!(
+            schema_version(&conn),
+            PREFERENCES_SCHEMA_VERSION,
+            "a v1 database must be brought fully up to date"
+        );
+
+        let cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('channel_memory')")
+            .expect("table must exist")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query columns")
+            .flatten()
+            .collect();
+        for expected in [
+            "scanner_id",
+            "channel_index",
+            "frequency",
+            "modulation",
+            "alpha_tag",
+            "delay",
+            "lockout",
+            "priority",
+            "tone_kind",
+            "tone_squelch_hz",
+            "tone_dcs_code",
+            "synced_at",
+        ] {
+            assert!(
+                cols.iter().any(|c| c == expected),
+                "missing column {expected}: {cols:?}"
+            );
+        }
+        assert!(
+            !cols.iter().any(|c| c == "bank"),
+            "bank must NOT be persisted -- it is derived per connected model by \
+             channels_with_banks, and a stored bank reproduces the bank-derivation \
+             bug when a cache is read under a different model: {cols:?}"
+        );
+
+        let theme: String = conn
+            .query_row(
+                "SELECT value FROM preferences WHERE key = 'theme'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("existing preferences must survive the migration");
+        assert_eq!(theme, "\"dark\"");
+    }
+
+    /// Running the migration twice is a no-op rather than an error.
+    #[test]
+    fn channel_memory_migration_is_idempotent() {
+        let path = temp_db_file("channel-memory-idempotent");
+        let p = path.to_str().unwrap();
+        init_preferences_db(p).expect("first run");
+        init_preferences_db(p).expect("second run must be a no-op");
+
+        let conn = rusqlite::Connection::open(&path).expect("reopen");
+        // Compared against the constant, not a literal: a version bump should
+        // require touching the migration and nothing else. Hardcoding the
+        // number here made the bump to 3 fail this test for no reason.
+        assert_eq!(schema_version(&conn), PREFERENCES_SCHEMA_VERSION);
+    }
+
+    /// A v2 database gains the `scanners` table and keeps its channel memory.
+    ///
+    /// The columns are asserted by name for the same reason as the v2 test: the
+    /// schema is the contract #415 through #417 build on, and a silently
+    /// renamed column would not fail a round-trip test that uses the same names
+    /// on both sides.
+    #[test]
+    fn preferences_v2_migrates_to_scanners_v3() {
+        let path = temp_db_file("scanners-v2-to-v3");
+        let p = path.to_str().unwrap();
+
+        // Build a real v2 database, then wind the version back so the v3 step
+        // is the only one left to run.
+        init_preferences_db(p).expect("build current schema");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("reopen");
+            conn.execute(
+                "INSERT INTO channel_memory
+                     (scanner_id, channel_index, frequency, modulation, alpha_tag,
+                      delay, lockout, priority, tone_kind, synced_at)
+                 VALUES ('_default', 1, 146.52, 'FM', 'KEEP ME', 2, 0, 0, 'none', 1.0)",
+                [],
+            )
+            .expect("seed cached channel memory");
+            conn.execute("DROP TABLE scanners", []).expect("undo v3");
+            conn.pragma_update(None, "user_version", 2)
+                .expect("mark as v2");
+        }
+
+        init_preferences_db(p).expect("migration must succeed");
+
+        let conn = rusqlite::Connection::open(&path).expect("reopen");
+        assert_eq!(schema_version(&conn), PREFERENCES_SCHEMA_VERSION);
+
+        let cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('scanners')")
+            .expect("scanners table must exist")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query columns")
+            .filter_map(Result::ok)
+            .collect();
+        for expected in [
+            "scanner_id",
+            "match_index",
+            "model",
+            "usb_serial",
+            "display_name",
+            "first_seen",
+            "last_seen",
+        ] {
+            assert!(
+                cols.iter().any(|c| c == expected),
+                "scanners must carry `{expected}`: {cols:?}"
+            );
+        }
+
+        // The cache survives. Orphaning a user's channel memory on an upgrade
+        // would cost them a re-sync and look like data loss.
+        let tag: String = conn
+            .query_row(
+                "SELECT alpha_tag FROM channel_memory WHERE channel_index = 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("cached channel memory must survive the step");
+        assert_eq!(tag, "KEEP ME");
+    }
+
     /// REGRESSION GUARD: a failed step must NOT bump `user_version`.
     ///
     /// The bump used to run unconditionally after `let _ = conn.execute(...)`,
@@ -3260,6 +4277,59 @@ mod tests {
         }
     }
 
+    /// An EXISTING database that gets upgraded says so, because upgrading is a
+    /// one-way door and the user is the one who needs to know.
+    ///
+    /// Migrations are forward-only, and `check_not_from_the_future` refuses a
+    /// database whose `user_version` is newer than the running build. So once
+    /// 1.1.0 has opened a 1.0.0 database, 1.0.0 can no longer read it. That is
+    /// correct behaviour -- old code against a newer schema is silent
+    /// misbehaviour -- but it happened invisibly, so the first a user heard of
+    /// it was an error message during a downgrade they had already committed to.
+    #[test]
+    fn an_upgraded_database_reports_that_it_was_upgraded() {
+        let path = temp_db_file("analytics-upgrade-notice");
+        seed_v1_analytics_db(&path, &[(146.7, Some("KC FIRE 1"))]);
+        let p = path.to_str().expect("path to string");
+
+        let upgraded = init_analytics_db(p).expect("migrate");
+        assert!(
+            upgraded,
+            "a v1 database taken to v2 must report the upgrade; the user can no \
+             longer open it with the version they had"
+        );
+
+        // Second launch finds the schema current and must NOT claim an upgrade,
+        // or the notice would reappear on every start and stop meaning anything.
+        let again = init_analytics_db(p).expect("second migrate is a no-op");
+        assert!(!again, "an already-current database was not upgraded");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A FRESH install must not claim an upgrade.
+    ///
+    /// Paired with the guard above, and not redundant: a new database also
+    /// travels 0 -> N, so a naive "did the version change?" check reports an
+    /// upgrade on first launch. Telling a brand-new user their data was
+    /// upgraded and they cannot go back is both false and alarming, and it is
+    /// the more likely of the two mistakes to ship because every developer
+    /// testing this has a database already.
+    #[test]
+    fn a_fresh_database_does_not_claim_an_upgrade() {
+        let path = temp_db_file("analytics-fresh-no-notice");
+        let p = path.to_str().expect("path to string");
+
+        let upgraded = init_analytics_db(p).expect("create");
+        assert!(
+            !upgraded,
+            "a database created from nothing was not upgraded -- there was no \
+             earlier version to lose"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// A v1 database carrying real hits must reach v2 with every row intact.
     ///
     /// Migrations are forward-only (#418), so a step that drops rows on the way
@@ -3367,6 +4437,153 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// REGRESSION GUARD (#415): the hit-load cap applies PER SCANNER.
+    ///
+    /// `load_analytics_hits_from_db` took the newest `ANALYTICS_HIT_LOAD_CAP`
+    /// rows across the whole table. With two radios attached that is a
+    /// starvation bug, and #415 named it before it could happen: a chatty
+    /// scanner fills the entire budget and the quiet one's history is absent
+    /// from the in-memory log, so the activity view and every dashboard
+    /// derived from it silently show nothing for a scanner that was recording
+    /// fine.
+    ///
+    /// The assertion is on CONTENT, not on `loaded.len()`. A count check
+    /// passes for a build that returns the cap's worth of arbitrary rows --
+    /// which is exactly what the bug does -- so it could never fail. What has
+    /// to be true is that the QUIET scanner's specific hits come back.
+    #[test]
+    fn the_hit_load_cap_applies_per_scanner() {
+        let path = temp_db_file("analytics-per-scanner-cap");
+        let p = path.to_str().expect("path to string").to_string();
+        init_analytics_db(&p).expect("migrate");
+
+        let hit_at = |ts: f64, scanner: &str| ActivityHit {
+            id: "0".to_string(),
+            timestamp: ts,
+            frequency: 146.7,
+            channel: Some(1),
+            alpha_tag: None,
+            rssi: 36,
+            duration: 1.0,
+            modulation: "NFM".to_string(),
+            mode: ScannerMode::Scan,
+            bank: Some(1),
+            session_id: "s".to_string(),
+            ended_at: ts + 1.0,
+            scanner_id: Some(scanner.to_string()),
+        };
+
+        // The quiet scanner recorded FIRST, so every one of its hits is older
+        // than everything the chatty one produced. Under a global
+        // "newest N" cap they are the first rows evicted.
+        let quiet_stamps: Vec<f64> = (0..5).map(|i| 1_000.0 + i as f64).collect();
+        for ts in &quiet_stamps {
+            insert_analytics_hit(&p, &hit_at(*ts, "QUIET"));
+        }
+        // Chatty fills the whole budget on its own. Seeded in one transaction
+        // rather than through `insert_analytics_hit`, which opens a fresh
+        // connection per row — thousands of those makes the test slow enough
+        // that people stop running it.
+        {
+            let conn = rusqlite::Connection::open(&path).expect("open for bulk seed");
+            conn.execute_batch("BEGIN").expect("begin");
+            {
+                let mut stmt = conn
+                    .prepare(
+                        "INSERT INTO scan_hits (timestamp, frequency, channel, alpha_tag, modulation, rssi, duration, mode, bank, session_id, ended_at, scanner_id)
+                         VALUES (?1, 146.7, 1, NULL, 'NFM', 36, 1.0, 'SCAN', 1, 's', ?2, 'CHATTY')",
+                    )
+                    .expect("prepare bulk insert");
+                for i in 0..ANALYTICS_HIT_LOAD_CAP {
+                    let ts = 50_000.0 + i as f64;
+                    stmt.execute(rusqlite::params![ts, ts + 1.0])
+                        .expect("bulk insert");
+                }
+            }
+            conn.execute_batch("COMMIT").expect("commit");
+        }
+
+        let loaded = load_analytics_hits_from_db(&p);
+
+        let quiet_loaded: Vec<f64> = loaded
+            .iter()
+            .filter(|h| h.scanner_id.as_deref() == Some("QUIET"))
+            .map(|h| h.timestamp)
+            .collect();
+        assert_eq!(
+            quiet_loaded, quiet_stamps,
+            "every hit from the quiet scanner must survive the load; a chatty \
+             scanner must not evict another scanner's history"
+        );
+
+        // And the chatty scanner still gets its own full allowance rather than
+        // being penalised for the other's presence.
+        let chatty_count = loaded
+            .iter()
+            .filter(|h| h.scanner_id.as_deref() == Some("CHATTY"))
+            .count();
+        assert_eq!(
+            chatty_count, ANALYTICS_HIT_LOAD_CAP,
+            "the cap is per scanner, so the chatty scanner keeps a full cap's worth"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// REGRESSION GUARD (#608): the analytics READ path must not define schema.
+    ///
+    /// `load_analytics_hits_from_db` opened with a `CREATE TABLE IF NOT EXISTS
+    /// scan_hits (...)` that omitted `scanner_id`, while the `SELECT` two
+    /// statements below reads it. `scanner_id` arrived in analytics schema v2
+    /// (#440) via `ALTER TABLE`; this second, drifting copy of the same table
+    /// was never updated to match.
+    ///
+    /// In production `migrate_analytics_db` runs first, so the `IF NOT EXISTS`
+    /// is a no-op and the mismatch stays hidden. It only bites where this CREATE
+    /// actually fires — a database reaching this function unmigrated — and then
+    /// it bites silently: the table comes into existence WITHOUT `scanner_id`,
+    /// `conn.prepare` returns `Err`, `if let Ok(..)` skips the whole block, and
+    /// the caller cannot tell "no hits recorded" from "the query was malformed".
+    /// To the user that is an empty activity log and empty dashboards, with
+    /// nothing in a WARN-only file log to say why.
+    ///
+    /// The fix is one owner for the schema: `migrate_analytics_db`. A reader
+    /// that creates tables is the actual defect, and a second definition that
+    /// must be edited in lockstep with the first is what went wrong here.
+    ///
+    /// Asserting the table is ABSENT, not that the result is empty. An empty
+    /// result is what the bug produces too, so it cannot tell the two apart.
+    #[test]
+    fn loading_hits_does_not_create_the_table() {
+        let path = temp_db_file("analytics-read-no-create");
+        let p = path.to_str().expect("path to string").to_string();
+
+        // Deliberately NOT migrated — this is the unmigrated path the inline
+        // CREATE was there to paper over.
+        let loaded = load_analytics_hits_from_db(&p);
+        assert!(
+            loaded.is_empty(),
+            "an unmigrated database has no hits to load"
+        );
+
+        let conn = rusqlite::Connection::open(&path).expect("open");
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='scan_hits'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query sqlite_master");
+        assert_eq!(
+            tables, 0,
+            "the read path must not create scan_hits; it used to create one \
+             WITHOUT scanner_id, which made every later prepare fail silently"
+        );
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// REGRESSION GUARD: a failed backup aborts the migration.
     ///
     /// Forward-only migrations make the pre-migration backup the ONLY recovery
@@ -3387,22 +4604,23 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("create dir");
         let path = dir.join("prefs.db");
-        {
-            let conn = rusqlite::Connection::open(&path).expect("create db");
-            conn.execute(
-                "CREATE TABLE preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at REAL NOT NULL)",
-                [],
-            )
-            .expect("create table");
-        }
+        // The connection stays open across the backup now that the backup runs
+        // through SQLite rather than the filesystem (#574).
+        let conn = rusqlite::Connection::open(&path).expect("create db");
+        conn.execute(
+            "CREATE TABLE preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at REAL NOT NULL)",
+            [],
+        )
+        .expect("create table");
         // Read+execute only: the existing file stays readable, but a new file
         // cannot be created alongside it.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
             .expect("make dir read-only");
 
-        let result = backup_db_if_needed(path.to_str().unwrap(), "preferences", 0, 1);
+        let result = backup_db_if_needed(&conn, path.to_str().unwrap(), "preferences", 0, 1);
 
         // Restore permissions before asserting so a failure still cleans up.
+        drop(conn);
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -3414,18 +4632,111 @@ mod tests {
         );
     }
 
+    /// REGRESSION GUARD (#574): the pre-migration backup must contain data that
+    /// is still sitting in the write-ahead log.
+    ///
+    /// `open_sqlite` sets `journal_mode = WAL` and `synchronous = NORMAL`, so a
+    /// committed transaction lives in the `-wal` sidecar until something
+    /// checkpoints it. The backup was `std::fs::copy` of the main file alone --
+    /// the `-wal` and `-shm` sidecars were not copied and no checkpoint was
+    /// forced, so the ONLY recovery path from a forward-only migration could be
+    /// missing the most recent committed state.
+    ///
+    /// Restoring it was worse than incomplete: dropping the `.bak` over
+    /// `preferences.db` while a newer `-wal` still sat beside it produces a
+    /// MISMATCHED PAIR, not the old database.
+    ///
+    /// The existing backup tests assert that a file is CREATED, and that its
+    /// absence aborts. Never what is inside it -- the same shape as the
+    /// `synced_at` bug from #537: a guard that checks a value exists cannot
+    /// notice the value is wrong.
+    ///
+    /// The 30-second channel-cache flush (#413) makes the volume of at-risk WAL
+    /// frames much larger than it was when this code was written, and v2/v3 are
+    /// the first migrations to run against a database holding real channel
+    /// memory. Before that, the worst case was losing preferences.
+    #[test]
+    fn the_backup_includes_uncheckpointed_wal_data() {
+        let path = temp_db_file("wal-backup");
+        let path_str = path.to_str().expect("path").to_string();
+
+        // Exactly what `open_sqlite` configures.
+        let conn = rusqlite::Connection::open(&path).expect("create db");
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .expect("wal");
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .expect("synchronous");
+        conn.execute(
+            "CREATE TABLE preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at REAL NOT NULL)",
+            [],
+        )
+        .expect("create table");
+        conn.pragma_update(None, "user_version", 2)
+            .expect("set version");
+
+        // Checkpoint the SCHEMA into the main file, so the only thing left in
+        // the WAL is the row below. Without this the backup would be missing
+        // the table too, and the test would prove a blunter point than the one
+        // #574 is about: committed data that the copy cannot see.
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint");
+
+        // Committed, and deliberately NOT checkpointed. The connection stays
+        // open, so these frames are still in `-wal` when the backup runs --
+        // which is the state a SIGKILL, panic or power loss leaves behind.
+        conn.execute(
+            "INSERT INTO preferences (key, value, updated_at) VALUES ('theme', 'dark', 1.0)",
+            [],
+        )
+        .expect("insert");
+        assert!(
+            std::path::Path::new(&format!("{path_str}-wal")).exists(),
+            "precondition: the WAL sidecar must be hot for this test to mean \
+             anything"
+        );
+
+        let backup = backup_db_if_needed(&conn, &path_str, "preferences", 2, 3)
+            .expect("the backup must succeed")
+            .expect("a database at v2 going to v3 must be backed up");
+
+        // Open the backup ALONE. No sidecar travels with it, which is the whole
+        // point: whatever the recovery path can read has to already be in this
+        // one file.
+        let restored = rusqlite::Connection::open(&backup).expect("open backup");
+        let value: String = restored
+            .query_row(
+                "SELECT value FROM preferences WHERE key = 'theme'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the committed row must be IN the backup, not just in the original's WAL");
+        assert_eq!(value, "dark");
+
+        let version: i32 = restored
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read user_version");
+        assert_eq!(
+            version, 2,
+            "the backup must carry the schema version it was taken at -- \
+             restoring it is how a user gets back to the pre-migration app, \
+             and a version of 0 would make that build re-run every migration"
+        );
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup);
+    }
+
     /// The backup path appears in the failure message, because forward-only
     /// migrations make "restore the .bak" the documented way back and a user
     /// told to do that has to be able to find the file.
     #[test]
     fn a_successful_backup_lands_next_to_the_database() {
         let path = temp_db_file("backup-made");
-        {
-            let conn = rusqlite::Connection::open(&path).expect("create db");
-            conn.execute("CREATE TABLE probe (id INTEGER)", [])
-                .expect("create table");
-        }
-        let backup = backup_db_if_needed(path.to_str().unwrap(), "preferences", 0, 1)
+        let conn = rusqlite::Connection::open(&path).expect("create db");
+        conn.execute("CREATE TABLE probe (id INTEGER)", [])
+            .expect("create table");
+        let backup = backup_db_if_needed(&conn, path.to_str().unwrap(), "preferences", 0, 1)
             .expect("backup must succeed")
             .expect("a backup must be made when migrating an existing database");
 
@@ -3444,12 +4755,10 @@ mod tests {
     #[test]
     fn no_backup_is_made_when_already_current() {
         let path = temp_db_file("no-backup");
-        {
-            let conn = rusqlite::Connection::open(&path).expect("create db");
-            conn.execute("CREATE TABLE probe (id INTEGER)", [])
-                .expect("create table");
-        }
-        let backup = backup_db_if_needed(path.to_str().unwrap(), "preferences", 1, 1)
+        let conn = rusqlite::Connection::open(&path).expect("create db");
+        conn.execute("CREATE TABLE probe (id INTEGER)", [])
+            .expect("create table");
+        let backup = backup_db_if_needed(&conn, path.to_str().unwrap(), "preferences", 1, 1)
             .expect("no-op must succeed");
         assert!(backup.is_none(), "already-current needs no backup");
         let _ = std::fs::remove_file(&path);
@@ -3667,6 +4976,284 @@ mod tests {
         assert_ne!(channel.bank, 0, "bank 0 is the parser's placeholder");
     }
 
+    /// REGRESSION GUARD (#507): a VALUE-level guard on the `C-Freq` row.
+    ///
+    /// `bc125at_ss_export_matches_the_reference_file_shape` compares
+    /// run-length-encoded (section, field_count, run) triples and never looks
+    /// at values, which was the right call for the positional bug it was
+    /// written for (#461) and is why the tone column shipped broken for months
+    /// (#516): Bearpaw wrote `100.0`, Uniden reads `C100.0`, and every export
+    /// of a toned channel silently lost it while the golden test stayed green.
+    ///
+    /// This asserts ONE row with every column set to a distinct non-default
+    /// value, so a change to ANY of them has to update a test deliberately
+    /// rather than slipping through. Per-column bespoke tests were the previous
+    /// answer and only ever covered the column someone had already broken.
+    #[tokio::test]
+    async fn bc125at_ss_export_pins_every_c_freq_column() {
+        let state = default_state();
+        {
+            let mut shadow = state.shadow.write().unwrap();
+            for idx in 1..=500u16 {
+                shadow.channels.insert(
+                    idx,
+                    ChannelData {
+                        index: idx,
+                        ..Default::default()
+                    },
+                );
+            }
+            shadow.channels.insert(
+                250,
+                ChannelData {
+                    index: 250,
+                    frequency: 154.5,
+                    modulation: "NFM".to_string(),
+                    alpha_tag: "FULL FIELD".to_string(),
+                    tone_squelch_kind: crate::state::ToneSquelchKind::Ctcss,
+                    tone_squelch: Some(141.3),
+                    tone_dcs_code: None,
+                    lockout: true,
+                    delay: 5,
+                    priority: true,
+                    bank: 5,
+                },
+            );
+        }
+        let _scanner = FakeScanner::attach(&state, |cmd: &str| {
+            Ok(match cmd {
+                "BLT" => "BLT,AF".to_string(),
+                "KBP" => "KBP,99,0".to_string(),
+                "BSV" => "BSV,2".to_string(),
+                "PRI" => "PRI,0".to_string(),
+                "SCG" => "SCG,1111111111".to_string(),
+                "SCO" => "SCO,1,0".to_string(),
+                "CLC" => "CLC,0,0,0,11111,0".to_string(),
+                "WXS" => "WXS,0".to_string(),
+                "CNT" => "CNT,8".to_string(),
+                "VOL" => "VOL,14".to_string(),
+                "SQL" => "SQL,6".to_string(),
+                c if c.starts_with("CSP,") => format!("{c},25000000,27995000"),
+                c if c.starts_with("SSP,") => format!("{c},0"),
+                _ => "OK".to_string(),
+            })
+        });
+
+        let response =
+            super::handlers::exports::export_bc125at_ss_file(axum::extract::State(state.clone()))
+                .await
+                .expect("export should succeed");
+        let body = axum::response::IntoResponse::into_response(response);
+        let bytes = axum::body::to_bytes(body.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let out = String::from_utf8(bytes.to_vec()).expect("utf8");
+
+        // idx, name, freqHz, modulation, tone, lockout, delay, priority
+        assert!(
+            out.contains("C-Freq\t250\tFULL FIELD\t154500000\tNFM\tC141.3\tOn\t5\tOn\r\n"),
+            "every C-Freq column must serialise exactly as Uniden writes it"
+        );
+
+        // And the default row, which pins the `Auto` casing (#507) plus the
+        // cleared-slot shape every untouched channel takes.
+        assert!(
+            out.contains("C-Freq\t1\t\t0\tAuto\tOff\tOff\t0\tOff\r\n"),
+            "an unprogrammed channel must use Uniden's `Auto`, not the wire's `AUTO`"
+        );
+        assert!(
+            !out.contains("\tAUTO\t"),
+            "the wire's upper-case AUTO must never reach the file"
+        );
+    }
+
+    /// REGRESSION GUARD (#459): `AvoidFreqs` must reach the file, and must sit
+    /// BETWEEN `GeneralSearch` and the first `Conventional`.
+    ///
+    /// Position is load-bearing in this format -- #461 was a pure ordering bug
+    /// that no field-count comparison could see -- so a builder that emits the
+    /// right line in the wrong place is still a broken file. The unit tests
+    /// next to `build_avoid_freqs_line` cover the field packing; this covers
+    /// that it is called at all, and where.
+    #[tokio::test]
+    async fn bc125at_ss_export_writes_avoid_freqs_between_search_and_banks() {
+        let state = default_state();
+        {
+            let mut shadow = state.shadow.write().unwrap();
+            for idx in 1..=500u16 {
+                shadow.channels.insert(
+                    idx,
+                    ChannelData {
+                        index: idx,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        // GLF is a cursor: successive bare calls step the list, then -1 ends it.
+        // A stateless fake would loop until the 110-iteration bound.
+        let glf_calls = std::sync::Mutex::new(0usize);
+        let _scanner = FakeScanner::attach(&state, move |cmd: &str| {
+            Ok(match cmd {
+                "GLF" => {
+                    let mut n = glf_calls.lock().unwrap();
+                    *n += 1;
+                    match *n {
+                        1 => "GLF,01167333".to_string(),
+                        2 => "GLF,01228833".to_string(),
+                        _ => "GLF,-1".to_string(),
+                    }
+                }
+                "BLT" => "BLT,AF".to_string(),
+                "KBP" => "KBP,99,0".to_string(),
+                "BSV" => "BSV,2".to_string(),
+                "PRI" => "PRI,0".to_string(),
+                "SCG" => "SCG,1111111111".to_string(),
+                "SCO" => "SCO,1,0".to_string(),
+                "CLC" => "CLC,0,0,0,11111,0".to_string(),
+                "WXS" => "WXS,0".to_string(),
+                "CNT" => "CNT,8".to_string(),
+                "VOL" => "VOL,14".to_string(),
+                "SQL" => "SQL,6".to_string(),
+                c if c.starts_with("CSP,") => format!("{c},25000000,27995000"),
+                c if c.starts_with("SSP,") => format!("{c},0"),
+                _ => "OK".to_string(),
+            })
+        });
+
+        let response =
+            super::handlers::exports::export_bc125at_ss_file(axum::extract::State(state.clone()))
+                .await
+                .expect("export should succeed");
+        let body = axum::response::IntoResponse::into_response(response);
+        let bytes = axum::body::to_bytes(body.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let out = String::from_utf8(bytes.to_vec()).expect("utf8");
+
+        let keys: Vec<&str> = out
+            .split("\r\n")
+            .filter(|l| !l.is_empty())
+            .map(|l| l.split('\t').next().unwrap_or(""))
+            .collect();
+
+        let avoid = keys
+            .iter()
+            .position(|k| *k == "AvoidFreqs")
+            .expect("AvoidFreqs must be emitted when the lockout list is non-empty");
+        let search = keys
+            .iter()
+            .position(|k| *k == "GeneralSearch")
+            .expect("GeneralSearch");
+        let first_bank = keys
+            .iter()
+            .position(|k| *k == "Conventional")
+            .expect("Conventional");
+
+        assert!(
+            search < avoid && avoid < first_bank,
+            "AvoidFreqs must sit between GeneralSearch and the first Conventional, got \
+             GeneralSearch={search} AvoidFreqs={avoid} Conventional={first_bank}"
+        );
+        assert_eq!(
+            keys.iter().filter(|k| **k == "AvoidFreqs").count(),
+            1,
+            "exactly one AvoidFreqs line"
+        );
+        assert!(
+            out.contains("AvoidFreqs\t\t116733300\t122883300\t"),
+            "values packed from field 2 in walk order, integer Hz"
+        );
+    }
+
+    /// REGRESSION GUARD (#516): the tone column must reach the FILE, not just
+    /// the helper. `ss_tone_label` is unit-tested next to itself; this asserts
+    /// the emitted `C-Freq` line, so a future refactor that stops calling it
+    /// (or calls `dcs_code_to_label` again) fails here.
+    ///
+    /// The golden shape test cannot cover this: it compares section and
+    /// field-count runs, and every reference file is `Off` on all 500 rows.
+    #[tokio::test]
+    async fn bc125at_ss_export_writes_unidens_tone_spellings() {
+        let state = default_state();
+        {
+            let mut shadow = state.shadow.write().unwrap();
+            for idx in 1..=500u16 {
+                shadow.channels.insert(
+                    idx,
+                    ChannelData {
+                        index: idx,
+                        ..Default::default()
+                    },
+                );
+            }
+            shadow.channels.insert(
+                429,
+                ChannelData {
+                    index: 429,
+                    frequency: 123.0,
+                    modulation: "AM".to_string(),
+                    tone_squelch_kind: crate::state::ToneSquelchKind::Ctcss,
+                    tone_squelch: Some(100.0),
+                    ..Default::default()
+                },
+            );
+            shadow.channels.insert(
+                430,
+                ChannelData {
+                    index: 430,
+                    frequency: 462.5625,
+                    modulation: "NFM".to_string(),
+                    tone_squelch_kind: crate::state::ToneSquelchKind::Dcs,
+                    tone_dcs_code: Some(128),
+                    ..Default::default()
+                },
+            );
+        }
+        let _scanner = FakeScanner::attach(&state, |cmd: &str| {
+            Ok(match cmd {
+                "BLT" => "BLT,AF".to_string(),
+                "KBP" => "KBP,99,0".to_string(),
+                "BSV" => "BSV,2".to_string(),
+                "PRI" => "PRI,0".to_string(),
+                "SCG" => "SCG,1111111111".to_string(),
+                "SCO" => "SCO,1,0".to_string(),
+                "CLC" => "CLC,0,0,0,11111,0".to_string(),
+                "WXS" => "WXS,0".to_string(),
+                "CNT" => "CNT,8".to_string(),
+                "VOL" => "VOL,14".to_string(),
+                "SQL" => "SQL,6".to_string(),
+                c if c.starts_with("CSP,") => format!("{c},25000000,27995000"),
+                c if c.starts_with("SSP,") => format!("{c},0"),
+                _ => "OK".to_string(),
+            })
+        });
+
+        let response =
+            super::handlers::exports::export_bc125at_ss_file(axum::extract::State(state.clone()))
+                .await
+                .expect("export should succeed");
+        let body = axum::response::IntoResponse::into_response(response);
+        let bytes = axum::body::to_bytes(body.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let out = String::from_utf8(bytes.to_vec()).expect("utf8");
+
+        // Measured against BC125AT SS reading a real radio, 2026-08-29.
+        assert!(
+            out.contains("C-Freq\t429\t\t123000000\tAM\tC100.0\t"),
+            "CTCSS must be written as C100.0"
+        );
+        assert!(
+            out.contains("C-Freq\t430\t\t462562500\tNFM\tD023\t"),
+            "DCS must be written as D023"
+        );
+        assert!(
+            !out.contains("DCS 023"),
+            "the UI's `DCS 023` label must never reach the file"
+        );
+    }
+
     /// GOLDEN TEST: the `.bc125at_ss` we write must match the shape of a file
     /// written by Uniden's own tool.
     ///
@@ -3799,15 +5386,23 @@ mod tests {
                 shadow.channels.insert(idx, ch);
             }
         }
-        // Exactly the replies this model gave on the wire, 2026-08-26.
+        // Mixed search/band settings exercise both mask polarities: CSG uses
+        // zero=enabled, while CLC uses one=enabled.
         let _scanner = FakeScanner::attach(&state, |cmd: &str| {
             Ok(match cmd {
                 "KBP" => "KBP,,0".to_string(),
                 "SQL" => "SQL,2".to_string(),
                 "PRI" => "PRI,0".to_string(),
-                "SCO" => "SCO,2,,0".to_string(),
+                "SCO" => "SCO,1,,1".to_string(),
                 "CLC" => "CLC,2,1,1,11101,".to_string(),
                 "SCG" => "SCG,1111111111".to_string(),
+                "CSG" => "CSG,0111111110,0,1".to_string(),
+                c if c.starts_with("SSP,") => {
+                    let index = c.trim_start_matches("SSP,").parse::<u8>().unwrap();
+                    let delay = if index % 2 == 1 { 1 } else { 0 };
+                    let direction = if index == 2 { 1 } else { 0 };
+                    format!("{c},{delay},{direction}")
+                }
                 _ => "OK".to_string(),
             })
         });
@@ -3856,6 +5451,18 @@ mod tests {
         // writer must keep it; this one must not have it.
         assert!(ours.contains("Custom\t1\tSearch Bank1\t"));
         assert!(!ours.contains("Bnak"));
+
+        // Value fidelity, not just section shape. These are the exact states
+        // returned by the fake scanner above.
+        assert!(ours.contains("Service\t1\tWX\t\t2\tUp\r\n"));
+        assert!(ours.contains("Service\t2\tPolice\t\t0\tDown\r\n"));
+        assert!(ours.contains("CustomSearch\t0\tDown\r\n"));
+        assert!(ours.contains("Custom\t1\tSearch Bank1\t25000000\t27995000\tOn\r\n"));
+        assert!(ours.contains("Custom\t2\tSearch Bank2\t28000000\t29695000\tOff\r\n"));
+        assert!(ours.contains("Custom\t10\tSearch Bank10\t470000000\t512000000\tOn\r\n"));
+        assert!(ours.contains("CloseCall\tDND\tOn\tOn\t\r\n"));
+        assert!(ours.contains("CloseCallBands\tOn\tOn\tOn\t\tOn\r\n"));
+        assert!(ours.contains("GeneralSearch\t2\t\tDown\r\n"));
 
         // The reserved columns go out empty, as the real file has them.
         // Delay 2 despite the channel carrying wire delay 1: the tool writes a
@@ -3968,6 +5575,307 @@ mod tests {
             !is_factory_empty(&cleared, &BC125AT_FAMILY),
             "delay 0 is not what a BC125AT reports either — this is not a \
              sentinel, it is a real per-model value"
+        );
+    }
+
+    /// REGRESSION GUARD (#479): the swap sends `DCH` only where `DCH` exists.
+    ///
+    /// A BC75XLT has no `DCH` and refuses an in-place priority clear, so the
+    /// clear step failed and aborted every swap -- by design, per the atomicity
+    /// guard. It needs no clear: its firmware moves the flag within a bank
+    /// itself (hardware 2026-08-28, findings.md §8).
+    ///
+    /// Paired on purpose. Asserting only the BC75XLT half would pass for a
+    /// build that never cleared on ANY model, which would silently leave a
+    /// BC125AT bank holding two priority channels.
+    async fn priority_swap_transcript(
+        caps: crate::protocol::capabilities::ScannerCapabilities,
+    ) -> Vec<String> {
+        let state = default_state();
+        state.device.write().unwrap().capabilities = Some(caps);
+        {
+            let mut shadow = state.shadow.write().unwrap();
+            for (index, priority) in [(2u16, true), (9u16, false)] {
+                shadow.channels.insert(
+                    index,
+                    ChannelData {
+                        index,
+                        frequency: 146.52,
+                        priority,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        // Delay 0, not the shared responder's 2. Delay is a boolean on a
+        // BC75XLT, so a channel carrying 2 cannot exist there and
+        // `build_cin_write_payload_for` rejects it before the wire -- the swap
+        // would fail for a reason that has nothing to do with the clear. 0 is
+        // valid on both models, so the pair differs ONLY by capabilities.
+        let scanner = FakeScanner::attach(&state, |command: &str| {
+            if command == "PRG" {
+                return Ok("PRG,OK\r".to_string());
+            }
+            if command == "EPG" {
+                return Ok("EPG,OK\r".to_string());
+            }
+            if command.starts_with("DCH,") {
+                return Ok("DCH,OK\r".to_string());
+            }
+            if let Some(rest) = command.strip_prefix("CIN,") {
+                let mut fields = rest.splitn(2, ',');
+                let index: u16 = fields.next().unwrap_or("").parse().unwrap_or(0);
+                match fields.next() {
+                    Some(payload) => {
+                        let wrote_priority = payload.rsplit(',').next() == Some("1");
+                        WROTE_PRIORITY.with(|w| {
+                            w.borrow_mut().insert(index, wrote_priority);
+                        });
+                        return Ok("CIN,OK\r".to_string());
+                    }
+                    None => {
+                        let priority = WROTE_PRIORITY
+                            .with(|w| w.borrow().get(&index).copied())
+                            .unwrap_or(index == 2);
+                        return Ok(format!(
+                            "CIN,{index},,01451300,,,0,0,{}\r",
+                            if priority { 1 } else { 0 }
+                        ));
+                    }
+                }
+            }
+            Ok("OK\r".to_string())
+        });
+        let _ = set_channel_priority(&state, 9).await;
+        scanner.transcript_with_closed_bracket()
+    }
+
+    /// Seed one channel into the shadow with the given priority flag.
+    fn shadow_with_priority(state: &AppState, index: u16, priority: bool) {
+        state.shadow.write().unwrap().channels.insert(
+            index,
+            ChannelData {
+                index,
+                frequency: 145.13,
+                priority,
+                ..Default::default()
+            },
+        );
+    }
+
+    fn shadow_priority(state: &AppState, index: u16) -> Option<bool> {
+        state
+            .shadow
+            .read()
+            .unwrap()
+            .channels
+            .get(&index)
+            .map(|c| c.priority)
+    }
+
+    /// REGRESSION GUARD: a priority clear writes its verified result to the
+    /// shadow, so the cache stops disagreeing with the radio.
+    ///
+    /// `clear_channel_priority_locked` read the channel, ran DCH+rewrite,
+    /// read-back-verified, and then RETURNED the readback without storing it.
+    /// Its sibling `set_channel_priority` inserts into the shadow three times.
+    /// The asymmetry was invisible until #413: the stale flag used to be
+    /// cleared by the next launch's memory sync, and is now flushed to SQLite
+    /// within CHANNEL_CACHE_FLUSH_SECS and re-adopted at every connect.
+    #[tokio::test]
+    async fn a_priority_clear_updates_the_shadow() {
+        let state = default_state();
+        shadow_with_priority(&state, 5, true);
+
+        // Priority starts set on the radio and is cleared by the DCH+rewrite.
+        let cleared = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cleared.clone();
+        let _scanner = FakeScanner::attach(&state, move |command: &str| {
+            if command == "PRG" {
+                return Ok("PRG,OK\r".to_string());
+            }
+            if command == "EPG" {
+                return Ok("EPG,OK\r".to_string());
+            }
+            if command.starts_with("DCH,") {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                return Ok("DCH,OK\r".to_string());
+            }
+            if let Some(rest) = command.strip_prefix("CIN,") {
+                let mut fields = rest.splitn(2, ',');
+                let index: u16 = fields.next().unwrap_or("").parse().unwrap_or(0);
+                if fields.next().is_some() {
+                    return Ok("CIN,OK\r".to_string());
+                }
+                let priority = !flag.load(std::sync::atomic::Ordering::Relaxed);
+                return Ok(format!(
+                    "CIN,{index},,01451300,,,0,0,{}\r",
+                    if priority { 1 } else { 0 }
+                ));
+            }
+            Ok("OK\r".to_string())
+        });
+
+        let result = clear_channel_priority(&state, 5).await;
+        assert!(result.is_ok(), "the clear must succeed: {result:?}");
+
+        assert_eq!(
+            shadow_priority(&state, 5),
+            Some(false),
+            "the verified readback must land in the shadow, not be returned and dropped"
+        );
+    }
+
+    /// REGRESSION GUARD: the no-op branch heals a shadow that is already stale.
+    ///
+    /// `needs_priority_clear` short-circuits when the radio says the channel
+    /// does not hold priority -- which is exactly the state a stale shadow
+    /// produces, because something else displaced the flag on hardware (a plain
+    /// `CIN` write can set priority and displace the bank's previous holder,
+    /// see the #198 guard). Returning early without storing that read leaves the
+    /// cache wrong forever under #413. The read is already paid for; storing it
+    /// is free.
+    #[tokio::test]
+    async fn a_no_op_priority_clear_heals_a_stale_shadow() {
+        let state = default_state();
+        // The shadow believes channel 5 holds priority; the radio disagrees.
+        shadow_with_priority(&state, 5, true);
+
+        let _scanner = FakeScanner::attach(&state, |command: &str| {
+            if command == "PRG" {
+                return Ok("PRG,OK\r".to_string());
+            }
+            if command == "EPG" {
+                return Ok("EPG,OK\r".to_string());
+            }
+            if command.starts_with("DCH,") {
+                panic!("a channel the radio does not flag must never be DCH-wiped");
+            }
+            if let Some(rest) = command.strip_prefix("CIN,") {
+                let index: u16 = rest.split(',').next().unwrap_or("").parse().unwrap_or(0);
+                return Ok(format!("CIN,{index},,01451300,,,0,0,0\r"));
+            }
+            Ok("OK\r".to_string())
+        });
+
+        let result = clear_channel_priority(&state, 5).await;
+        assert!(result.is_ok(), "a no-op clear is success: {result:?}");
+
+        assert_eq!(
+            shadow_priority(&state, 5),
+            Some(false),
+            "a clear that finds nothing to clear must still correct the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn priority_swap_skips_the_clear_where_the_firmware_owns_it() {
+        use crate::protocol::capabilities::BC75XLT;
+
+        let sent = priority_swap_transcript(BC75XLT).await;
+        assert!(
+            !sent.iter().any(|c| c.starts_with("DCH")),
+            "a BC75XLT has no DCH; sending one aborts the whole swap: {sent:?}"
+        );
+        assert!(
+            sent.iter().any(|c| c.starts_with("CIN,9,")),
+            "the new priority channel must still be written: {sent:?}"
+        );
+        // The old channel is re-read AFTER the set, so the shadow cache does
+        // not keep showing a priority channel the radio already cleared.
+        let set_at = sent.iter().position(|c| c.starts_with("CIN,9,")).unwrap();
+        let reread_at = sent.iter().rposition(|c| c == "CIN,2");
+        assert!(
+            reread_at.is_some_and(|at| at > set_at),
+            "the auto-cleared channel must be re-read after the set: {sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn priority_swap_still_clears_where_bearpaw_owns_it() {
+        let sent = priority_swap_transcript(BC125AT_FAMILY).await;
+        assert!(
+            sent.iter().any(|c| c.starts_with("DCH,2")),
+            "a BC125AT firmware does not auto-swap; the old channel must be \
+             explicitly cleared or the bank keeps two: {sent:?}"
+        );
+    }
+
+    // REGRESSION GUARD (priority swap atomicity): where the FIRMWARE owns the
+    // swap, the post-set re-read of the old channel is informational -- it
+    // refreshes the shadow cache after the radio's own auto-clear. A failed
+    // re-read must not fail the swap. By the time it runs, the `CIN` write has
+    // already been sent AND verified by readback, so propagating its error
+    // reports a failure for a change the scanner has committed: the user sees
+    // the swap fail, retries, and the bank was right the first time.
+    //
+    // This mirrors the `warn!` in the same branch that declines to call a
+    // missed auto-clear a failed request. Both say the same thing: the
+    // requested channel DID get priority, so report the truth rather than a
+    // tidy fiction.
+    //
+    // The BC75XLT is the model where this bites, and not by coincidence -- it
+    // is the CP210x scanner, where a first-command-after-open `ERR` is
+    // documented behaviour (CLAUDE.md backend pitfall #11), so the transient
+    // this guards against is expected rather than hypothetical.
+    #[tokio::test]
+    async fn priority_swap_survives_a_failed_post_set_reread() {
+        use crate::protocol::capabilities::BC75XLT;
+
+        let state = default_state();
+        state.device.write().unwrap().capabilities = Some(BC75XLT);
+        {
+            let mut shadow = state.shadow.write().unwrap();
+            for (index, priority) in [(2u16, true), (9u16, false)] {
+                shadow.channels.insert(
+                    index,
+                    ChannelData {
+                        index,
+                        frequency: 146.52,
+                        priority,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
+        let _scanner = FakeScanner::attach(&state, |command: &str| match command {
+            "PRG" => Ok("PRG,OK\r".to_string()),
+            "EPG" => Ok("EPG,OK\r".to_string()),
+            // The informational re-read of the auto-cleared old channel: the
+            // one round-trip this test fails. `ERR` does not parse as a CIN
+            // frame, so `read_channel_from_scanner` gives `channel_read_failed`.
+            "CIN,2" => Ok("ERR\r".to_string()),
+            // Both the pre-read and the post-write readback of the new channel.
+            // A fixed reply is enough: the pre-read is only checked for a
+            // non-zero frequency, the readback only for the priority bit.
+            "CIN,9" => Ok("CIN,9,,01451300,,,0,0,1\r".to_string()),
+            _ => Ok("CIN,OK\r".to_string()),
+        });
+
+        let changed = set_channel_priority(&state, 9)
+            .await
+            .expect("a swap whose CIN write succeeded must not be reported as failed");
+
+        assert!(
+            changed.iter().any(|c| c.index == 9 && c.priority),
+            "the newly-set priority channel must still be reported: {changed:?}"
+        );
+        assert!(
+            !changed.iter().any(|c| c.index == 2),
+            "the old channel could not be read, so it must not be reported as \
+             changed -- fabricating a cleared state asserts something the \
+             scanner never confirmed: {changed:?}"
+        );
+        assert!(
+            state
+                .shadow
+                .read()
+                .unwrap()
+                .channels
+                .get(&9)
+                .is_some_and(|c| c.priority),
+            "the committed write must reach the shadow cache"
         );
     }
 
@@ -4187,6 +6095,7 @@ mod tests {
         ("POST", "/api/v1/lockouts/clear"),
         ("POST", "/api/v1/lockouts/channels/clear"),
         ("GET", "/api/v1/lockouts"),
+        ("DELETE", "/api/v1/lockouts/frequencies"),
         ("GET", "/api/v1/memory/channels"),
         ("POST", "/api/v1/memory/sync"),
         ("POST", "/api/v1/memory/sync/cancel"),
@@ -4207,7 +6116,6 @@ mod tests {
         ("GET", "/api/v1/memory/channels/1"),
         ("POST", "/api/v1/memory/channels/1/priority"),
         ("GET", "/api/v1/settings/custom-search/ranges/1"),
-        ("GET", "/api/v1/settings/custom-search/defaults"),
         ("POST", "/api/v1/settings/custom-search/ranges/1"),
         ("PUT", "/api/v1/memory/channels/1"),
         ("POST", "/api/v1/settings/search"),
@@ -4283,6 +6191,10 @@ mod tests {
     /// sending them meant four guaranteed-failing round-trips and four logged
     /// errors each time — and KBP is program-mode-only on that model, which
     /// `get_config` does not bracket.
+    ///
+    /// `SSG` joined the list for a different reason: it is absent from the
+    /// BC75XLT's command table entirely, so that model has no service-search
+    /// avoid mask to read.
     #[tokio::test]
     async fn settings_snapshot_skips_commands_the_scanner_lacks() {
         use crate::protocol::capabilities::BC75XLT;
@@ -4294,7 +6206,7 @@ mod tests {
         let _ = read_settings_snapshot_from_scanner(&state).await;
         let sent = fake.transcript();
 
-        for cmd in ["BLT", "BSV", "CNT", "WXS", "KBP"] {
+        for cmd in ["BLT", "BSV", "CNT", "WXS", "KBP", "SSG"] {
             assert!(
                 !sent.iter().any(|c| c == cmd),
                 "{cmd} must not be sent to a scanner that cannot answer it: {sent:?}"
@@ -4318,7 +6230,7 @@ mod tests {
         let _ = read_settings_snapshot_from_scanner(&state).await;
         let sent = fake.transcript();
 
-        for cmd in ["BLT", "BSV", "CNT", "WXS", "KBP"] {
+        for cmd in ["BLT", "BSV", "CNT", "WXS", "KBP", "SSG"] {
             assert!(
                 sent.iter().any(|c| c == cmd),
                 "{cmd} must still be read on a BC125AT: {sent:?}"
@@ -4676,6 +6588,1326 @@ mod tests {
         );
     }
 
+    /// REGRESSION GUARD (#556, findings 3/4/5): an import caches what the
+    /// SCANNER reports, not what the file said.
+    ///
+    /// The three import loops used `write_channel_no_readback`, which accepts
+    /// `CIN,OK` and returns nothing verified -- so each cached its own intent.
+    /// The firmware silently refuses an in-place priority 1->0 (REGRESSION
+    /// GUARD #198, captured live), so every imported row disagreeing on that
+    /// field was stored as a lie. Before #413 that died with the session; now
+    /// it is flushed to SQLite and re-adopted at every connect.
+    ///
+    /// The fake radio here models exactly that refusal: it accepts the write,
+    /// then reads back with priority still set. `readback_matches` tolerates
+    /// that specific disagreement (`priority_ok`), so the import still counts
+    /// the row as imported -- what must change is the value that lands in the
+    /// cache.
+    ///
+    /// Costs one extra `CIN` per row: about +5 s on a full 500-channel import,
+    /// measured against the ~5 s a 500-channel read takes.
+    #[tokio::test]
+    async fn an_import_caches_the_scanner_value_not_the_file_value() {
+        let state = default_state();
+        // A radio that refuses to clear priority on channel 2, whatever it is
+        // told -- the documented firmware behaviour.
+        let _fake = FakeScanner::attach(&state, |command: &str| {
+            if command == "PRG" {
+                return Ok("PRG,OK\r".to_string());
+            }
+            if command == "EPG" {
+                return Ok("EPG,OK\r".to_string());
+            }
+            if let Some(rest) = command.strip_prefix("CIN,") {
+                let mut fields = rest.splitn(2, ',');
+                let index: u16 = fields.next().unwrap_or("").parse().unwrap_or(0);
+                return match fields.next() {
+                    Some(_) => Ok("CIN,OK\r".to_string()),
+                    // Always priority=1, however it was written.
+                    None => Ok(format!("CIN,{index},Imported,01451300,FM,0,2,0,1\r")),
+                };
+            }
+            Ok("OK\r".to_string())
+        });
+
+        // The file asks for priority off.
+        let csv = "Index,Frequency,Modulation,Alpha Tag,Delay,Lockout,Priority,CTCSS/DCS,Bank\r\n\
+                   2,145.1300,FM,Imported,2,0,0,,1\r\n";
+        let boundary = "XbearpawX";
+        let body = format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"c.csv\"\r\n\
+             Content-Type: text/csv\r\n\r\n{csv}\r\n--{b}--\r\n",
+            b = boundary,
+            csv = csv
+        );
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/memory/import/csv")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the import itself must succeed: a refused priority clear is a \
+             tolerated disagreement, not a failed row"
+        );
+
+        let cached = state
+            .shadow
+            .read()
+            .unwrap()
+            .channels
+            .get(&2)
+            .cloned()
+            .expect("the imported channel must be cached");
+        assert!(
+            cached.priority,
+            "the cache must hold the SCANNER's priority, not the file's: {cached:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ss_tone_restore_writes_wire_codes_and_caches_readback() {
+        let state = default_state();
+        let scanner_memory = Arc::new(Mutex::new(HashMap::<u16, String>::new()));
+        let responder_memory = scanner_memory.clone();
+        let fake = FakeScanner::attach(&state, move |command: &str| {
+            if command == "PRG" || command == "EPG" {
+                return Ok(format!("{command},OK"));
+            }
+            if let Some(rest) = command.strip_prefix("CIN,") {
+                if let Some((index, payload)) = rest.split_once(',') {
+                    let index = index.parse::<u16>().unwrap();
+                    responder_memory
+                        .lock()
+                        .unwrap()
+                        .insert(index, payload.to_string());
+                    return Ok("CIN,OK".to_string());
+                }
+                let index = rest.parse::<u16>().unwrap();
+                let payload = responder_memory
+                    .lock()
+                    .unwrap()
+                    .get(&index)
+                    .cloned()
+                    .expect("read follows write");
+                return Ok(format!("CIN,{index},{payload}"));
+            }
+            for setting in ["SSG", "SCG", "CSG"] {
+                if command == setting {
+                    return Ok(format!("{setting},0000000000"));
+                }
+                if command.starts_with(&format!("{setting},")) {
+                    return Ok(format!("{setting},OK"));
+                }
+            }
+            Ok("OK".to_string())
+        });
+
+        let ss = "C-Freq\t1\tOff\t145130000\tFM\tOff\tOff\t2\tOff\r\n\
+                  C-Freq\t2\tCTCSS\t146520000\tNFM\tC100.0\tOff\t2\tOff\r\n\
+                  C-Freq\t3\tDCS\t147000000\tFM\tD023\tOff\t2\tOff\r\n\
+                  C-Freq\t4\tSearch\t148000000\tAM\tSrch\tOff\t2\tOff\r\n";
+        let boundary = "XbearpawToneX";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"tones.bc125at_ss\"\r\n\
+             Content-Type: text/plain\r\n\r\n{ss}\r\n--{boundary}--\r\n"
+        );
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/memory/import/bc125at_ss")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["imported"], 4);
+        assert_eq!(body["errors"], json!([]));
+
+        let written_tones: Vec<(u16, String)> = fake
+            .transcript()
+            .iter()
+            .filter_map(|command| {
+                let fields: Vec<&str> = command.split(',').collect();
+                (fields.first() == Some(&"CIN") && fields.len() > 5)
+                    .then(|| (fields[1].parse().unwrap(), fields[5].to_string()))
+            })
+            .collect();
+        assert_eq!(
+            written_tones,
+            vec![
+                (1, "0".to_string()),
+                (2, "76".to_string()),
+                (3, "128".to_string()),
+                (4, "127".to_string()),
+            ]
+        );
+
+        let shadow = state.shadow.read().unwrap();
+        assert_eq!(
+            shadow.channels[&2].tone_squelch_kind,
+            crate::state::ToneSquelchKind::Ctcss
+        );
+        assert_eq!(shadow.channels[&2].tone_squelch, Some(100.0));
+        assert_eq!(
+            shadow.channels[&3].tone_squelch_kind,
+            crate::state::ToneSquelchKind::Dcs
+        );
+        assert_eq!(shadow.channels[&3].tone_dcs_code, Some(128));
+        assert_eq!(
+            shadow.channels[&4].tone_squelch_kind,
+            crate::state::ToneSquelchKind::Search
+        );
+    }
+
+    /// REGRESSION GUARD (#621): a blank `.ss` file clears every slot, on BOTH
+    /// families, through the REAL route.
+    ///
+    /// Ported from #635, which fixed the same issue independently and reached
+    /// for route-level coverage the merged fix did not have. The pure guards in
+    /// `import_ss.rs` pin what the parser produces; this pins that the produced
+    /// rows actually reach the wire as zero-frequency `CIN` writes and land in
+    /// the shadow. A parser that emits perfect cleared rows into a handler that
+    /// drops them satisfies every pure guard and none of this one.
+    ///
+    /// The BC125AT half is the half that matters most here: the fix was
+    /// verified on a BC75XLT on real hardware (PR #636), and that model was the
+    /// only one plugged in.
+    ///
+    /// The `DCH` assertion is deliberate. #635 cleared via `DCH` where
+    /// `has_priority_clear`; the merged fix writes frequency 0 on both
+    /// families, which is what the app's own Clear button does and what
+    /// `readback_matches`' zero-frequency branch is built to verify. Pinning
+    /// "no `DCH`" makes a future switch to the other mechanism a deliberate
+    /// edit rather than a silent one.
+    #[tokio::test]
+    async fn a_blank_ss_file_clears_every_slot_on_both_families() {
+        use crate::protocol::capabilities::BC75XLT;
+
+        for (caps, uri, filename, ss) in [
+            (
+                BC125AT_FAMILY,
+                "/api/v1/memory/import/bc125at_ss",
+                "blank.bc125at_ss",
+                include_str!("../../fixtures/blank.bc125at_ss"),
+            ),
+            (
+                BC75XLT,
+                "/api/v1/memory/import/bc75xlt_ss",
+                "blank.bc75xlt_ss",
+                include_str!("../../fixtures/blank.bc75xlt_ss"),
+            ),
+        ] {
+            let state = default_state();
+            state.device.write().unwrap().capabilities = Some(caps);
+            // Every slot starts PROGRAMMED. That is the precondition the bug
+            // needed: with an empty shadow, "cleared" and "never written" look
+            // identical.
+            {
+                let mut shadow = state.shadow.write().unwrap();
+                for index in 1..=caps.channel_count {
+                    shadow.channels.insert(
+                        index,
+                        ChannelData {
+                            index,
+                            frequency: 145.13,
+                            bank: caps.index_to_bank(index),
+                            ..test_channel()
+                        },
+                    );
+                }
+            }
+
+            let fake = FakeScanner::attach(&state, move |command: &str| {
+                if command == "PRG" || command == "EPG" {
+                    return Ok(format!("{command},OK"));
+                }
+                if command.starts_with("DCH,") {
+                    return Ok("DCH,OK".to_string());
+                }
+                if let Some(rest) = command.strip_prefix("CIN,") {
+                    if rest.contains(',') {
+                        return Ok("CIN,OK".to_string());
+                    }
+                    // The factory-empty signature this model stamps on a
+                    // cleared slot. Delay is model-dependent -- 2 on the
+                    // BC125AT family, 0 on a BC75XLT (hardware 2026-08-26).
+                    let index = rest.parse::<u16>().unwrap();
+                    return if caps.has_priority_clear {
+                        Ok(format!("CIN,{index},,00000000,AUTO,0,2,1,0"))
+                    } else {
+                        Ok(format!("CIN,{index},,00000000,,,0,1,0"))
+                    };
+                }
+                if command.contains(',') {
+                    let name = command.split(',').next().unwrap();
+                    return Ok(format!("{name},OK"));
+                }
+                Ok(format!("{command},0"))
+            });
+
+            let boundary = format!("XbearpawBlank{}X", caps.channel_count);
+            let body = format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n\
+                 Content-Type: text/plain\r\n\r\n{ss}\r\n--{boundary}--\r\n"
+            );
+            let response = router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(uri)
+                        .header(
+                            "content-type",
+                            format!("multipart/form-data; boundary={boundary}"),
+                        )
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK, "{filename}");
+            let response_body = json_body(response).await;
+            // A blank file is `channel_count` explicit clears, not zero work.
+            assert_eq!(
+                response_body["total"], caps.channel_count,
+                "{filename}: {response_body}"
+            );
+            assert_eq!(
+                response_body["imported"], caps.channel_count,
+                "{filename}: {response_body}"
+            );
+
+            let shadow = state.shadow.read().unwrap();
+            assert_eq!(shadow.channels.len(), caps.channel_count as usize);
+            assert!(
+                shadow
+                    .channels
+                    .values()
+                    .all(|channel| channel.frequency.abs() < 0.00005),
+                "{filename}: a programmed channel survived the restore"
+            );
+            drop(shadow);
+
+            let transcript = fake.transcript_with_closed_bracket();
+            let writes = transcript
+                .iter()
+                .filter(|command| {
+                    command.starts_with("CIN,")
+                        && command.matches(',').count() > 1
+                        && command.contains("00000000")
+                })
+                .count();
+            assert_eq!(
+                writes, caps.channel_count as usize,
+                "{filename}: every slot must be cleared ON THE WIRE"
+            );
+            assert_eq!(
+                transcript
+                    .iter()
+                    .filter(|command| command.starts_with("DCH,"))
+                    .count(),
+                0,
+                "{filename}: the clear is a zero-frequency CIN write, not DCH"
+            );
+        }
+    }
+
+    /// REGRESSION GUARD (#621): a MIXED file matches the file row for row.
+    ///
+    /// Ported from #635. The blank-file guard above passes for a handler that
+    /// clears unconditionally; this one fails there, because row 1 must stay
+    /// programmed. The two are paired on purpose.
+    ///
+    /// The fake holds real memory so the readback reflects what was written --
+    /// a stateless fake would accept a handler that wrote nothing.
+    #[tokio::test]
+    async fn a_mixed_ss_file_programs_and_clears_per_row_on_both_families() {
+        use crate::protocol::capabilities::BC75XLT;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        for (caps, uri, filename) in [
+            (
+                BC125AT_FAMILY,
+                "/api/v1/memory/import/bc125at_ss",
+                "mixed.bc125at_ss",
+            ),
+            (
+                BC75XLT,
+                "/api/v1/memory/import/bc75xlt_ss",
+                "mixed.bc75xlt_ss",
+            ),
+        ] {
+            let state = default_state();
+            state.device.write().unwrap().capabilities = Some(caps);
+            for index in 1..=2 {
+                state.shadow.write().unwrap().channels.insert(
+                    index,
+                    ChannelData {
+                        index,
+                        frequency: 146.52,
+                        delay: caps.cleared_delay,
+                        priority: false,
+                        bank: 1,
+                        ..test_channel()
+                    },
+                );
+            }
+
+            let memory = Arc::new(Mutex::new(HashMap::from([
+                (1_u16, "Old,01465200,FM,0,2,0,0".to_string()),
+                (2_u16, "Old,01465200,FM,0,2,0,0".to_string()),
+            ])));
+            let scanner_memory = memory.clone();
+            let _fake = FakeScanner::attach(&state, move |command: &str| {
+                if command == "PRG" || command == "EPG" {
+                    return Ok(format!("{command},OK"));
+                }
+                if let Some(rest) = command.strip_prefix("CIN,") {
+                    if let Some((index, payload)) = rest.split_once(',') {
+                        let index = index.parse::<u16>().unwrap();
+                        let frequency = payload.split(',').nth(1).unwrap_or_default();
+                        if frequency == "00000000" {
+                            scanner_memory.lock().unwrap().remove(&index);
+                        } else {
+                            scanner_memory
+                                .lock()
+                                .unwrap()
+                                .insert(index, payload.to_string());
+                        }
+                        return Ok("CIN,OK".to_string());
+                    }
+                    let index = rest.parse::<u16>().unwrap();
+                    if let Some(payload) = scanner_memory.lock().unwrap().get(&index).cloned() {
+                        return Ok(format!("CIN,{index},{payload}"));
+                    }
+                    return if caps.has_priority_clear {
+                        Ok(format!("CIN,{index},,00000000,AUTO,0,2,1,0"))
+                    } else {
+                        Ok(format!("CIN,{index},,00000000,,,0,1,0"))
+                    };
+                }
+                if command.contains(',') {
+                    let name = command.split(',').next().unwrap();
+                    return Ok(format!("{name},OK"));
+                }
+                Ok(format!("{command},0"))
+            });
+
+            let (name, modulation) = if caps.has_alpha_tags {
+                ("New", "FM")
+            } else {
+                ("", "")
+            };
+            let ss = format!(
+                "C-Freq\t1\t{name}\t145130000\t{modulation}\tOff\tOff\t2\tOff\r\n\
+                 C-Freq\t2\t\t0\t{modulation}\tOff\tOff\t2\tOff\r\n"
+            );
+            let boundary = format!("XbearpawMixed{}X", caps.channel_count);
+            let body = format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n\
+                 Content-Type: text/plain\r\n\r\n{ss}\r\n--{boundary}--\r\n"
+            );
+            let response = router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(uri)
+                        .header(
+                            "content-type",
+                            format!("multipart/form-data; boundary={boundary}"),
+                        )
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK, "{filename}");
+            let response_body = json_body(response).await;
+            assert_eq!(response_body["total"], 2, "{filename}: {response_body}");
+            assert_eq!(response_body["imported"], 2, "{filename}: {response_body}");
+
+            let shadow = state.shadow.read().unwrap();
+            assert!(
+                (shadow.channels[&1].frequency - 145.13).abs() < 0.00005,
+                "{filename}: the programmed row must be written, not cleared"
+            );
+            assert!(
+                shadow.channels[&2].frequency.abs() < 0.00005,
+                "{filename}: the empty row must be cleared"
+            );
+        }
+    }
+
+    /// REGRESSION GUARD (#638): a rejected `SCO` write is NOT success.
+    ///
+    /// The check was `upper.starts_with("SCO,")`, which `SCO,ERR` satisfies.
+    /// So a refused write returned `{"status":"ok"}` AND wrote the value into
+    /// the settings cache, showing the user a setting the radio never took.
+    /// Found on the dev BC75XLT 2026-09-02: five delay values all reported OK
+    /// and the live read never moved off 1.
+    ///
+    /// The cache assertion is the half that matters. A guard checking only the
+    /// status code passes for a build that returns 400 and caches the value
+    /// anyway -- which is the same lie, one layer down, and survives a restart
+    /// because the settings cache is persisted.
+    #[tokio::test]
+    async fn a_rejected_sco_write_is_not_success() {
+        let state = default_state();
+        state.device.write().unwrap().capabilities = Some(BC125AT_FAMILY);
+        let _fake = FakeScanner::attach(&state, |command: &str| {
+            if command == "PRG" || command == "EPG" {
+                return Ok(format!("{command},OK"));
+            }
+            if command.starts_with("SCO,") {
+                return Ok("SCO,ERR".to_string());
+            }
+            Ok("OK".to_string())
+        });
+
+        // `default_state()` already carries a `search` section, so "absent"
+        // was never the right question -- the first draft of this guard
+        // asserted it and failed for that reason rather than for the bug.
+        // UNCHANGED is what matters.
+        let before = state.settings.read().unwrap()["search"].clone();
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/settings/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"delay":4,"code_search":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let after = state.settings.read().unwrap()["search"].clone();
+        assert_eq!(
+            after, before,
+            "a refused write must not reach the settings cache"
+        );
+        assert_ne!(
+            after["delay"], 4,
+            "the rejected value must not be what the UI reads back"
+        );
+    }
+
+    /// The paired half: an ACCEPTED `SCO` write still succeeds and still
+    /// caches. Without it, narrowing the check to "refuse everything" passes
+    /// the guard above perfectly.
+    #[tokio::test]
+    async fn an_accepted_sco_write_is_still_success() {
+        let state = default_state();
+        state.device.write().unwrap().capabilities = Some(BC125AT_FAMILY);
+        let _fake = FakeScanner::attach(&state, |command: &str| {
+            if command == "PRG" || command == "EPG" {
+                return Ok(format!("{command},OK"));
+            }
+            if command.starts_with("SCO,") {
+                return Ok("SCO,OK".to_string());
+            }
+            Ok("OK".to_string())
+        });
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/settings/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"delay":4,"code_search":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let cached = state.settings.read().unwrap().clone();
+        assert_eq!(cached["search"]["delay"], 4);
+    }
+
+    /// REGRESSION GUARD (#638): `SCO` is refused BEFORE the wire on a model
+    /// that cannot take it.
+    ///
+    /// The BC75XLT answers a `SCO` read but rejects every write, including a
+    /// write of the value it just reported (`SCO,1,0` -> `Err`, hardware
+    /// 2026-09-02). Same guard `set_key_beep` and `set_weather` carry.
+    ///
+    /// "Nothing reached the wire" is asserted, not just the status: refusing
+    /// after sending would still stall the PRG bracket, which is #436.
+    #[tokio::test]
+    async fn sco_is_refused_before_the_wire_where_the_model_cannot_take_it() {
+        use crate::protocol::capabilities::BC75XLT;
+
+        let state = default_state();
+        state.device.write().unwrap().capabilities = Some(BC75XLT);
+        let fake = FakeScanner::attach(&state, |command: &str| Ok(format!("{command},OK")));
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/settings/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"delay":1,"code_search":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            !fake
+                .transcript_with_closed_bracket()
+                .iter()
+                .any(|command| command.starts_with("SCO,")),
+            "no SCO write may reach a model that cannot take one"
+        );
+    }
+
+    /// REGRESSION GUARD (#598): a drop that QUEUED an EPG leaves the flag set.
+    ///
+    /// The poll loop yields STS/GLG on `program_mode_active`. The Drop used to
+    /// clear it up front and then queue the EPG fire-and-forget, so the loop
+    /// resumed polling a radio still in program mode -- a window exactly as
+    /// wide as the queue backlog, and a plausible source of the STS parse drops
+    /// seen on hardware.
+    ///
+    /// `send_raw_command` already had this ordering right for the EPGs it sends
+    /// itself; only the guard's path was wrong, because a `Drop` cannot await a
+    /// reply. The poll loop now clears the flag after the EPG actually goes
+    /// out -- which is why the flag is still set here: this test has a fake
+    /// scanner but no poll loop, so nothing else clears it.
+    #[tokio::test]
+    async fn the_flag_survives_a_drop_that_queued_an_epg() {
+        let state = default_state();
+        let fake = FakeScanner::attach(&state, |_| Ok("OK\r".to_string()));
+
+        {
+            let _guard = ProgramModeGuard::enter(&state)
+                .await
+                .expect("the fake accepts PRG");
+            assert!(
+                state.program_mode_active.load(Ordering::Relaxed),
+                "precondition: entering suspends the poll loop"
+            );
+        }
+
+        assert!(
+            state.program_mode_active.load(Ordering::Relaxed),
+            "the flag must stay set until the EPG has actually gone out -- \
+             clearing it in Drop is what let the poll loop talk to a radio \
+             still in PRG"
+        );
+
+        let transcript = fake.transcript_with_closed_bracket();
+        assert!(
+            transcript.iter().any(|c| c == "EPG"),
+            "and the EPG must genuinely be on its way: {transcript:?}"
+        );
+    }
+
+    /// The other half, and the hazard the original comment named: when nothing
+    /// will arrive to clear the flag, the drop must clear it itself.
+    ///
+    /// Asserting only the guard above would pass for a build that never clears
+    /// the flag at all -- which freezes the live display permanently, a worse
+    /// bug than the one being fixed.
+    #[tokio::test]
+    async fn a_drop_with_nowhere_to_send_clears_the_flag_itself() {
+        let state = default_state();
+        let _fake = FakeScanner::attach(&state, |_| Ok("OK\r".to_string()));
+
+        let guard = ProgramModeGuard::enter(&state)
+            .await
+            .expect("the fake accepts PRG");
+        assert!(state.program_mode_active.load(Ordering::Relaxed));
+
+        // The channel goes away before the bracket closes -- a shutdown, or a
+        // poll loop that has torn down. Nothing will ever execute an EPG now.
+        *state.command_tx.lock().unwrap() = None;
+        drop(guard);
+
+        assert!(
+            !state.program_mode_active.load(Ordering::Relaxed),
+            "with nowhere to send the EPG, the drop must clear the flag or the \
+             poll loop stays suspended forever"
+        );
+    }
+
+    /// REGRESSION GUARD (#513): the shipped server's shutdown path is
+    /// REACHABLE, and it flushes.
+    ///
+    /// `run_server` passed `std::future::pending()` -- a future that never
+    /// resolves. `with_graceful_shutdown` therefore never fired, the `.await?`
+    /// on the server never returned, and every line after it was dead code in
+    /// the shipped binary. That included the final `flush_channel_cache`, which
+    /// CLAUDE.md lists as one of three flush callers and calls "the one that
+    /// makes a clean quit lose nothing".
+    ///
+    /// It went unnoticed because the only entry point with a test is
+    /// `run_server_with_shutdown`, and the one `main.rs` calls is `run_server`.
+    ///
+    /// It is also the precondition #513's USB wedge is reproduced from: with no
+    /// signal handler, SIGTERM kills the process mid-poll with the interface
+    /// still claimed and transfers in flight.
+    ///
+    /// This drives the real server with a shutdown future it controls, and
+    /// asserts the cache was written. It does NOT assert anything about
+    /// signals -- `shutdown_signal()` cannot be delivered to a test process
+    /// without killing the test runner -- so the wiring from `run_server` to
+    /// this path is asserted separately below.
+    #[tokio::test]
+    async fn the_shutdown_path_flushes_the_channel_cache() {
+        use crate::api::channel_cache::{load_channels, PLACEHOLDER_SCANNER_ID};
+
+        let state = default_state();
+        let count = state.capabilities().channel_count;
+        {
+            let mut shadow = state.shadow.write().unwrap();
+            shadow.channels = (1..=count)
+                .map(|index| {
+                    (
+                        index,
+                        ChannelData {
+                            index,
+                            frequency: 146.0 + (index as f64) / 1000.0,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect();
+            shadow.last_sync = 1_000_000_000.0;
+        }
+        assert_eq!(
+            load_channels(&state.preferences_db_path, PLACEHOLDER_SCANNER_ID).len(),
+            0,
+            "precondition: nothing is cached yet"
+        );
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(run_server_with_shutdown(
+            // Port 0: the OS picks a free one, so this never collides with a
+            // real backend or another test.
+            "127.0.0.1:0",
+            state.clone(),
+            None,
+            async {
+                let _ = rx.await;
+            },
+        ));
+
+        tx.send(()).expect("ask the server to stop");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), server)
+            .await
+            .expect("the server must actually return once shutdown resolves")
+            .expect("join");
+        assert!(result.is_ok(), "clean shutdown: {result:?}");
+
+        assert_eq!(
+            load_channels(&state.preferences_db_path, PLACEHOLDER_SCANNER_ID).len(),
+            count as usize,
+            "the shutdown flush must run -- this is the whole reason the path \
+             has to be reachable"
+        );
+    }
+
+    /// The wiring, asserted separately because a signal cannot be delivered to
+    /// a test process without killing the runner.
+    ///
+    /// Without this, `run_server` could go back to `pending()` and the guard
+    /// above would stay green forever -- it exercises
+    /// `run_server_with_shutdown`, which was never the broken one.
+    #[test]
+    fn the_shipped_server_has_a_reachable_shutdown() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("pub async fn run_server(")
+            .expect("run_server must exist");
+        let body = &source[start..start + 400];
+        assert!(
+            !body.contains("std::future::pending()"),
+            "run_server must not pass a future that never resolves -- that is \
+             the bug: everything after `with_graceful_shutdown` becomes dead \
+             code in the shipped binary"
+        );
+        assert!(
+            body.contains("shutdown_signal()"),
+            "run_server must pass a real signal future"
+        );
+    }
+
+    /// A scanner that ACKNOWLEDGES every write and then reads back a channel
+    /// that does not reflect it -- the "write landed, verification disagrees"
+    /// case both write helpers already detect and report.
+    ///
+    /// The read is deliberately a REAL channel with a distinctive frequency, so
+    /// a test can tell "the shadow holds what the scanner said" apart from
+    /// "the shadow holds what the caller hoped" or "the shadow was untouched".
+    fn responder_that_never_persists() -> impl Fn(&str) -> Result<String, String> + Send + 'static {
+        move |command: &str| {
+            if command == "PRG" {
+                return Ok("PRG,OK\r".to_string());
+            }
+            if command == "EPG" {
+                return Ok("EPG,OK\r".to_string());
+            }
+            if let Some(rest) = command.strip_prefix("CIN,") {
+                let mut fields = rest.splitn(2, ',');
+                let index: u16 = fields.next().unwrap_or("").parse().unwrap_or(0);
+                return match fields.next() {
+                    // Write: acknowledged, and then ignored by the firmware.
+                    Some(_) => Ok("CIN,OK\r".to_string()),
+                    // Read: always unlocked, always 146.5200, whatever was written.
+                    None => Ok(format!("CIN,{index},Scanner Truth,01465200,FM,0,2,0,0\r")),
+                };
+            }
+            Ok("OK\r".to_string())
+        }
+    }
+
+    /// REGRESSION GUARD (#556, findings 7/12): a lockout write whose readback
+    /// disagrees still STORES that readback.
+    ///
+    /// `set_channel_lockout_on_scanner` reads the channel back, compares, and
+    /// on a mismatch warns and returns `lockout_not_persisted` -- discarding
+    /// the parsed readback it is holding. Callers update the shadow only on
+    /// `Ok`, so the cache kept its PRE-write value: a description of the radio
+    /// that was already known to be wrong, chosen over one that had just been
+    /// read off the wire.
+    ///
+    /// Reporting the failure is right. Throwing away the truth on the way out
+    /// is not, and #413 made it durable -- the shadow is flushed to SQLite
+    /// within 30 s and re-adopted at every connect.
+    #[tokio::test]
+    async fn a_failed_lockout_write_still_stores_what_the_scanner_reported() {
+        let state = default_state();
+        // A stale cache entry: wrong frequency, and claiming a lockout the
+        // radio does not have.
+        state.shadow.write().unwrap().channels.insert(
+            5,
+            ChannelData {
+                index: 5,
+                frequency: 100.0,
+                alpha_tag: "Stale".to_string(),
+                lockout: true,
+                ..Default::default()
+            },
+        );
+        let _fake = FakeScanner::attach(&state, responder_that_never_persists());
+
+        let result = set_channel_lockout_on_scanner(&state, 5, true).await;
+
+        assert!(
+            result.is_err(),
+            "a write the scanner did not persist must still be reported as a failure"
+        );
+        let cached = state.shadow.read().unwrap().channels.get(&5).cloned();
+        let cached = cached.expect("the channel must still be cached");
+        assert!(
+            (cached.frequency - 146.52).abs() < 1e-9,
+            "the shadow must hold what the scanner reported, not the stale \
+             pre-write value: {cached:?}"
+        );
+        assert!(
+            !cached.lockout,
+            "including the field the write failed to change: {cached:?}"
+        );
+    }
+
+    /// A scanner that persists lockout writes: a `CIN` read returns whatever
+    /// the last `CIN` write for that index sent, so the readback check passes.
+    fn responder_that_persists() -> impl Fn(&str) -> Result<String, String> + Send + 'static {
+        let written: Mutex<HashMap<u16, String>> = Mutex::new(HashMap::new());
+        move |command: &str| {
+            if command == "PRG" {
+                return Ok("PRG,OK\r".to_string());
+            }
+            if command == "EPG" {
+                return Ok("EPG,OK\r".to_string());
+            }
+            if let Some(rest) = command.strip_prefix("CIN,") {
+                let mut fields = rest.splitn(2, ',');
+                let index: u16 = fields.next().unwrap_or("").parse().unwrap_or(0);
+                let mut written = written.lock().unwrap();
+                return match fields.next() {
+                    Some(payload) => {
+                        written.insert(index, payload.to_string());
+                        Ok("CIN,OK\r".to_string())
+                    }
+                    None => Ok(match written.get(&index) {
+                        Some(payload) => format!("CIN,{index},{payload}\r"),
+                        None => format!("CIN,{index},Pager,01465200,FM,0,2,0,0\r"),
+                    }),
+                };
+            }
+            Ok("OK\r".to_string())
+        }
+    }
+
+    /// A scanner that refuses program mode and answers everything else. Which
+    /// real state produces `PRG,NG` is unobserved; its own menu is not one on a
+    /// BC125AT (audit-reconciliation Conflict 6).
+    fn responder_that_refuses_prg() -> impl Fn(&str) -> Result<String, String> + Send + 'static {
+        |command: &str| match command {
+            "PRG" => Ok("PRG,NG\r".to_string()),
+            "VER" => Ok("VER,1.06.06\r".to_string()),
+            _ => Ok("OK\r".to_string()),
+        }
+    }
+
+    /// REGRESSION GUARD (#684): a refused `PRG` stops every hand-bracketed
+    /// helper before the wire, with `program_mode_refused`.
+    ///
+    /// These five helpers sent `PRG` by hand and threw its reply away, so
+    /// `PRG,NG` counted as success (the #140 bug `ProgramModeGuard` already
+    /// guards): they went on to send `CIN`/`GLF`/settings reads to a radio that
+    /// never entered program mode, then a stray `EPG`, and reported the wrong
+    /// error. One state per helper, so each starts with no bracket open.
+    #[tokio::test]
+    async fn a_refused_prg_stops_every_program_mode_helper() {
+        let wanted = ChannelData {
+            index: 5,
+            frequency: 146.52,
+            modulation: "FM".to_string(),
+            ..Default::default()
+        };
+        for helper in ["lockouts", "settings", "read", "write", "lockout"] {
+            let state = default_state();
+            let scanner = FakeScanner::attach(&state, responder_that_refuses_prg());
+            let err = match helper {
+                "lockouts" => read_frequency_lockouts_from_scanner(&state).await.err(),
+                "settings" => read_settings_snapshot_from_scanner(&state).await.err(),
+                "read" => read_channel_from_scanner(&state, 5).await.err(),
+                "write" => write_channel_to_scanner(&state, &wanted).await.err(),
+                _ => set_channel_lockout_on_scanner(&state, 5, true).await.err(),
+            };
+            assert!(
+                matches!(&err, Some(ApiError::BadRequest(m)) if m.starts_with("program_mode_refused")),
+                "{helper}: a PRG,NG must fail as program_mode_refused, got {err:?}"
+            );
+            let sent: Vec<String> = scanner
+                .transcript()
+                .into_iter()
+                .filter(|c| c != "VER")
+                .collect();
+            assert_eq!(
+                sent,
+                vec!["PRG".to_string()],
+                "{helper}: nothing may follow a refused PRG -- no CIN/GLF on a radio \
+                 outside program mode, and no EPG for a bracket that never opened"
+            );
+            assert!(
+                !state.program_mode_active.load(Ordering::Relaxed),
+                "{helper}: a refused PRG must not leave the poll loop suspended"
+            );
+        }
+    }
+
+    /// REGRESSION GUARD (#684): a helper refuses during a memory sync with
+    /// `sync_in_progress` instead of queueing behind it and timing out.
+    ///
+    /// A sync sets `program_mode_active` too, so this also pins that
+    /// `enter_or_join` does not JOIN a sync's bracket.
+    #[tokio::test]
+    async fn a_program_mode_helper_refuses_during_a_memory_sync() {
+        let state = default_state();
+        let scanner = FakeScanner::attach(&state, responder_that_persists());
+        *state.sync_task_id.lock().unwrap() = Some("sync-1".to_string());
+        state.program_mode_active.store(true, Ordering::Relaxed);
+
+        let err = set_channel_lockout_on_scanner(&state, 5, true).await.err();
+
+        assert!(
+            matches!(&err, Some(ApiError::Conflict(m)) if m == "sync_in_progress"),
+            "a lockout during a sync must be refused as sync_in_progress, got {err:?}"
+        );
+        assert!(
+            scanner.transcript().is_empty(),
+            "nothing may be queued behind a running sync: {:?}",
+            scanner.transcript()
+        );
+    }
+
+    /// REGRESSION GUARD (#684): inside a bracket someone else holds, a helper
+    /// sends neither `PRG` nor `EPG`, and leaves the bracket open.
+    #[tokio::test]
+    async fn a_program_mode_helper_joins_an_open_bracket() {
+        let state = default_state();
+        let scanner = FakeScanner::attach(&state, responder_that_persists());
+        state.program_mode_active.store(true, Ordering::Relaxed);
+
+        read_channel_from_scanner(&state, 5)
+            .await
+            .expect("the read must succeed inside the open bracket");
+
+        assert_eq!(scanner.transcript(), vec!["CIN,5".to_string()]);
+        assert!(
+            state.program_mode_active.load(Ordering::Relaxed),
+            "a helper must not close a bracket it did not open"
+        );
+    }
+
+    /// REGRESSION GUARD (#684): back-to-back standalone calls each open and
+    /// CLOSE their own bracket.
+    ///
+    /// `ProgramModeGuard`'s Drop only queues its `EPG`, leaving the flag set
+    /// until the poll thread sends it (#598). A helper that closed that way
+    /// would hand the next call a flag that says "bracket open": it would join
+    /// a bracket already closing and send its `CIN` after the `EPG`.
+    /// `clear_temporary_lockouts` makes exactly these calls, one per channel.
+    #[tokio::test]
+    async fn back_to_back_helper_calls_each_open_their_own_bracket() {
+        let state = default_state();
+        let scanner = FakeScanner::attach(&state, responder_that_persists());
+
+        set_channel_lockout_on_scanner(&state, 5, true)
+            .await
+            .expect("first lockout");
+        set_channel_lockout_on_scanner(&state, 6, true)
+            .await
+            .expect("second lockout");
+
+        let brackets: Vec<String> = scanner
+            .transcript()
+            .into_iter()
+            .filter(|c| c == "PRG" || c == "EPG")
+            .collect();
+        assert_eq!(
+            brackets,
+            ["PRG", "EPG", "PRG", "EPG"].map(String::from).to_vec(),
+            "each standalone call must open and close its own bracket"
+        );
+    }
+
+    async fn post_lockout_in_mode(
+        mode: ScannerMode,
+        lockout_mode: &str,
+        responder: impl Fn(&str) -> Result<String, String> + Send + 'static,
+    ) -> (StatusCode, Vec<String>) {
+        let state = default_state();
+        state.live.write().unwrap().mode = mode;
+        let scanner = FakeScanner::attach(&state, responder);
+        let status = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/commands/lockout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"mode":"{lockout_mode}","channel":5}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status();
+        (status, scanner.transcript())
+    }
+
+    /// REGRESSION GUARD (#678): a lockout during a scan puts the scanner back
+    /// into scan.
+    ///
+    /// The lockout is a `PRG` / `CIN` / `EPG` bracket, and `EPG` parks the
+    /// radio in HOLD at channel 1. `commanded_mode` still reads `SCAN`, so the
+    /// frontend's `HOLD`-gated resume never fired and the scanner sat at
+    /// channel 1 while the UI said "Scanning...". The assertion is on ORDER as
+    /// well as presence: a `KEY,S,P` sent before `EPG` lands inside program
+    /// mode and resumes nothing.
+    ///
+    /// Both modes, because both run the same bracket from the same UI control.
+    #[tokio::test]
+    async fn a_lockout_during_scan_resumes_scanning() {
+        for lockout_mode in ["temporary", "permanent"] {
+            let (status, transcript) =
+                post_lockout_in_mode(ScannerMode::Scan, lockout_mode, responder_that_persists())
+                    .await;
+            assert_eq!(status, StatusCode::OK, "{lockout_mode}: {transcript:?}");
+            let epg = transcript.iter().rposition(|c| c == "EPG");
+            let scan = transcript.iter().position(|c| c == super::poll::KEY_SCAN);
+            assert!(
+                matches!((epg, scan), (Some(e), Some(s)) if s > e),
+                "{lockout_mode}: scan must resume AFTER the bracket closes: {transcript:?}"
+            );
+        }
+    }
+
+    /// REGRESSION GUARD (#678): a lockout while HELD resumes too.
+    ///
+    /// `EPG` drops the held channel either way, and resuming after a held
+    /// lockout is what the frontend did before the resume moved to the
+    /// backend. Losing this would leave a held user parked at channel 1.
+    #[tokio::test]
+    async fn a_lockout_while_held_resumes_scanning() {
+        let (status, transcript) =
+            post_lockout_in_mode(ScannerMode::Hold, "temporary", responder_that_persists()).await;
+        assert_eq!(status, StatusCode::OK, "{transcript:?}");
+        assert!(
+            transcript.iter().any(|c| c == super::poll::KEY_SCAN),
+            "{transcript:?}"
+        );
+    }
+
+    /// REGRESSION GUARD (#678): the resume follows the user's mode; it is not
+    /// unconditional.
+    ///
+    /// Paired with the two guards above because they alone pass for a build
+    /// that sends `KEY,S,P` after every lockout -- which would throw a user
+    /// off a manually tuned frequency and into scan.
+    #[tokio::test]
+    async fn a_lockout_while_tuned_direct_does_not_resume_scanning() {
+        for lockout_mode in ["temporary", "permanent"] {
+            let (status, transcript) =
+                post_lockout_in_mode(ScannerMode::Direct, lockout_mode, responder_that_persists())
+                    .await;
+            assert_eq!(status, StatusCode::OK, "{lockout_mode}: {transcript:?}");
+            assert!(
+                !transcript.iter().any(|c| c == super::poll::KEY_SCAN),
+                "{lockout_mode}: a direct tune is not a scan to resume: {transcript:?}"
+            );
+        }
+    }
+
+    /// REGRESSION GUARD (#678): a lockout that FAILS after opening the
+    /// bracket still resumes scan.
+    ///
+    /// The failure is reported, but `EPG` has already parked the radio. Only
+    /// resuming on success would strand a scanning user at channel 1 on
+    /// exactly the path where they are already looking at an error.
+    #[tokio::test]
+    async fn a_failed_lockout_during_scan_still_resumes_scanning() {
+        let (status, transcript) = post_lockout_in_mode(
+            ScannerMode::Scan,
+            "temporary",
+            responder_that_never_persists(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{transcript:?}");
+        assert!(
+            transcript.iter().any(|c| c == super::poll::KEY_SCAN),
+            "the radio is parked whether or not the write stuck: {transcript:?}"
+        );
+    }
+
+    /// REGRESSION GUARD (#556, findings 8/11): the same for a full channel
+    /// write.
+    ///
+    /// `write_channel_to_scanner` returns `channel_not_persisted` AFTER the
+    /// `CIN` has landed and been read back, discarding the readback. Paired
+    /// with the guard above because they are two copies of one mistake in two
+    /// functions -- fixing either alone leaves the other live.
+    #[tokio::test]
+    async fn a_failed_channel_write_still_stores_what_the_scanner_reported() {
+        let state = default_state();
+        state.shadow.write().unwrap().channels.insert(
+            5,
+            ChannelData {
+                index: 5,
+                frequency: 100.0,
+                alpha_tag: "Stale".to_string(),
+                lockout: true,
+                ..Default::default()
+            },
+        );
+        let _fake = FakeScanner::attach(&state, responder_that_never_persists());
+
+        let wanted = ChannelData {
+            index: 5,
+            frequency: 154.1,
+            alpha_tag: "Wanted".to_string(),
+            modulation: "FM".to_string(),
+            delay: 2,
+            ..Default::default()
+        };
+        let result = write_channel_to_scanner(&state, &wanted).await;
+
+        assert!(
+            result.is_err(),
+            "a write the scanner did not persist must still be reported as a failure"
+        );
+        let cached = state.shadow.read().unwrap().channels.get(&5).cloned();
+        let cached = cached.expect("the channel must still be cached");
+        assert!(
+            (cached.frequency - 146.52).abs() < 1e-9,
+            "the shadow must hold the scanner's readback, not the stale value \
+             and not the value the caller wanted: {cached:?}"
+        );
+        assert_ne!(
+            cached.alpha_tag, "Wanted",
+            "storing the INTENT would be the bug this issue is about"
+        );
+    }
+
+    /// REGRESSION GUARD (#556, finding 2): a `CIN` write that SETS priority
+    /// re-reads the channel it displaced.
+    ///
+    /// Setting priority on one channel clears the bank's previous holder on
+    /// hardware, without naming it -- documented at `set_channel_priority` and
+    /// captured live. Only the written index was updated, so the displaced
+    /// channel kept `priority: true` in the shadow and the bank showed TWO
+    /// priority channels.
+    ///
+    /// Not destructive: `needs_priority_clear` re-reads before any `DCH`. But
+    /// it mis-aims the next swap's plan, and since #413 the wrong flag is
+    /// flushed to SQLite and re-adopted at every connect rather than dying with
+    /// the session.
+    ///
+    /// The fake scanner models the real behaviour: writing priority=1 to a
+    /// channel makes every OTHER channel in that bank read back as priority=0.
+    #[tokio::test]
+    async fn a_priority_write_re_reads_the_channel_it_displaced() {
+        let state = default_state();
+        // Channel 3 holds priority, per the cache. Same bank as channel 5 on
+        // both families (bank 1 covers 1-30 on a BC75XLT, 1-50 on a BC125AT).
+        state.shadow.write().unwrap().channels.insert(
+            3,
+            ChannelData {
+                index: 3,
+                frequency: 151.0,
+                priority: true,
+                ..Default::default()
+            },
+        );
+
+        // The displacing scanner: whatever index is asked for, only the one
+        // most recently written with priority=1 reads back as priority=1.
+        let fake = FakeScanner::attach(&state, {
+            let holder = std::sync::Mutex::new(0u16);
+            move |command: &str| {
+                if command == "PRG" {
+                    return Ok("PRG,OK\r".to_string());
+                }
+                if command == "EPG" {
+                    return Ok("EPG,OK\r".to_string());
+                }
+                if let Some(rest) = command.strip_prefix("CIN,") {
+                    let mut fields = rest.splitn(2, ',');
+                    let index: u16 = fields.next().unwrap_or("").parse().unwrap_or(0);
+                    match fields.next() {
+                        Some(payload) => {
+                            if payload.rsplit(',').next() == Some("1") {
+                                *holder.lock().unwrap() = index;
+                            }
+                            return Ok("CIN,OK\r".to_string());
+                        }
+                        None => {
+                            let p = if *holder.lock().unwrap() == index {
+                                1
+                            } else {
+                                0
+                            };
+                            return Ok(format!("CIN,{index},Chan,01510000,FM,0,2,0,{p}\r"));
+                        }
+                    }
+                }
+                Ok("OK\r".to_string())
+            }
+        });
+
+        let wanted = ChannelData {
+            index: 5,
+            frequency: 151.0,
+            alpha_tag: "Chan".to_string(),
+            modulation: "FM".to_string(),
+            delay: 2,
+            priority: true,
+            ..Default::default()
+        };
+        let written = write_channel_to_scanner(&state, &wanted)
+            .await
+            .expect("the write itself must succeed");
+        assert!(written.priority, "precondition: channel 5 took priority");
+
+        let shadow = state.shadow.read().unwrap();
+        let displaced = shadow
+            .channels
+            .get(&3)
+            .expect("channel 3 must still be cached");
+        assert!(
+            !displaced.priority,
+            "the displaced channel must be re-read, not left claiming a \
+             priority the radio moved away: {displaced:?}"
+        );
+
+        // And it happened inside ONE bracket -- a second PRG/EPG pair back to
+        // back is the #584 shape, where the second queues behind the first and
+        // blows its deadline.
+        let transcript = fake.transcript_with_closed_bracket();
+        assert_eq!(
+            transcript.iter().filter(|c| *c == "PRG").count(),
+            1,
+            "the displacement re-read must reuse the open bracket: {transcript:?}"
+        );
+        assert!(
+            transcript.iter().any(|c| c == "CIN,3"),
+            "expected a re-read of the displaced channel: {transcript:?}"
+        );
+    }
+
+    /// The other direction: a write that does NOT set priority reads nothing
+    /// extra.
+    ///
+    /// Paired deliberately. A build that re-read the whole bank on every
+    /// channel write would satisfy the guard above while turning each edit into
+    /// a burst of round trips -- and the bulk-upload loop writes one channel at
+    /// a time.
+    #[tokio::test]
+    async fn a_write_without_priority_reads_no_bystanders() {
+        let state = default_state();
+        state.shadow.write().unwrap().channels.insert(
+            3,
+            ChannelData {
+                index: 3,
+                frequency: 151.0,
+                priority: true,
+                ..Default::default()
+            },
+        );
+        let fake = FakeScanner::attach(&state, scanner_responder(None, |_| false));
+
+        let wanted = ChannelData {
+            index: 5,
+            frequency: 145.13,
+            alpha_tag: "Test Chan".to_string(),
+            modulation: "FM".to_string(),
+            delay: 2,
+            priority: false,
+            ..Default::default()
+        };
+        let _ = write_channel_to_scanner(&state, &wanted).await;
+
+        let transcript = fake.transcript_with_closed_bracket();
+        assert!(
+            !transcript.iter().any(|c| c == "CIN,3"),
+            "a write that sets no priority displaces nothing, so it must not \
+             re-read bystanders: {transcript:?}"
+        );
+    }
+
     // ---------------------------------------------------------------------
     // Settings write paths
     //
@@ -4719,6 +7951,69 @@ mod tests {
             .filter(|c| *c != "PRG" && *c != "EPG")
             .cloned()
             .collect()
+    }
+
+    /// A DELETE with a JSON body, which `post_json_capture` cannot send.
+    async fn delete_json_capture(uri: &str, body: &'static str) -> (StatusCode, Vec<String>) {
+        let state = default_state();
+        let fake = FakeScanner::attach(&state, |_| Ok("OK".to_string()));
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (response.status(), fake.transcript())
+    }
+
+    #[tokio::test]
+    async fn remove_global_lockout_sends_ulf_in_the_wire_encoding() {
+        let (status, t) =
+            delete_json_capture("/api/v1/lockouts/frequencies", r#"{"frequency":146.52}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(settings_payload(&t), vec!["ULF,01465200"]);
+        assert_eq!(t.first().map(String::as_str), Some("PRG"));
+        assert_eq!(t.last().map(String::as_str), Some("EPG"));
+    }
+
+    /// REGRESSION GUARD (#522): validate BEFORE the wire, like every other
+    /// frequency write (#402). A `LOF` outside the scanner's coverage is a
+    /// value it cannot tune, and the vendor spec aborts on a format error --
+    /// so it is rejected here rather than sent hopefully.
+    #[tokio::test]
+    async fn a_frequency_outside_coverage_never_reaches_the_wire() {
+        // 700 MHz is outside every BC125AT band (25-54, 108-174, 225-380, 400-512).
+        // Asserted on DELETE because that is the only verb this route has: the
+        // add path was removed in #531, and the guard lives in the shared
+        // `lockout_wire_value`.
+        let (status, t) =
+            delete_json_capture("/api/v1/lockouts/frequencies", r#"{"frequency":700.0}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(t.is_empty(), "nothing may be sent: {t:?}");
+    }
+
+    /// REGRESSION GUARD (#522): `covers_frequency` returns TRUE for 0.0,
+    /// because 0 is the clear sentinel on the channel-write path. There is no
+    /// such sentinel here -- a lockout on 0 Hz is meaningless -- so the zero
+    /// case must be rejected explicitly rather than inherited from that helper.
+    /// Reusing `covers_frequency` alone would send `LOF,00000000`.
+    #[tokio::test]
+    async fn zero_is_rejected_rather_than_inherited_as_the_clear_sentinel() {
+        let (status, t) =
+            delete_json_capture("/api/v1/lockouts/frequencies", r#"{"frequency":0}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(t.is_empty(), "nothing may be sent for 0: {t:?}");
+
+        let (status, t) =
+            delete_json_capture("/api/v1/lockouts/frequencies", r#"{"frequency":-5.0}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(t.is_empty(), "nothing may be sent for a negative: {t:?}");
     }
 
     #[tokio::test]
@@ -4846,6 +8141,178 @@ mod tests {
             payload[0].starts_with("SSG,"),
             "expected an SSG write: {payload:?}"
         );
+    }
+
+    /// The write half of the same guard: a stale client that still POSTs the
+    /// service-search mask gets a named error instead of a bare `ERR` off the
+    /// wire, and nothing reaches the scanner.
+    #[tokio::test]
+    async fn set_service_search_is_refused_without_ssg() {
+        use crate::protocol::capabilities::BC75XLT;
+
+        let state = default_state();
+        state.device.write().unwrap().capabilities = Some(BC75XLT);
+        let fake = FakeScanner::attach(&state, |_| Ok("OK".to_string()));
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/settings/service-search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"groups":[true,false,true,false,true,false,true,false,true,false]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            settings_payload(&fake.transcript()).is_empty(),
+            "nothing may reach a scanner with no SSG command"
+        );
+    }
+
+    /// A model whose `KBP` beep field is `[RSV]` must never be sent one. The
+    /// vendor spec aborts the whole set command on a format error, so a write
+    /// here would take the key lock down with it.
+    #[tokio::test]
+    async fn set_key_beep_is_refused_without_a_beep_field() {
+        use crate::protocol::capabilities::BC75XLT;
+
+        let state = default_state();
+        state.device.write().unwrap().capabilities = Some(BC75XLT);
+        let fake = FakeScanner::attach(&state, |_| Ok("OK".to_string()));
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/settings/key-beep")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"level":1,"lock":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            settings_payload(&fake.transcript()).is_empty(),
+            "nothing may reach a scanner whose KBP beep field is reserved"
+        );
+    }
+
+    /// REGRESSION GUARD: the `CSG` write echoes the field count the READ
+    /// reported.
+    ///
+    /// A BC125AT answers a bare mask; a BC75XLT answers
+    /// `CSG,<mask>,[DLY],[DIR]` and rejects the bare form -- `CSG,0111010101`
+    /// -> `CSG,ERR`, hardware 2026-08-28. Because a format error aborts the
+    /// whole set command, sending the BC125AT shape made every custom-search
+    /// bank toggle a silent no-op on that model: the API returned 200 and
+    /// nothing changed on the radio.
+    ///
+    /// Both shapes are pinned. Either alone passes while the other is broken,
+    /// and the trailing fields carry a search delay and direction Bearpaw does
+    /// not model -- write back anything but what was read and they are lost.
+    fn csg_responder(
+        read: &'static str,
+    ) -> impl Fn(&str) -> Result<String, String> + Send + 'static {
+        move |cmd: &str| {
+            if cmd == "CSG" {
+                Ok(read.to_string())
+            } else {
+                Ok("OK".to_string())
+            }
+        }
+    }
+
+    async fn csg_write_for(read: &'static str) -> Vec<String> {
+        let state = default_state();
+        let fake = FakeScanner::attach(&state, csg_responder(read));
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/settings/custom-search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"groups":[true,false,false,false,true,false,true,false,true,false]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        settings_payload(&fake.transcript_with_closed_bracket())
+            .into_iter()
+            .filter(|c| c != "CSG")
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn set_custom_search_sends_the_bare_mask_when_the_read_is_bare() {
+        assert_eq!(
+            csg_write_for("CSG,0111010101").await,
+            vec!["CSG,0111010101"],
+            "a BC125AT-shaped read must produce a BC125AT-shaped write"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_custom_search_carries_the_trailing_fields_the_read_reported() {
+        assert_eq!(
+            csg_write_for("CSG,0111010101,1,0").await,
+            vec!["CSG,0111010101,1,0"],
+            "a BC75XLT-shaped read must produce a BC75XLT-shaped write, \
+             delay and direction preserved"
+        );
+    }
+
+    /// REGRESSION GUARD: a reserved `CLC` field goes out EMPTY, never `0`.
+    ///
+    /// Field 5 (`hit_scan`) is reserved on a BC75XLT -- written `1` it reads
+    /// back empty (hardware 2026-08-28). It is accepted without an error and
+    /// silently discarded, so nothing but a read-back reveals the failure.
+    /// CLAUDE.md pitfall #9: an empty field means "leave unchanged", while a
+    /// value in a reserved slot risks the format error that aborts the whole
+    /// set command. The UI hides that control, so the `lockout` arriving here
+    /// is a default rather than a user choice -- writing it would be inventing
+    /// an answer.
+    ///
+    /// Paired with the BC125AT case: a guard that emptied the field for every
+    /// model would pass alone while silently dropping a real setting.
+    async fn clc_write_for(caps: crate::protocol::capabilities::ScannerCapabilities) -> String {
+        let state = default_state();
+        state.device.write().unwrap().capabilities = Some(caps);
+        let fake = FakeScanner::attach(&state, |_| Ok("OK".to_string()));
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/settings/close-call")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"mode":1,"alert_beep":true,"alert_light":true,"band":[true,true,true,false,true],"lockout":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = settings_payload(&fake.transcript_with_closed_bracket());
+        assert_eq!(payload.len(), 1, "expected one CLC write: {payload:?}");
+        payload.into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn close_call_leaves_a_reserved_hit_scan_field_empty() {
+        use crate::protocol::capabilities::BC75XLT;
+        assert_eq!(clc_write_for(BC75XLT).await, "CLC,1,1,1,11101,");
+    }
+
+    #[tokio::test]
+    async fn close_call_still_writes_hit_scan_where_it_is_settable() {
+        assert_eq!(clc_write_for(BC125AT_FAMILY).await, "CLC,1,1,1,11101,1");
     }
 
     #[tokio::test]

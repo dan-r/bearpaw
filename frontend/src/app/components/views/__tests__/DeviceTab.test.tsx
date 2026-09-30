@@ -1,5 +1,6 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { toast } from 'sonner';
 import {
   DeviceTab,
   PREFERENCE_KEY_MAP,
@@ -11,6 +12,8 @@ import {
 } from '../DeviceTab';
 import { createMockApiClient } from '../../../../test/mocks/mockApiClient';
 import {
+  BC125AT_CAPS,
+  BC75XLT_CAPS,
   createTestChannel,
   createTestDeviceInfo,
   createTestLiveState,
@@ -27,6 +30,7 @@ vi.mock('sonner', () => ({
 }));
 
 vi.mock('../../../../api/useApi', () => ({
+  API_BASE: 'http://127.0.0.1:3030/api/v1',
   getAPI: vi.fn(() => createMockApiClient()),
 }));
 
@@ -41,13 +45,48 @@ describe('DeviceTab', () => {
       channels: [],
       liveState: createTestLiveState(),
       deviceInfo: createTestDeviceInfo(),
+      preferences: { ...useStore.getState().preferences, analyticsScope: 'scanner' },
     });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   const renderDeviceTab = () => render(<DeviceTab />);
 
   const selectCategory = async (label: RegExp | string) => {
     await userEvent.click(screen.getByRole('button', { name: label }));
+  };
+
+  /**
+   * Turn Close Call on, toggle one band, and return the WIRE POSITION that
+   * moved (1-based, as the mask is written).
+   *
+   * Reads the index that changed rather than an absolute value: the band's
+   * starting state comes from hydration, so asserting `true` or `false`
+   * pins the fixture instead of the mapping. What matters is which slot the
+   * click reached.
+   *
+   * The switches are disabled while the mode is 'off' — the default until
+   * hydration — so the mode has to move first. That write is itself a
+   * setCloseCallSettings call, hence the before/after pair.
+   */
+  const bandPositionMovedBy = async (label: string): Promise<number[]> => {
+    await userEvent.click(screen.getByLabelText('Mode'));
+    await userEvent.click(await screen.findByRole('option', { name: 'CC Priority' }));
+    await waitFor(() => expect(mockApiClient.setCloseCallSettings).toHaveBeenCalled());
+
+    await userEvent.click(screen.getByLabelText(label));
+    await waitFor(() =>
+      expect(mockApiClient.setCloseCallSettings.mock.calls.length).toBeGreaterThan(1),
+    );
+    const payloads = mockApiClient.setCloseCallSettings.mock.calls.map(
+      (call) => (call[0] as { band: boolean[] }).band,
+    );
+    const before = payloads[0];
+    const after = payloads[payloads.length - 1];
+    return after.map((_, i) => i).filter((i) => before[i] !== after[i]);
   };
 
   describe('Device Config category', () => {
@@ -151,6 +190,29 @@ describe('DeviceTab', () => {
         expect(screen.queryByText(/will not engage/i)).not.toBeInTheDocument();
       });
 
+      // REGRESSION GUARD (#413): channels adopted from the SQLite cache at
+      // connect are real, read channel memory -- but no sync ran this session,
+      // so `sync.hasSyncedInitially` is false and stays false for the whole
+      // session. Gating on it meant this hint silently vanished on exactly the
+      // fast-start launches the cache exists to create: the user picks a
+      // priority mode, the radio ignores it ("Priority Scan: No Channel"), and
+      // the one thing that explains why is absent.
+      //
+      // `channels.length > 0` is the right gate now. The original comment gave
+      // the reason it was not -- an empty list was indistinguishable from
+      // "synced, nothing flagged" -- and persistence is precisely what removed
+      // that ambiguity. The test above still pins the cold-start case.
+      it('warns when channels came from the cache with no sync this session', () => {
+        useStore.setState({
+          channels: [createTestChannel({ index: 1, priority: false })],
+          sync: { ...useStore.getState().sync, hasSyncedInitially: false },
+        });
+
+        renderDeviceTab();
+
+        expect(screen.getByText(/will not engage/i)).toBeInTheDocument();
+      });
+
       // The hint is only useful to a screen-reader user if it is associated
       // with the control it explains; visual adjacency does not carry over.
       it('associates the hint with the Priority Mode select', () => {
@@ -207,6 +269,57 @@ describe('DeviceTab', () => {
       });
       expect(screen.getByText(/CH 1/i)).toBeInTheDocument();
       expect(screen.getByText(/151.2500/i)).toBeInTheDocument();
+    });
+
+    it('renders the global avoid list as a separate table (#522)', async () => {
+      // The avoid list is a SECOND list, not a filter of the channel one:
+      // bare frequencies with no channel, which Search and Close Call skip.
+      useStore.setState({ channels: [createTestChannel({ index: 1 })] });
+      mockApiClient.getLockouts = vi.fn().mockResolvedValue({
+        channels: [1],
+        frequencies: [116.7333, 122.8833],
+        temporary_channels: [],
+      });
+
+      renderDeviceTab();
+      await selectCategory(/Locked Channels/i);
+
+      await waitFor(() => {
+        expect(screen.getByRole('table', { name: /avoided frequencies/i })).toBeInTheDocument();
+      });
+      expect(screen.getByText('116.7333')).toBeInTheDocument();
+      expect(screen.getByText('122.8833')).toBeInTheDocument();
+      expect(screen.getByText(/2 on the global list/i)).toBeInTheDocument();
+    });
+
+    it('removes one avoided frequency and refetches (#522)', async () => {
+      useStore.setState({ channels: [createTestChannel({ index: 1 })] });
+      mockApiClient.getLockouts = vi.fn().mockResolvedValue({
+        channels: [1],
+        frequencies: [116.7333],
+        temporary_channels: [],
+      });
+      mockApiClient.removeGlobalLockout = vi
+        .fn()
+        .mockResolvedValue({ status: 'ok', frequency: 116.7333 });
+
+      renderDeviceTab();
+      await selectCategory(/Locked Channels/i);
+      await waitFor(() => {
+        expect(screen.getByText('116.7333')).toBeInTheDocument();
+      });
+
+      await userEvent.click(screen.getByRole('button', { name: /Remove 116.7333 MHz/i }));
+
+      // The MHz value goes to the API, not the wire encoding -- the backend
+      // does that conversion, and sending raw 100 Hz units here would be
+      // 10000x off with no type error to catch it.
+      await waitFor(() => {
+        expect(mockApiClient.removeGlobalLockout).toHaveBeenCalledWith(116.7333);
+      });
+      // Refetched rather than spliced locally: ULF can be refused, and only
+      // the walk knows what the radio actually holds.
+      expect(mockApiClient.getLockouts).toHaveBeenCalledTimes(2);
     });
 
     it('should call unlock when Unlock Selected button clicked', async () => {
@@ -317,6 +430,90 @@ describe('DeviceTab', () => {
     });
   });
 
+  // REGRESSION GUARD (#533): the panel heading must name the category the panel
+  // is actually rendering. `categories` shrinks when capabilities arrive or
+  // change — a BC75XLT has no `SSG` command, so Service Search leaves the list —
+  // and `activeCategory` exists precisely to absorb that, per its derivation
+  // comment ("swapping scanners can strip the category the user is standing
+  // on"). The heading alone still read `selectedCategory`, so a user standing on
+  // Service Search when a BC75XLT identified itself got Device Config's controls
+  // under a "Service Search" heading.
+  //
+  // Asserting the heading alone would pass for a build that renamed the heading
+  // while rendering the wrong panel, so this pins BOTH: the Service-Search-only
+  // control goes away AND the heading follows it.
+  describe('category heading follows the rendered panel (#533)', () => {
+    it('renames the heading when capabilities strip the selected category', async () => {
+      renderDeviceTab();
+      await selectCategory(/Service Search/i);
+
+      expect(screen.getByRole('heading', { level: 2 })).toHaveTextContent('Service Search');
+      expect(screen.getByRole('switch', { name: /Police/i })).toBeInTheDocument();
+
+      act(() => {
+        useStore.setState({
+          deviceInfo: { ...createTestDeviceInfo(), capabilities: BC75XLT_CAPS },
+        });
+      });
+
+      // The panel fell back to Device Config. The heading must say so.
+      expect(screen.queryByRole('switch', { name: /Police/i })).not.toBeInTheDocument();
+      expect(screen.getByRole('heading', { level: 2 })).toHaveTextContent('Device Config');
+      expect(screen.getByRole('heading', { level: 2 })).not.toHaveTextContent('Service Search');
+    });
+  });
+
+  // REGRESSION GUARD (#638): Search Settings are HIDDEN on a model that cannot
+  // take them.
+  //
+  // The BC75XLT answers a `SCO` read but rejects every write, including a write
+  // of the value it just reported (hardware 2026-09-02). Worse, `set_search`
+  // treated `SCO,ERR` as success, so the slider moved, the toast said OK, and
+  // the radio never changed — a control that looks like it works.
+  //
+  // Both halves are pinned. Asserting only that it disappears on a BC75XLT
+  // passes for a build that hides Search Settings from everyone.
+  describe('Search Settings visibility (#638)', () => {
+    it('shows the controls on a model that can take SCO', async () => {
+      renderDeviceTab();
+      await selectCategory(/Service Search/i);
+
+      expect(screen.getByRole('heading', { name: /Search Settings/i })).toBeInTheDocument();
+      expect(screen.getByRole('switch', { name: /Code Search/i })).toBeInTheDocument();
+      expect(screen.getByRole('slider', { name: /Search Delay/i })).toBeInTheDocument();
+    });
+
+    // Swapping to BC75XLT_CAPS would be the obvious way to write this, and it
+    // is WRONG: that model also lacks `SSG`, so the whole Service Search
+    // category leaves the list and the panel falls back to Device Config (see
+    // the #533 guard above). The block then disappears whether or not the gate
+    // exists — the first draft of this test passed with the gate replaced by
+    // `{true && (...)}`, caught by mutation rather than review.
+    //
+    // Varying ONLY `has_search_options` keeps the category on screen, so the
+    // gate is the single thing under test.
+    it('hides them on a model that cannot', async () => {
+      renderDeviceTab();
+      await selectCategory(/Service Search/i);
+      expect(screen.getByRole('heading', { name: /Search Settings/i })).toBeInTheDocument();
+
+      act(() => {
+        useStore.setState({
+          deviceInfo: {
+            ...createTestDeviceInfo(),
+            capabilities: { ...BC125AT_CAPS, has_search_options: false },
+          },
+        });
+      });
+
+      // The category is still here — only the SCO controls went away.
+      expect(screen.getByRole('switch', { name: /Police/i })).toBeInTheDocument();
+      expect(screen.queryByRole('heading', { name: /Search Settings/i })).not.toBeInTheDocument();
+      expect(screen.queryByRole('switch', { name: /Code Search/i })).not.toBeInTheDocument();
+      expect(screen.queryByRole('slider', { name: /Search Delay/i })).not.toBeInTheDocument();
+    });
+  });
+
   describe('Custom Search category', () => {
     it('should toggle search range enable', async () => {
       mockApiClient.setCustomSearchSettings = vi.fn().mockResolvedValue(undefined);
@@ -330,54 +527,156 @@ describe('DeviceTab', () => {
       expect(mockApiClient.setCustomSearchSettings).toHaveBeenCalled();
     });
 
-    it('should update range values', async () => {
+    // Editing moved from inline table inputs into a dialog (click the row,
+    // edit, Save). The inline inputs wrote to the radio from `onChange`, so
+    // every keystroke that left both fields parseable sent a `CSP` write --
+    // typing `146.5` into an empty lower limit sent `1`, `14`, `146`, `146.5`,
+    // three of them values nobody chose, each opening a program-mode bracket.
+    const openRangeEditor = async (id: number) => {
+      await userEvent.click(screen.getByRole('button', { name: `Edit search range ${id}` }));
+    };
+
+    it('saves a range only when Save is pressed', async () => {
       mockApiClient.setCustomSearchRange = vi.fn().mockResolvedValue(undefined);
 
       renderDeviceTab();
       await selectCategory(/Custom Search/i);
+      await openRangeEditor(1);
 
-      const startInput = screen.getByDisplayValue('140.0000');
-      fireEvent.change(startInput, { target: { value: '141.0000' } });
+      const lower = screen.getByLabelText('Lower (MHz)');
+      fireEvent.change(lower, { target: { value: '141.0000' } });
 
+      // The whole point: typing has not touched the scanner.
+      expect(mockApiClient.setCustomSearchRange).not.toHaveBeenCalled();
+
+      await userEvent.click(screen.getByRole('button', { name: 'Save' }));
       await waitFor(() => {
-        expect(mockApiClient.setCustomSearchRange).toHaveBeenLastCalledWith(1, 141, 149);
+        expect(mockApiClient.setCustomSearchRange).toHaveBeenCalledWith(1, 141, 149);
       });
     });
 
-    // Regression guard (#264): the range MHz inputs are controlled, so
-    // updateRange must always write the raw typed string to state — otherwise
-    // clearing the field (or typing a leading '.') parses to NaN, the state
-    // write is skipped, and React snaps the input back to its old value,
-    // visibly swallowing the keystroke.
-    it('lets you clear a range input without snapping back', async () => {
+    it('discards edits on Cancel without writing', async () => {
       mockApiClient.setCustomSearchRange = vi.fn().mockResolvedValue(undefined);
 
       renderDeviceTab();
       await selectCategory(/Custom Search/i);
+      await openRangeEditor(1);
 
-      const startInput = screen.getByDisplayValue('140.0000');
-      fireEvent.change(startInput, { target: { value: '' } });
+      fireEvent.change(screen.getByLabelText('Lower (MHz)'), { target: { value: '141.0000' } });
+      await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
 
-      await waitFor(() => {
-        expect(startInput).toHaveValue('');
-      });
-      // An empty bound must NOT reach the wire — the parse guard still holds.
       expect(mockApiClient.setCustomSearchRange).not.toHaveBeenCalled();
     });
 
-    it('lets you type a leading decimal into a range input', async () => {
+    // Regression guard (#264), carried over from the inline inputs: the fields
+    // are controlled, so the raw typed string must always reach state.
+    // Otherwise clearing the field (or typing a leading '.') parses to NaN, the
+    // state write is skipped, and React snaps the input back — visibly
+    // swallowing the keystroke. Validation gates the SAVE, not the keystroke.
+    it.each([
+      ['cleared', ''],
+      ['a leading decimal', '.'],
+    ])('lets you type %s without snapping back', async (_label, typed) => {
       mockApiClient.setCustomSearchRange = vi.fn().mockResolvedValue(undefined);
 
       renderDeviceTab();
       await selectCategory(/Custom Search/i);
+      await openRangeEditor(1);
 
-      const startInput = screen.getByDisplayValue('140.0000');
-      fireEvent.change(startInput, { target: { value: '.' } });
+      const lower = screen.getByLabelText('Lower (MHz)');
+      fireEvent.change(lower, { target: { value: typed } });
 
-      await waitFor(() => {
-        expect(startInput).toHaveValue('.');
-      });
+      await waitFor(() => expect(lower).toHaveValue(typed));
       expect(mockApiClient.setCustomSearchRange).not.toHaveBeenCalled();
+    });
+
+    it('refuses to save a limit the scanner cannot tune', async () => {
+      mockApiClient.setCustomSearchRange = vi.fn().mockResolvedValue(undefined);
+
+      renderDeviceTab();
+      await selectCategory(/Custom Search/i);
+      await openRangeEditor(1);
+
+      fireEvent.change(screen.getByLabelText('Lower (MHz)'), { target: { value: '900.0000' } });
+      await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+      expect(await screen.findByText(/Must be in a covered band/i)).toBeInTheDocument();
+      expect(mockApiClient.setCustomSearchRange).not.toHaveBeenCalled();
+    });
+
+    // `CSP` has no name field on either model, so a label could never be saved.
+    // The old one wrote to local state and vanished on reload.
+    it('has no label column', async () => {
+      renderDeviceTab();
+      await selectCategory(/Custom Search/i);
+
+      expect(screen.queryByText('Label')).not.toBeInTheDocument();
+      expect(screen.getByText('R-1')).toBeInTheDocument();
+    });
+  });
+
+  // The scanner has no change notification, so anything changed on its front
+  // panel stays invisible until the settings read runs again. Refresh makes
+  // that recoverable; the timestamp makes it visible. Not polled on purpose --
+  // the backend answers this inside a program-mode bracket, which parks the
+  // scanner in HOLD at channel 1.
+  // #434: the Locked Channels table always rendered a Tag column, labelled
+  // every empty tag "Untitled", and advertised tag search. On a BC75XLT that
+  // is a full column of "Untitled" and a search box promising something the
+  // hardware cannot do. Same fix #404 made to the channel table, in a table
+  // #404 did not touch -- and partly an accessibility one: with no tag, every
+  // row announces identically.
+  describe('Locked Channels tag column (#434)', () => {
+    it('hides the Tag column and its search promise on a BC75XLT', async () => {
+      useStore.setState({
+        deviceInfo: { ...createTestDeviceInfo(), capabilities: BC75XLT_CAPS },
+      });
+      renderDeviceTab();
+      await selectCategory(/Locked Channels/i);
+
+      expect(screen.queryByRole('columnheader', { name: 'Tag' })).not.toBeInTheDocument();
+      expect(screen.getByPlaceholderText('Search frequency')).toBeInTheDocument();
+    });
+
+    it('keeps them on a BC125AT-family scanner', async () => {
+      renderDeviceTab();
+      await selectCategory(/Locked Channels/i);
+
+      expect(screen.getByRole('columnheader', { name: 'Tag' })).toBeInTheDocument();
+      expect(screen.getByPlaceholderText('Search frequency or tag')).toBeInTheDocument();
+    });
+  });
+
+  describe('Refresh control', () => {
+    it.each([['Device Config'], ['Close Call'], ['Service Search'], ['Custom Search']])(
+      'offers Refresh on %s, which reads device state',
+      async (category) => {
+        renderDeviceTab();
+        await selectCategory(new RegExp(category, 'i'));
+
+        expect(screen.getByRole('button', { name: /Refresh/i })).toBeInTheDocument();
+      },
+    );
+
+    it.each([['Locked Channels'], ['Preferences']])(
+      'omits Refresh on %s, which does not read drifting device state',
+      async (category) => {
+        renderDeviceTab();
+        await selectCategory(new RegExp(category, 'i'));
+
+        expect(screen.queryByRole('button', { name: /^Refresh$/i })).not.toBeInTheDocument();
+      },
+    );
+
+    it('re-reads settings and stamps the time', async () => {
+      renderDeviceTab();
+      await selectCategory(/Custom Search/i);
+      mockApiClient.getAllSettings.mockClear();
+
+      await userEvent.click(screen.getByRole('button', { name: /Refresh/i }));
+
+      await waitFor(() => expect(mockApiClient.getAllSettings).toHaveBeenCalledTimes(1));
+      expect(await screen.findByText(/^Read /)).toBeInTheDocument();
     });
   });
 
@@ -394,34 +693,38 @@ describe('DeviceTab', () => {
       expect(screen.getByRole('button', { name: /Github/i })).toBeInTheDocument();
       expect(screen.getByRole('button', { name: /Buy me a coffee/i })).toBeInTheDocument();
     });
+
+    it('applies a preference only after the backend confirms persistence', async () => {
+      const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 } as Response);
+      vi.stubGlobal('fetch', fetchMock);
+      renderDeviceTab();
+      await selectCategory(/Preferences/i);
+
+      await userEvent.click(screen.getByRole('switch', { name: /Combine Scanner Analytics/i }));
+
+      await waitFor(() => expect(useStore.getState().preferences.analyticsScope).toBe('all'));
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining('/preferences'),
+        expect.objectContaining({ body: JSON.stringify({ analytics_scope: 'all' }) }),
+      );
+    });
+
+    it('keeps the saved preference and reports a persistence failure', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 500 } as Response));
+      renderDeviceTab();
+      await selectCategory(/Preferences/i);
+
+      await userEvent.click(screen.getByRole('switch', { name: /Combine Scanner Analytics/i }));
+
+      await waitFor(() =>
+        expect(toast.error).toHaveBeenCalledWith(expect.stringMatching(/previous setting/i)),
+      );
+      expect(useStore.getState().preferences.analyticsScope).toBe('scanner');
+      expect(screen.getByRole('switch', { name: /Combine Scanner Analytics/i })).not.toBeChecked();
+    });
   });
 
   describe('capability-gated controls (#404/#405)', () => {
-    const BC75XLT_CAPS = {
-      channel_count: 300,
-      channels_per_bank: 30,
-      bank_count: 10,
-      has_alpha_tags: false,
-      reports_live_channel: false,
-      ss_format: 'bc75xlt',
-      ss_region: 'USA',
-      has_per_channel_modulation: false,
-      has_tone_squelch: false,
-      has_backlight_control: false,
-      has_battery_save: false,
-      has_contrast: false,
-      has_weather_alert: false,
-      key_beep_needs_program_mode: true,
-      valid_delays: [0, 1],
-      cleared_delay: 0,
-      default_baud: 57600,
-      coverage_bands: [
-        [25, 54],
-        [108, 174],
-        [406, 512],
-      ] as Array<[number, number]>,
-    };
-
     // Verified on hardware 2026-08-26: BLT, BSV, CNT and WXS all reply ERR on a
     // BC75XLT, in and out of program mode. A visible control that cannot work is
     // worse than an absent one — it invites a click that silently fails and logs
@@ -436,6 +739,21 @@ describe('DeviceTab', () => {
       expect(screen.queryByLabelText('Backlight')).not.toBeInTheDocument();
       expect(screen.queryByLabelText('Contrast')).not.toBeInTheDocument();
       expect(screen.queryByLabelText('Battery Saver')).not.toBeInTheDocument();
+    });
+
+    // `KBP` on this model is `[RSV],[LOCK]` -- the beep slot is reserved, and
+    // the radio answers `KBP,,0` (settings probe 2026-08-26). The read could
+    // never parse, so the switch rendered a fabricated `on`; the write put a
+    // number in the reserved slot, which per the vendor spec aborts the whole
+    // set command and takes the key lock with it.
+    it('hides key beep on a BC75XLT', async () => {
+      useStore.setState({
+        deviceInfo: { ...createTestDeviceInfo(), capabilities: BC75XLT_CAPS },
+      });
+      renderDeviceTab();
+      await selectCategory(/Device Config/i);
+
+      expect(screen.queryByLabelText('Key Beep')).not.toBeInTheDocument();
     });
 
     // With two supported families, a user with both scanners otherwise has no
@@ -475,6 +793,196 @@ describe('DeviceTab', () => {
       expect(screen.getByLabelText('Backlight')).toBeInTheDocument();
       expect(screen.getByLabelText('Contrast')).toBeInTheDocument();
       expect(screen.getByLabelText('Battery Saver')).toBeInTheDocument();
+      expect(screen.getByLabelText('Key Beep')).toBeInTheDocument();
+    });
+
+    // The BC75XLT has service search on its `Svc` key but no `SSG` command, so
+    // none of the ten toggles on that page can write. The whole subtab goes,
+    // not the switches: a page of dead controls asks the same question on
+    // every visit. Its band names are wrong for this model as well — `WX`
+    // leads its list and it has no Military Air.
+    it('hides the Service Search page on a BC75XLT', () => {
+      useStore.setState({
+        deviceInfo: { ...createTestDeviceInfo(), capabilities: BC75XLT_CAPS },
+      });
+      renderDeviceTab();
+
+      expect(screen.queryByRole('button', { name: /Service Search/i })).not.toBeInTheDocument();
+    });
+
+    // Paired half — a gate that hid it from everyone would pass the test above.
+    it('keeps the Service Search page on a BC125AT-family scanner', () => {
+      renderDeviceTab();
+
+      expect(screen.getByRole('button', { name: /Service Search/i })).toBeInTheDocument();
+    });
+
+    // REGRESSION GUARD: the Close Call band switch writes the WIRE position
+    // its label names. Positions 4 and 5 are swapped between families —
+    // BC125AT is [.., UHF, 800 MHz], BC75XLT is [.., reserved, UHF], verified
+    // on hardware 2026-08-28 (writing 11111 reads back 11101). Bearpaw used
+    // the BC125AT order for both, so on a BC75XLT the "UHF" switch wrote the
+    // reserved slot and "800 MHz" — a band that radio cannot receive — was
+    // the real UHF control.
+    //
+    // Asserting the label list alone is NOT enough: hiding the 800 MHz row
+    // while leaving UHF at index 3 passes a label check and still writes
+    // nothing. The payload index is the assertion that matters.
+    it('maps UHF to wire position 5 on a BC75XLT', async () => {
+      useStore.setState({
+        deviceInfo: { ...createTestDeviceInfo(), capabilities: BC75XLT_CAPS },
+      });
+      renderDeviceTab();
+      await selectCategory(/Close Call/i);
+
+      expect(screen.queryByLabelText('800 MHz')).not.toBeInTheDocument();
+
+      // Index 4 is the fifth mask character. Index 3 is reserved here and must
+      // never move.
+      expect(await bandPositionMovedBy('UHF')).toEqual([4]);
+    });
+
+    // Paired half. Same click, different radio, different wire slot.
+    it('maps UHF to wire position 4 on a BC125AT-family scanner', async () => {
+      renderDeviceTab();
+      await selectCategory(/Close Call/i);
+
+      expect(screen.getByLabelText('800 MHz')).toBeInTheDocument();
+
+      expect(await bandPositionMovedBy('UHF')).toEqual([3]);
+    });
+
+    // CLC field 5 is reserved on a BC75XLT: written 1, it reads back empty.
+    // Accepted without an error and silently discarded, so nothing but a
+    // read-back would ever reveal it.
+    it('hides Lockout Hits While Scanning on a BC75XLT', async () => {
+      useStore.setState({
+        deviceInfo: { ...createTestDeviceInfo(), capabilities: BC75XLT_CAPS },
+      });
+      renderDeviceTab();
+      await selectCategory(/Close Call/i);
+
+      expect(screen.queryByLabelText(/Lockout Hits While Scanning/i)).not.toBeInTheDocument();
+    });
+
+    // Every control in the Display & System card is capability-gated, so on a
+    // BC75XLT it rendered as an empty titled box once #471 gated Key Beep
+    // alongside BLT and CNT. An empty card is not a neutral outcome — it reads
+    // as a section that failed to load.
+    it('hides the whole Display & System card when it would be empty', async () => {
+      useStore.setState({
+        deviceInfo: { ...createTestDeviceInfo(), capabilities: BC75XLT_CAPS },
+      });
+      renderDeviceTab();
+      await selectCategory(/Device Config/i);
+
+      expect(screen.queryByRole('heading', { name: /Display & System/i })).not.toBeInTheDocument();
+      // Scanning Logic takes the vacated grid slot rather than leaving a gap.
+      expect(screen.getByRole('heading', { name: /Scanning Logic/i })).toBeInTheDocument();
+      expect(screen.getByRole('heading', { name: /Audio & Power/i })).toBeInTheDocument();
+    });
+
+    // Paired half: a card that disappeared for everyone would pass the test
+    // above while removing backlight and contrast from the scanners that have
+    // them.
+    it('keeps the Display & System card on a BC125AT-family scanner', async () => {
+      renderDeviceTab();
+      await selectCategory(/Device Config/i);
+
+      expect(screen.getByRole('heading', { name: /Display & System/i })).toBeInTheDocument();
+      expect(screen.getByRole('heading', { name: /Scanning Logic/i })).toBeInTheDocument();
+    });
+
+    // CC Only (mode 3) is absent from the BC75XLT vendor spec AND its owner's
+    // manual, but the radio accepts and retains it (hardware 2026-08-28).
+    // Captures win — this option must NOT be hidden on that model.
+    it('still offers CC Only on a BC75XLT', async () => {
+      useStore.setState({
+        deviceInfo: { ...createTestDeviceInfo(), capabilities: BC75XLT_CAPS },
+      });
+      renderDeviceTab();
+      await selectCategory(/Close Call/i);
+      await userEvent.click(screen.getByLabelText('Mode'));
+
+      expect(await screen.findByRole('option', { name: 'CC Only' })).toBeInTheDocument();
+    });
+  });
+
+  describe('settings read recovers from a failure (#413 follow-on)', () => {
+    // The mount effect runs EXACTLY ONCE: `loadAllSettings` is
+    // useCallback(..., [api]) and the effect depends only on it, so both are
+    // stable for the life of the page. A read that failed stayed failed, and
+    // every control kept its useState default -- which the first click then
+    // wrote to the scanner.
+    //
+    // The failure is ordinary, not exotic: every settings read 409s while a
+    // memory sync holds program mode, and since #413 a sync can start at
+    // connect.
+
+    it('waits for a running sync, then reads once it ends', async () => {
+      // Better than retrying into a 409: with one effect, a sync in progress
+      // means the doomed read is never attempted. The page simply reads as
+      // soon as the radio is available.
+      useStore.setState({
+        sync: { ...useStore.getState().sync, inProgress: true },
+      });
+      mockApiClient.getAllSettings = vi.fn().mockResolvedValue({ squelch: { level: 5 } });
+
+      const { rerender } = renderDeviceTab();
+      expect(mockApiClient.getAllSettings).not.toHaveBeenCalled();
+
+      // The sync ends.
+      act(() => {
+        useStore.setState({
+          sync: { ...useStore.getState().sync, inProgress: false },
+        });
+      });
+      rerender(<DeviceTab />);
+
+      await waitFor(() => expect(mockApiClient.getAllSettings).toHaveBeenCalledTimes(1));
+    });
+
+    it('does not re-read once a read has succeeded', async () => {
+      // The read parks the scanner in HOLD at channel 1 for its duration, so a
+      // retry loop would make the radio unusable. Success is terminal; the
+      // Refresh control is the deliberate re-read.
+      useStore.setState({
+        sync: { ...useStore.getState().sync, inProgress: false },
+      });
+      mockApiClient.getAllSettings = vi.fn().mockResolvedValue({ squelch: { level: 5 } });
+
+      const { rerender } = renderDeviceTab();
+      await waitFor(() => expect(mockApiClient.getAllSettings).toHaveBeenCalledTimes(1));
+
+      act(() => {
+        useStore.setState({
+          sync: { ...useStore.getState().sync, inProgress: true },
+        });
+      });
+      rerender(<DeviceTab />);
+      act(() => {
+        useStore.setState({
+          sync: { ...useStore.getState().sync, inProgress: false },
+        });
+      });
+      rerender(<DeviceTab />);
+
+      expect(mockApiClient.getAllSettings).toHaveBeenCalledTimes(1);
+    });
+
+    it('names Refresh when the read fails', async () => {
+      // On failure every control shows a default. The toast has to say what to
+      // do about it, because nothing on screen looks wrong.
+      useStore.setState({
+        sync: { ...useStore.getState().sync, inProgress: false },
+      });
+      mockApiClient.getAllSettings = vi.fn().mockRejectedValue(new Error('PRG,NG'));
+
+      renderDeviceTab();
+
+      await waitFor(() =>
+        expect(toast.error).toHaveBeenCalledWith(expect.stringMatching(/Refresh/i)),
+      );
     });
   });
 });

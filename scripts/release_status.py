@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""Report where the current release stands. Reports; never gates.
+
+`release_preflight.py` decides whether a tag may be built. This answers the
+question you ask before you get there — "is 1.1 ready, and if not, what is
+outstanding?" — so the answer is a command rather than an archaeology dig.
+
+It reuses release_preflight's checks rather than restating them. Two
+implementations of one question is the defect this process exists to remove.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import release_preflight as preflight  # noqa: E402  (needs the path above)
+
+NEXT_HEADING = re.compile(r"^## \[", re.MULTILINE)
+
+
+def section_entries(changelog: str, version: str) -> list[str]:
+    """The bullet leads recorded under this version's heading, in order.
+
+    The declared version always has its own section — `tests.yml` runs
+    release_preflight on every pull request, which fails when it does not — so
+    that section is the staging area for the cycle, not a separate
+    `[Unreleased]` block.
+    """
+    start = re.compile(rf"^## \[{re.escape(version)}\].*$", re.MULTILINE).search(changelog)
+    if not start:
+        return []
+    rest = changelog[start.end() :]
+    end = NEXT_HEADING.search(rest)
+    body = rest[: end.start()] if end else rest
+    return [line.strip()[2:].strip() for line in body.splitlines() if line.startswith("- ")]
+
+
+def gh(*args: str) -> str | None:
+    """Run gh, returning None when it is absent or the call fails."""
+    try:
+        done = subprocess.run(
+            ["gh", *args], capture_output=True, text=True, timeout=30, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout.strip() if done.returncode == 0 else None
+
+
+def merged_undeleted_branches() -> list[str] | None:
+    """Remote branches with no commits of their own left to land."""
+    if subprocess.run(["git", "fetch", "--prune", "origin"], capture_output=True).returncode:
+        return None
+    listing = subprocess.run(
+        ["git", "branch", "-r", "--no-merged", "origin/main"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    stale = []
+    for line in listing.stdout.splitlines():
+        branch = line.strip()
+        if not branch.startswith("origin/"):
+            continue  # a different remote, e.g. a security-advisory fork
+        cherry = subprocess.run(
+            ["git", "cherry", "origin/main", branch],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if not any(l.startswith("+") for l in cherry.stdout.splitlines()):
+            stale.append(branch)
+    return stale
+
+
+def milestone_unreleasables(tag: str) -> list[str] | None:
+    """Open items in a milestone that are labelled `goal` or `epic`.
+
+    Neither closes inside one release — an epic spans releases by design and a
+    goal spans years — and the release gate blocks on open milestone items. So
+    one of these filed into a milestone blocks that tag until someone notices.
+    They are not unclosable; a person closes an epic by hand once its
+    sub-issues are done. The problem is the span, not the closing.
+    """
+    listing = gh(
+        "issue",
+        "list",
+        "--milestone",
+        tag,
+        "--state",
+        "open",
+        "--limit",
+        "200",
+        "--json",
+        "number,title,labels",
+    )
+    if listing is None:
+        return None
+    return unreleasable_items(json.loads(listing))
+
+
+def unreleasable_items(issues: list[dict]) -> list[str]:
+    """Of these issues, the ones labelled `goal` or `epic`."""
+    found = []
+    for issue in issues:
+        names = {label["name"] for label in issue.get("labels", [])}
+        blocking = names & {"goal", "epic"}
+        if blocking:
+            found.append(f"#{issue['number']} [{'/'.join(sorted(blocking))}] {issue['title']}")
+    return found
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
+    args = parser.parse_args()
+    root = args.root
+
+    version = preflight.package_version(root)
+    tag = f"v{version}"
+    print(f"Declared version   {version}   (release would be tagged {tag})")
+
+    errors = preflight.inspect_release(root, tag)
+    if errors:
+        print("Release preflight  FAILING")
+        for error in errors:
+            print(f"                   - {error}")
+    else:
+        print("Release preflight  passing (version sources agree, changelog section present)")
+
+    tags = subprocess.run(
+        ["git", "tag", "--list", tag], capture_output=True, text=True, check=False
+    ).stdout.strip()
+    if tags:
+        print(f"Tag {tag:<14} exists — {version} is SHIPPED; bump the version files for the next release")
+    else:
+        print(f"Tag {tag:<14} DOES NOT EXIST — this release is unpublished")
+
+    milestones = gh("api", "--paginate", "repos/{owner}/{repo}/milestones?state=all")
+    if milestones is None:
+        print("Milestone          unknown (gh unavailable or not authenticated)")
+    else:
+        found = next((m for m in json.loads(milestones) if m["title"] == tag), None)
+        if found is None:
+            print(f"Milestone          MISSING — no milestone named {tag}")
+        elif found["open_issues"]:
+            print(f"Milestone          {found['open_issues']} OPEN, {found['closed_issues']} closed — the release gate will refuse this tag")
+        else:
+            print(f"Milestone          clear ({found['closed_issues']} closed)")
+
+        unreleasable = milestone_unreleasables(tag)
+        if unreleasable is None:
+            print("                   (could not check for goal/epic items)")
+        elif unreleasable:
+            print(f"                   {len(unreleasable)} item(s) that will not close inside one")
+            print("                   release — an epic or goal here blocks this tag:")
+            for item in unreleasable:
+                print(f"                   - {item}")
+
+    entries = section_entries((root / "CHANGELOG.md").read_text(encoding="utf-8"), version)
+    label = f"[{version}]"
+    if entries:
+        print(f"{label:<19}{len(entries)} entr{'y' if len(entries) == 1 else 'ies'} so far this cycle:")
+        for entry in entries:
+            print(f"                   - {entry[:88]}")
+    else:
+        print(f"{label:<19}empty — nothing user-visible has landed yet")
+
+    stale = merged_undeleted_branches()
+    if stale is None:
+        print("Stale branches     unknown (could not fetch)")
+    elif stale:
+        print(f"Stale branches     {len(stale)} fully merged and undeleted:")
+        for branch in stale:
+            print(f"                   - {branch}")
+    else:
+        print("Stale branches     none")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

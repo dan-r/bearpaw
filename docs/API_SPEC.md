@@ -1,6 +1,6 @@
 # Bearpaw API Specification
 
-**Version:** 1.0.0 (the backend echoes its crate version at `GET /health`)
+**Version:** the backend echoes its crate version at `GET /health` — that is the authority, and this document deliberately does not restate it.
 **Protocol:** HTTP REST + WebSocket
 **Format:** JSON
 **Base URL:** `http://localhost:8000/api/v1`
@@ -576,11 +576,21 @@ in-progress flag is stale until it queries this endpoint.
 ```json
 {
   "in_progress": true,
-  "task_id": "sync-abc123"
+  "task_id": "sync-abc123",
+  "synced_at": 1756500000.0
 }
 ```
 
 When no sync is running, `in_progress` is `false` and `task_id` is `null`.
+
+`synced_at` is epoch seconds for when channel memory was last read from the
+scanner, or `null` if it never has been. It survives a restart: channel memory
+is cached in SQLite (#413) and the timestamp is restored along with it, so a
+client can render "last synced 3 days ago" for memory adopted from cache rather
+than walked over the wire this session.
+
+It reports when the **radio** was read, not when the cache was last written —
+the periodic cache flush does not move it.
 
 ---
 
@@ -600,7 +610,14 @@ Download full scanner memory in Uniden `.bc125at_ss` format.
 **Errors:**
 - `400 Bad Request` (`unsupported_model`) if the model is not a BC125AT/UBC125-family scanner
 - `409 Conflict` (`sync_in_progress`) if a memory sync is in progress
+- `409 Conflict` (`memory_not_synced`) if channel memory has not been fully read — see below
 - `503 Service Unavailable` if scanner disconnected
+
+**Completeness precondition:** all three exporters require a complete channel
+image — `channel_count` entries covering `1..=channel_count` — and return
+`409 memory_not_synced` otherwise. `GET /memory/export/bc75xlt_ss` is identical
+for that model. Rationale: `require_complete_channel_image` in
+`api/handlers/exports.rs`.
 
 ---
 
@@ -640,6 +657,7 @@ Download scanner channels in CSV format.
 - No program mode required (uses cached shadow state)
 
 **Errors:**
+- `409 Conflict` (`memory_not_synced`) if channel memory has not been fully read (#639 — same precondition as the `.ss` exporters above)
 - `503 Service Unavailable` if backend error
 
 **CSV Format:**
@@ -704,13 +722,22 @@ extension (#187).
 ```json
 {
   "imported": 500,
+  "settings_applied": 12,
+  "settings_skipped": [{ "command": "BLT", "label": "Backlight" }],
   "errors": []
 }
 ```
 
 **Behavior:**
-- Parses the `.bc125at_ss` payload and writes valid channels to the scanner.
+- Parses the payload and writes valid channels to the scanner.
 - Runs in program mode; returns the count imported and any per-row errors.
+- Settings writes are gated on `ScannerCapabilities` and read-back verified.
+  A setting the connected scanner has no way to accept is **not** an error —
+  it is named in `settings_skipped` so the caller can report it rather than
+  claim a full restore (#625). The same shape is returned by
+  `/memory/import/bc75xlt_ss`, which applies the subset that model supports
+  (`SCG`, `PRI`, `SQL`, `SCO`, `CSP`, `CSG`, `CLC`) and skips the rest
+  (`BLT`, `BSV`, `CNT`, `WXS`, `SSG`, `KBP`).
 
 **Errors:**
 - `400 Bad Request` if the file is malformed
@@ -901,8 +928,9 @@ request/response shapes.
 | GET, POST | `/api/v1/volume` | Read / set scanner volume (0–15). |
 | GET, POST | `/api/v1/squelch` | Read / set squelch level. |
 | GET | `/api/v1/config` (alias `/api/v1/settings/all`) | Full settings snapshot read from the scanner. |
-| GET, POST | `/api/v1/settings/backlight`, `/battery`, `/close-call`, `/contrast`, `/custom-search`, `/custom-search/defaults`, `/custom-search/ranges/{index}`, `/key-beep`, `/priority`, `/search`, `/service-search`, `/weather` | Individual global-setting getters/setters (each brackets its work in PRG). |
+| GET, POST | `/api/v1/settings/backlight`, `/battery`, `/close-call`, `/contrast`, `/custom-search`, `/custom-search/ranges/{index}`, `/key-beep`, `/priority`, `/search`, `/service-search`, `/weather` | Individual global-setting getters/setters (each brackets its work in PRG). |
 | GET | `/api/v1/lockouts` | Frequency + channel + temporary lockouts. |
+| DELETE | `/api/v1/lockouts/frequencies` | Remove (`ULF`) one entry from the GLOBAL avoid list, body `{"frequency": <MHz>}`. Distinct from a channel lockout: this list is what Search and Close Call consult. Validated against the connected scanner's coverage bands before the wire; 0 and negatives are rejected. There is deliberately no add verb — see #531. |
 | POST | `/api/v1/lockouts/clear`, `/lockouts/channels/clear`, `/lockouts/temporary/clear` | Clear the respective lockout sets. |
 | POST | `/api/v1/memory/program-mode/start`, `/memory/program-mode/end` | Open / close a manual program-mode session across requests. |
 | POST | `/api/v1/memory/import/csv` | Import channels from CSV. |

@@ -69,13 +69,14 @@
 
         <h2 id="banks-the-sidebar">Banks: the sidebar</h2>
         <p>
-          Your 500 channels are organized into
-          <strong>10 banks of 50 channels each</strong>. Channels 1 to 50 are
-          Bank 1, 51 to 100 are Bank 2, and so on. The left sidebar has a button
-          for each bank.
+          Your channels are organized into <strong>10 banks</strong>, evenly
+          split. A BC125AT-family scanner has 500 channels in banks of 50
+          (channels 1 to 50 are Bank 1, 51 to 100 are Bank 2, and so on); a
+          BC75XLT has 300 in banks of 30. The left sidebar has a button for each
+          bank.
         </p>
         <p>
-          <strong>Click a bank to see its 50 channels.</strong> Only one bank
+          <strong>Click a bank to see its channels.</strong> Only one bank
           shows at a time; the app opens on Bank 1. The selected bank is
           highlighted with a small glowing dot, and its number appears next to
           the "Bank Channels" heading.
@@ -218,7 +219,7 @@
           (narrow FM). AUTO lets the scanner choose based on the frequency.
         </p>
         <p>
-          <strong>Tone Squelch (CTCSS Hz)</strong> sets a
+          <strong>Tone <a href="glossary.html#squelch">Squelch</a> (CTCSS Hz)</strong> sets a
           <a href="glossary.html#ctcss--tone--dcs">CTCSS tone</a> so the scanner
           only opens on transmissions carrying that tone. Leave it blank for none.
           The app accepts only the standard CTCSS tones (67.0 to 254.1 Hz) and
@@ -349,33 +350,55 @@
         <h3 id="exporting">Exporting</h3>
         <p>
           <strong>Export</strong> saves your channels to a file. Pick
-          <strong>CSV</strong> for just the channel list, or
-          <strong>BC125AT</strong> for the full backup. The app writes
-          <code>channels.csv</code> or <code>scanner.bc125at_ss</code> and lets
-          you choose where it goes.
+          <strong>CSV</strong> for just the channel list, or your radio's
+          <strong>settings file</strong> for the full backup. The app writes
+          <code>channels.csv</code>, <code>scanner.bc125at_ss</code> or
+          <code>scanner.bc75xlt_ss</code> and lets you choose where it goes.
         </p>
         <p>
-          The <code>.bc125at_ss</code> format is the one Uniden's own software
-          uses, and it describes a 500-channel BC125AT-family radio. It isn't
-          offered for a BC75XLT — use CSV there.
+          The settings-file format is the one Uniden's own software uses, and
+          there is one per radio family: <code>.bc125at_ss</code> describes a
+          500-channel BC125AT-family radio, <code>.bc75xlt_ss</code> a
+          300-channel BC75XLT. Bearpaw offers whichever matches the scanner
+          that's plugged in.
+        </p>
+        <p>
+          Export needs the full channel list first. If Bearpaw hasn't finished
+          reading your scanner, it stops and asks you to sync — a backup written
+          from a half-read list looks complete without being complete, and you
+          would only find out when you tried to restore it.
         </p>
 
         <h3 id="importing">Importing</h3>
         <p>
           <strong>Import</strong> loads channels from a file, and reads either
-          format automatically. A CSV brings in just the channels. A
-          <code>.bc125at_ss</code> file brings in everything it holds and
+          format automatically. A CSV brings in just the channels. A settings
+          file brings in everything it holds and
           <strong>overwrites all channels and settings</strong> on the radio, so
           the app asks you to confirm before it does.
         </p>
         <div class="callout">
           <p>
+            <strong>A settings file is a complete picture of the radio, not a
+            list of additions.</strong> Restoring one makes the scanner match
+            the file exactly. Where the file records a channel as empty, Bearpaw
+            <strong>erases that channel on the radio</strong> — including
+            channels you programmed after you saved the file. Restore a file
+            saved from a blank scanner and you clear every channel.
+          </p>
+          <p>
+            If you only want to add channels without touching the rest, use a
+            CSV instead.
+          </p>
+        </div>
+        <div class="callout">
+          <p>
             Import writes straight to the scanner. Unlike a hand edit, it isn't
             held as a draft: the file's channels are written to the radio as the
-            import runs, with a progress bar covering the screen while it works (a
-            full native-file restore is around 80 seconds of writes). When it
-            finishes, Bearpaw re-reads the channels so the list matches what's now
-            in the radio.
+            import runs, with a progress bar covering the screen while it works.
+            A full settings-file restore writes every channel slot, empty ones
+            included, so it takes a few minutes. When it finishes, Bearpaw
+            re-reads the channels so the list matches what's now in the radio.
           </p>
         </div>
 
@@ -384,15 +407,48 @@
         </h2>
         <p>
           Your channels are read from the scanner when the app starts. This
-          <strong>memory sync</strong> takes about 30 to 45 seconds, because the
-          scanner hands over its 500 channels one at a time.
+          <strong><a href="glossary.html#memory-sync">memory sync</a></strong> takes about five seconds, because the
+          scanner hands over its channels one at a time. A panel covers the
+          screen with a progress bar while it runs — the scanner stops scanning
+          for the duration, so the app says so rather than pretending otherwise.
         </p>
         <p>
-          To re-read them manually, say after you changed something on the radio's
-          own keypad, use <strong>Scanner → Sync Memory</strong> in the menu (or
-          <kbd>Ctrl/⌘ + Y</kbd>). A panel covers the screen with a progress bar
-          and blocks the UI until it's done.
+          Bearpaw also keeps a saved copy of your channels between sessions, so
+          the list can appear instantly at launch instead of after a sync.
+          Whether it re-reads the scanner anyway is up to you — see
+          <a href="preferences.html#reread-channels">Re-read Channels on
+          Connect</a>. It's on by default.
         </p>
+
+        <h3 id="how-old-is-this-list">How old is this list?</h3>
+        <p>
+          Next to the search box, Bearpaw shows when it last read your channels
+          from the scanner — <em>Synced 3d ago</em>, or <em>Synced just
+          now</em>. The same note sits at the bottom of the window beside the
+          connection status.
+        </p>
+        <p>
+          It matters because <strong>the scanner never tells the app when
+          something changes.</strong> It answers questions and volunteers
+          nothing. So if you program a channel on the radio's own keypad while
+          Bearpaw is closed, the saved copy is out of date and nothing on screen
+          looks wrong — the timestamp is the tell.
+        </p>
+        <p>
+          Press <strong>Refresh</strong> beside that timestamp to re-read the
+          scanner. <strong>Scanner → Sync Memory</strong> in the menu (or
+          <kbd>Ctrl/⌘ + Y</kbd>) does the same thing.
+        </p>
+
+        <div class="callout">
+          <p>
+            <strong>Editing a channel is safe even when the list is stale.</strong>
+            Bearpaw re-reads a channel from the scanner immediately before
+            writing to it, and keeps the scanner's own values for every field you
+            didn't change. So editing the tag on a channel whose frequency you
+            retuned at the keypad won't put the old frequency back.
+          </p>
+        </div>
         <nav class="docs-pagination" aria-label="Guide pages">
           <a class="page-prev" href="scan.html"><span class="page-dir">← Previous</span><span class="page-title">The Scan Tab</span></a>
           <a class="page-next" href="device.html"><span class="page-dir">Next →</span><span class="page-title">The Device Tab</span></a>

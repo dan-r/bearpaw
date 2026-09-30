@@ -106,6 +106,52 @@ export interface ScannerCapabilities {
   /** False on the BC75XLT: `WXS` replies ERR in both modes. */
   has_weather_alert: boolean;
   /**
+   * Whether `SSG` (the service-search avoid mask) exists on this model.
+   *
+   * Named for the mask, not the feature: the BC75XLT HAS service search, but
+   * no command to enable or disable a band remotely — its `SSP` carries only
+   * a per-service delay and direction. False there, so the UI hides the whole
+   * Service Search page rather than showing ten toggles that cannot write.
+   */
+  has_service_search_groups: boolean;
+  /** Whether `SCO` (general-search delay, code search) can be WRITTEN.
+   * The BC75XLT answers a read but rejects every write, including a write of
+   * the value it just reported (hardware 2026-09-02). Named for what Bearpaw
+   * can control, per `has_backlight_control`. */
+  has_search_options: boolean;
+  /**
+   * Close Call band labels, indexed by position in the `CLC` mask.
+   *
+   * `null` marks a reserved position — present in the 5-character mask, but
+   * not a band. The families disagree on positions 4 and 5: the BC125AT is
+   * `[…, 'UHF', '800 MHz']`, the BC75XLT is `[…, null, 'UHF']`. Render by
+   * index and skip the nulls; never reorder, the index IS the wire position.
+   */
+  close_call_bands: Array<string | null>;
+  /**
+   * Whether `CLC` field 5 (`hit_scan`, "Lockout Hits While Scanning") is
+   * settable. Reserved on the BC75XLT: written `1`, it reads back empty.
+   */
+  has_close_call_hit_scan: boolean;
+  /**
+   * Whether Bearpaw can clear a channel's priority flag on this model.
+   *
+   * The BC125AT family needs `DCH` + a full rewrite; a BC75XLT has no `DCH`
+   * and refuses an in-place clear, but its firmware moves the flag within a
+   * bank by itself. False does NOT mean priority cannot be moved — it means
+   * the clear is the radio's job rather than ours.
+   */
+  has_priority_clear: boolean;
+  /**
+   * Whether the `KBP` key-beep field is settable.
+   *
+   * The BC125AT's `KBP` is `[BEEP],[LOCK]`; the BC75XLT's is `[RSV],[LOCK]` —
+   * the beep slot is reserved, and that model's manual documents no key-beep
+   * setting. Separate from `key_beep_needs_program_mode`, which says WHERE the
+   * command may be sent; both are true of a BC75XLT at once.
+   */
+  has_key_beep: boolean;
+  /**
    * True on the BC75XLT, where `KBP` replies `KBP,NG` outside program mode.
    * The BC125AT accepts it in either mode.
    */
@@ -119,6 +165,16 @@ export interface ScannerCapabilities {
    * See the third-rail table in CLAUDE.md.
    */
   cleared_delay: number;
+  /**
+   * Whether this model's USB serial identifies the UNIT rather than the model.
+   *
+   * Every BC125AT reports `0001` — a firmware constant, measured on both units
+   * 2026-08-26 — while a BC75XLT's comes from a per-unit CP2104 bridge. The
+   * backend reads this to decide whether the serial belongs in a scanner's
+   * identity key at all (#570). False does not mean "no serial"; it means the
+   * serial does not distinguish units.
+   */
+  has_unique_usb_serial: boolean;
   /** Serial baud rate this model speaks. */
   default_baud: number;
   /**
@@ -150,6 +206,17 @@ export interface DeviceInfo {
    */
   data_diagnostic_code?: string | null;
   data_diagnostic_message?: string | null;
+  /**
+   * Something the user should know about their stored data that is NOT a
+   * problem — today, that the database was upgraded on this launch and older
+   * versions of Bearpaw can no longer open it.
+   *
+   * Separate from `data_diagnostic_*` on purpose: that pair means "something is
+   * wrong", and a successful upgrade shown as a fault teaches people to ignore
+   * the channel that also carries real failures.
+   */
+  data_notice_code?: string | null;
+  data_notice_message?: string | null;
   /**
    * Absent until a scanner identifies itself. Consumers should use
    * `useScannerCapabilities()` rather than reading this directly — it supplies

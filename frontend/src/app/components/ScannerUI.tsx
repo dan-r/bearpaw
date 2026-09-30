@@ -35,6 +35,12 @@ interface StatusBarProps {
    * Hidden, not disabled or blanked, per CLAUDE.md's frontend rule.
    */
   showChannelCount?: boolean;
+  /**
+   * Epoch seconds for when channel memory was last read from the scanner, or
+   * null if it never has been. Rendered beside the connection status because
+   * that is where "what is this app currently showing me" already lives.
+   */
+  syncedAt?: number | null;
 }
 
 function formatActiveDuration(totalSeconds?: number | null) {
@@ -42,6 +48,30 @@ function formatActiveDuration(totalSeconds?: number | null) {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = Math.floor(totalSeconds % 60);
   return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+}
+
+/**
+ * "Synced 3d ago" for the status bar, or null when there is nothing to say.
+ *
+ * Null means channel memory has never been read from this scanner -- a fresh
+ * install, or a cache the capacity guard rejected. A sync is almost always
+ * running in that moment, so the honest render is nothing at all rather than a
+ * "Never" that flashes and disappears.
+ *
+ * Exported for its test: asserting the real function is the point (see
+ * CLAUDE.md "Third-rail flows" on guards that hand-rebuilt the shape they meant
+ * to check and passed while the bug was live).
+ */
+export function formatSyncedAt(syncedAt?: number | null, nowSeconds?: number): string | null {
+  if (syncedAt == null || syncedAt <= 0) return null;
+  const now = nowSeconds ?? Date.now() / 1000;
+  const elapsed = now - syncedAt;
+  // A clock skew or a future timestamp reads as current rather than as a
+  // negative age; the cache is not stale in any direction the user cares about.
+  if (elapsed < 60) return 'Synced just now';
+  if (elapsed < 3600) return `Synced ${Math.floor(elapsed / 60)}m ago`;
+  if (elapsed < 86400) return `Synced ${Math.floor(elapsed / 3600)}h ago`;
+  return `Synced ${Math.floor(elapsed / 86400)}d ago`;
 }
 
 function getStatusDisplay(
@@ -64,8 +94,10 @@ export function StatusBar({
   currentTab,
   sessionStats,
   showChannelCount = true,
+  syncedAt,
 }: StatusBarProps) {
   const { statusColor, statusText } = getStatusDisplay(connectionStatus, modelName);
+  const syncedText = formatSyncedAt(syncedAt);
 
   return (
     // No role="status" here: this bar holds the live session stats (Hits /
@@ -81,6 +113,11 @@ export function StatusBar({
         </div>
         <p className="font-sans font-normal scanner-text-light text-xs text-nowrap">{statusText}</p>
         <p className="font-sans font-normal text-white/60 text-xs text-nowrap pl-2">{currentTab}</p>
+        {syncedText ? (
+          <p className="font-sans font-normal text-white/40 text-xs text-nowrap pl-2">
+            {syncedText}
+          </p>
+        ) : null}
       </div>
       <div className="flex gap-4 items-center justify-end">
         {sessionStats ? (
@@ -119,6 +156,18 @@ export function StatusBar({
 
 // --- Display: control mini-buttons (top-right of the orange panel) ---
 
+/**
+ * What the L/O menu can do. Both act on the CHANNEL the scanner is stopped on.
+ *
+ * There is deliberately no entry here for the global avoid list, even though
+ * Bearpaw can write it (#522). This menu could not carry the distinction: the
+ * two below are already easy to confuse, and a third item that looks like a
+ * lockout but touches an entirely different list made it worse rather than
+ * better. The avoid list is viewed and edited on Device -> Locked Channels,
+ * where there is room to say what it is.
+ */
+export type LockoutKind = 'temporary' | 'permanent';
+
 interface ScannerControlsProps {
   volume: number;
   onVolumeChange: (volume: number) => void;
@@ -126,7 +175,7 @@ interface ScannerControlsProps {
   onSquelchChange: (squelch: number) => void;
   isHolding: boolean;
   onHoldToggle: () => void;
-  onLockout: (type: 'temporary' | 'permanent') => void;
+  onLockout: (type: LockoutKind) => void;
 }
 
 const CONTROL_BUTTON_CLASSES =
@@ -279,7 +328,7 @@ export interface ScannerDisplayProps {
   isHolding: boolean;
   onVolumeChange: (volume: number) => void;
   onHoldToggle: () => void;
-  onLockout: (type: 'temporary' | 'permanent') => void;
+  onLockout: (type: LockoutKind) => void;
   banks: boolean[];
   banksKnown?: boolean;
   onBankToggle: (index: number) => void;

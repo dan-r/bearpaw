@@ -26,6 +26,25 @@ const APP_PATH = resolve(HERE, '..', 'App.tsx');
 const APP_SOURCE = readFileSync(APP_PATH, 'utf8');
 
 /**
+ * The auto-sync effect moved out of App.tsx in #568 so it could be exercised
+ * by mounting it (see `useAutoMemorySync.test.tsx`). Its source-level guards
+ * are still worth keeping -- they pin the ORDER and SHAPE of the decision,
+ * which a behavioural test covers less precisely -- so they read the hook's
+ * source rather than App's.
+ */
+const AUTO_SYNC_PATH = resolve(HERE, '..', '..', 'hooks', 'useAutoMemorySync.ts');
+const AUTO_SYNC_SOURCE = readFileSync(AUTO_SYNC_PATH, 'utf8');
+
+/**
+ * The bank refresh moved out of App.tsx in #596, for the same reason the
+ * auto-sync effect did: the bug was about how OFTEN it ran, which no
+ * source-level assertion can see. Behavioural coverage is in
+ * `useBankRefresh.test.tsx`; these guards still pin the shape and order.
+ */
+const BANK_REFRESH_PATH = resolve(HERE, '..', '..', 'hooks', 'useBankRefresh.ts');
+const BANK_REFRESH_SOURCE = readFileSync(BANK_REFRESH_PATH, 'utf8');
+
+/**
  * Extracts the deps array of the WebSocket-subscription useEffect — the one
  * whose body sets up `unsubscribeState`, `unsubscribeEvent`,
  * `unsubscribeDeviceInfo`, `unsubscribeProgress`. Returns the raw deps text
@@ -233,6 +252,398 @@ describe('App.tsx regression guards', () => {
       // directly the resume never fires on a tab-bar click.
       expect(APP_SOURCE).toMatch(/<TabBar[^>]*onTabChange=\{handleTabChange\}/);
       expect(APP_SOURCE).not.toMatch(/<TabBar[^>]*onTabChange=\{setCurrentTab\}/);
+    });
+  });
+
+  describe('cached channels suppress the startup memory sync', () => {
+    // History: before #413 every launch paid a blocking 30-45 s
+    // PRG/CIN/EPG walk behind a full-screen overlay, because channel memory
+    // lived only in RAM. #534/#537/#538 persist it and #540 adopts it back
+    // into `shadow.channels` at connect, so the mount-time GET
+    // /memory/channels now returns a full list on a warm cache.
+    //
+    // The ONLY thing that turns that into "no startup sync" is the
+    // `channels.length > 0` early return in the auto-sync effect. There is no
+    // WS message meaning "channels changed", so nothing else can suppress the
+    // sync. Dropping the check -- or dropping `channels.length` from the deps
+    // array, which stops the effect re-evaluating when the fetch lands --
+    // restores the blocking overlay for every user with a warm cache, with no
+    // error and no visible cause.
+    //
+    // CORRECTED (#576): this used to add "and the connect-edge device_info
+    // broadcast never fires (#539)". It does fire -- #551 moved
+    // `connection_status = "connected"` out of the port-open path so
+    // `transitioned_to_connected` becomes true, and #552 built App's
+    // connect-edge channel refetch on it. Acting on the old claim would have
+    // read that refetch as dead code and removed it.
+    //
+    // This is asserted at source level for the reason given at the top of
+    // this file: mounting App needs mocks for the WS context, Tauri shell,
+    // store, menu bus, API client, toasts and routing.
+
+    /**
+     * Body of the auto-sync useEffect, anchored on the unique
+     * `startMemorySync` identifier declared inside it.
+     */
+    function extractAutoSyncEffect(source: string): { body: string; deps: string } {
+      const anchor = source.indexOf('const startMemorySync = async () => {');
+      if (anchor === -1) throw new Error('Could not locate startMemorySync declaration');
+      const effectOpen = source.lastIndexOf('useEffect(() => {', anchor);
+      if (effectOpen === -1) throw new Error('Could not locate the auto-sync useEffect');
+      const depsOpen = source.indexOf('}, [', anchor);
+      if (depsOpen === -1) throw new Error('Could not locate auto-sync deps array open');
+      const depsClose = source.indexOf(']);', depsOpen);
+      if (depsClose === -1) throw new Error('Could not locate auto-sync deps array close');
+      return {
+        body: stripComments(source.slice(effectOpen, depsOpen)),
+        deps: source.slice(depsOpen + 3, depsClose + 1),
+      };
+    }
+
+    // Since the `reread_memory_on_connect` preference the early return is
+    // CONDITIONAL. Both sides are asserted separately and deliberately: the
+    // tempting edit when this first went red was to loosen the assertion to
+    // "the body mentions channels.length", which passes for a build where
+    // neither path works. That is the vacuous-guard shape this file exists to
+    // prevent, and it nearly happened here.
+    it('the auto-sync effect still returns early when the preference is OFF', () => {
+      const { body } = extractAutoSyncEffect(AUTO_SYNC_SOURCE);
+      expect(body).toMatch(
+        /if\s*\(\s*!preferences\.rereadMemoryOnConnect\s*&&\s*channels\.length\s*>\s*0\s*\)\s*return\s*;/,
+      );
+    });
+
+    it('the preference is what makes the early return conditional', () => {
+      // Without the negation the effect would sync only when the preference is
+      // OFF -- backwards, and green against a test that merely looked for the
+      // identifier somewhere in the body.
+      const { body } = extractAutoSyncEffect(AUTO_SYNC_SOURCE);
+      expect(body).toMatch(/!preferences\.rereadMemoryOnConnect\s*&&/);
+    });
+
+    it('the effect waits for stored preferences before deciding', () => {
+      // The store holds DEFAULTS until the preferences fetch settles, and
+      // `rereadMemoryOnConnect` defaults true. Without this gate the effect
+      // reads `true` on every launch and syncs regardless of what the user
+      // stored -- turning the preference OFF did nothing.
+      //
+      // Shipped that way and caught by hardware verification, not by these
+      // tests: they set the store synchronously, so nothing here ever
+      // exercised the load race. The same hazard is already guarded for
+      // `check_updates_on_launch`.
+      const { body } = extractAutoSyncEffect(AUTO_SYNC_SOURCE);
+      expect(body).toMatch(/if\s*\(\s*!preferencesLoaded\s*\)\s*return\s*;/);
+    });
+
+    it('the gate precedes the preference check', () => {
+      // Reading the preference before waiting for it is the bug, so ordering
+      // is the assertion. A build with both lines in the wrong order passes
+      // any test that only checks both are present.
+      const { body } = extractAutoSyncEffect(AUTO_SYNC_SOURCE);
+      const wait = body.search(/!preferencesLoaded/);
+      const use = body.search(/!preferences\.rereadMemoryOnConnect/);
+      expect(wait).toBeGreaterThanOrEqual(0);
+      expect(use).toBeGreaterThanOrEqual(0);
+      expect(wait).toBeLessThan(use);
+    });
+
+    it('the effect re-evaluates once preferences have loaded', () => {
+      // Without it in the deps the effect never re-runs after the fetch
+      // settles, so the early return above would permanently suppress the
+      // launch sync for everyone.
+      const { deps } = extractAutoSyncEffect(AUTO_SYNC_SOURCE);
+      expect(deps).toMatch(/preferencesLoaded/);
+    });
+
+    it('the OFF path asks the backend before syncing, not the store', () => {
+      // THE bug, and the one the source-level guards above could not catch.
+      // The early return is `!rereadMemoryOnConnect && channels.length > 0`.
+      // During startup `channels` is [] -- the mount fetch races the poll
+      // loop's connect and the connect-edge refetch (#552) has not resolved
+      // when this effect re-runs on the same device_info message. So the
+      // condition is `true && false`, no early return, and it syncs anyway.
+      //
+      // Measured on hardware: preference stored OFF, every launch still
+      // synced. A trace from the first API response showed in_progress:true
+      // with a task_id already assigned.
+      //
+      // Asking the backend removes the ordering assumption instead of making
+      // it likelier to hold.
+      const { body } = extractAutoSyncEffect(AUTO_SYNC_SOURCE);
+      const guardIdx = body.search(/if\s*\(\s*!preferences\.rereadMemoryOnConnect\s*\)\s*\{/);
+      const fetchIdx = body.search(/await\s+api\.getChannels\(\)/);
+      const syncIdx = body.search(/await\s+api\.syncMemory\(\)/);
+      expect(guardIdx).toBeGreaterThanOrEqual(0);
+      expect(fetchIdx).toBeGreaterThan(guardIdx);
+      expect(syncIdx).toBeGreaterThan(fetchIdx);
+    });
+
+    it('the preference is read at invocation, not tracked as a dependency', () => {
+      // REVERSED IN #568, deliberately. This guard used to assert the opposite
+      // -- that `preferences.rereadMemoryOnConnect` IS in the deps array -- on
+      // the reasoning that "the setting would appear to do nothing until the
+      // next connect".
+      //
+      // That reasoning was backwards. The preference governs what happens when
+      // a scanner CONNECTS, so taking effect at the next connect is correct.
+      // As a dependency it made the toggle itself drive the hardware: flipping
+      // it ON while connected re-ran the effect, cleared the early return, and
+      // sent `api.syncMemory()` -- covering the settings page the user was
+      // standing on with the full-screen overlay and holding the radio in
+      // program mode for the whole walk.
+      //
+      // The old guard could not catch that: a build with the bug contains the
+      // string perfectly. Presence of a string is not use of it.
+      //
+      // `preferencesLoaded` is what carries a stored value to an
+      // already-connected launch, and it is asserted separately above.
+      const { body, deps } = extractAutoSyncEffect(AUTO_SYNC_SOURCE);
+      expect(deps).not.toMatch(/preferences\.rereadMemoryOnConnect/);
+      expect(body).toMatch(/useStore\.getState\(\)\.preferences/);
+    });
+
+    it('the auto-sync effect re-evaluates when the channel count changes', () => {
+      // Without `channels.length` in deps the effect runs once, before the
+      // mount fetch resolves, and syncs anyway -- the check above would be
+      // present and useless.
+      const { deps } = extractAutoSyncEffect(AUTO_SYNC_SOURCE);
+      expect(deps).toMatch(/\bchannels\.length\b/);
+    });
+
+    it('the early return precedes the syncMemory call', () => {
+      // Ordering matters: a guard placed after `api.syncMemory()` reads as a
+      // guard and suppresses nothing.
+      const { body } = extractAutoSyncEffect(AUTO_SYNC_SOURCE);
+      const guard = body.search(/channels\.length\s*>\s*0\s*\)\s*return\s*;/);
+      const call = body.indexOf('api.syncMemory()');
+      expect(guard).toBeGreaterThanOrEqual(0);
+      expect(call).toBeGreaterThanOrEqual(0);
+      expect(guard).toBeLessThan(call);
+    });
+  });
+
+  describe('channels are refetched when the scanner connects', () => {
+    // History: #413 made the backend adopt cached channel memory at connect,
+    // but the frontend fetches channels exactly once at mount — and that fetch
+    // races the poll loop's connect. Measured on hardware: sometimes the
+    // backend won and 500 cached channels rendered instantly; sometimes the
+    // frontend won, saw an empty list, and started a full memory sync the
+    // cache exists to avoid. Both outcomes were observed on the same machine
+    // minutes apart.
+    //
+    // #551 made the connect edge broadcast at all (it was dead code, #539).
+    // This is the other half: on that edge, re-ask for channels. The backend
+    // adopts the cache BEFORE broadcasting, so the list is already populated
+    // server-side when this arrives.
+
+    /**
+     * Body of the `device_info` WS handler, anchored on its unique
+     * `ws.on('device_info'` registration.
+     */
+    function extractDeviceInfoHandler(source: string): string {
+      const start = source.indexOf("ws.on('device_info'");
+      if (start === -1) throw new Error('Could not locate the device_info subscription');
+      const end = source.indexOf("ws.on('progress'", start);
+      if (end === -1) throw new Error('Could not locate the end of the device_info handler');
+      return stripComments(source.slice(start, end));
+    }
+
+    /**
+     * The condition of the `if` that guards the channel refetch — not merely
+     * the handler text around it.
+     *
+     * Asserting that the handler CONTAINS `wasConnected` passes for a build
+     * where the variable is still declared and the gate ignores it. Measured:
+     * replacing the whole condition with `if (true)` left all four guards
+     * green until this extractor existed.
+     */
+    function extractRefetchGate(source: string): string {
+      const handler = extractDeviceInfoHandler(source);
+      const call = handler.indexOf('.getChannels()');
+      if (call === -1) throw new Error('Could not locate the channel refetch');
+      const ifStart = handler.lastIndexOf('if (', call);
+      if (ifStart === -1) throw new Error('The channel refetch is not inside an if');
+      const open = handler.indexOf('(', ifStart);
+      let depth = 0;
+      for (let i = open; i < call; i += 1) {
+        if (handler[i] === '(') depth += 1;
+        if (handler[i] === ')') {
+          depth -= 1;
+          if (depth === 0) return handler.slice(open + 1, i);
+        }
+      }
+      throw new Error('Unbalanced parentheses in the refetch gate');
+    }
+
+    it('the device_info handler refetches channels', () => {
+      const handler = extractDeviceInfoHandler(APP_SOURCE);
+      expect(handler).toMatch(/getChannels\(\)/);
+      expect(handler).toMatch(/setChannels\(/);
+    });
+
+    it('the refetch is gated on the connected state', () => {
+      // An unconditional refetch would fire on the DISCONNECT broadcast too,
+      // asking a scanner that just vanished for its channel list.
+      expect(extractRefetchGate(APP_SOURCE)).toMatch(/connection_status === 'connected'/);
+    });
+
+    it('the refetch is gated on the EDGE, not on every connected message', () => {
+      // `broadcast_device_info` only fires on edges today, but a future caller
+      // that broadcast every tick would turn an unconditional refetch into a
+      // 5 Hz channel fetch against a 500-channel endpoint.
+      expect(extractRefetchGate(APP_SOURCE)).toMatch(/wasConnected/);
+    });
+
+    it('reads the previous status via getState, not a closed-over value', () => {
+      // Closing over `deviceInfo` would require adding it to this effect's
+      // deps, which re-registers all four WS subscriptions whenever device
+      // info changes — the churn the guard at the top of this file exists to
+      // prevent.
+      const handler = extractDeviceInfoHandler(APP_SOURCE);
+      expect(handler).toMatch(/useStore\.getState\(\)/);
+
+      const deps = extractWsEffectDepsArray(APP_SOURCE);
+      expect(deps).not.toMatch(/\bdeviceInfo\b/);
+      expect(deps).not.toMatch(/\bchannels\b/);
+    });
+  });
+
+  describe('cache age appears on the cache-first path', () => {
+    // #572. The cache-age label ("Synced 3d ago") and the Channels tab's
+    // Refresh button both exist to answer "how stale is this list?". On the one
+    // path where that question matters most, neither appeared.
+    //
+    // The backend only knows `synced_at` after `load_channel_cache` sets
+    // `shadow.last_sync` inside `update_device_info_from_mdl`. The frontend
+    // learned it in exactly two places: the WS-connect probe, and sync
+    // completion. On a Tauri cold launch the WS connects in milliseconds while
+    // the poll loop is still opening the port and retrying MDL, so the probe
+    // answers `synced_at: null` -- and with `reread_memory_on_connect` OFF no
+    // sync ever runs, so it stayed null for the whole session.
+    //
+    // Result: the cache-first user -- the exact person #413 was built for --
+    // got an unlabelled channel list and no Refresh button. It appeared only
+    // on a tab switch (`currentTab` is in the probe effect's deps), and never
+    // for a `?tab=channels` deep link.
+    //
+    // The connect edge is precisely when `synced_at` becomes knowable, and the
+    // handler was already refetching channels there.
+
+    /**
+     * Body of the `device_info` WS handler, from its `ws.on('device_info'` to
+     * the close of the callback. Comments stripped so the assertions check
+     * executable code only.
+     */
+    function extractDeviceInfoHandler(source: string): string {
+      const anchor = source.indexOf("ws.on('device_info'");
+      if (anchor === -1) throw new Error('Could not locate the device_info handler');
+      const end = source.indexOf("ws.on('progress'", anchor);
+      if (end === -1) throw new Error('Could not locate the end of the device_info handler');
+      return stripComments(source.slice(anchor, end));
+    }
+
+    it('the connect edge refetches sync status, not just channels', () => {
+      // THE BUG: the edge refetched channels and nothing else, so `syncedAt`
+      // kept whatever the WS-connect probe saw -- null, because the scanner
+      // had not connected yet.
+      const handler = extractDeviceInfoHandler(APP_SOURCE);
+      expect(handler).toMatch(/getChannels\(\)/);
+      expect(handler).toMatch(/getSyncStatus\(\)/);
+    });
+
+    it('the refetched sync status is stored, not discarded', () => {
+      // Calling it and dropping the answer would satisfy the assertion above
+      // while leaving the label exactly as blank as before.
+      const handler = extractDeviceInfoHandler(APP_SOURCE);
+      const fetchIdx = handler.search(/getSyncStatus\(\)/);
+      const storeIdx = handler.search(/updateSync\(\{\s*syncedAt/);
+      expect(fetchIdx).toBeGreaterThanOrEqual(0);
+      expect(storeIdx).toBeGreaterThan(fetchIdx);
+    });
+
+    it('both refetches stay gated on the connect EDGE', () => {
+      // `broadcast_device_info` only fires on edges today, but an unconditional
+      // refetch would become two HTTP calls per tick if that ever changed --
+      // the hazard the existing channel-refetch comment already names.
+      const handler = extractDeviceInfoHandler(APP_SOURCE);
+      const gateIdx = handler.search(/connection_status\s*===\s*'connected'\s*&&\s*!wasConnected/);
+      expect(gateIdx).toBeGreaterThanOrEqual(0);
+      expect(handler.search(/getChannels\(\)/)).toBeGreaterThan(gateIdx);
+      expect(handler.search(/getSyncStatus\(\)/)).toBeGreaterThan(gateIdx);
+    });
+  });
+
+  describe('one bank read per sync, not two', () => {
+    // #584, found on hardware over a ~17 hour run: "Failed to refresh banks
+    // after sync" fired 37 times, with 18 backend `command_timeout`s, and the
+    // warning appeared TWICE per sync. That was the tell.
+    //
+    // Two `getBanks()` fired at the end of every sync: the post-sync chain's
+    // fire-and-forget refresh, and the connection-gated effect, which re-runs
+    // because `sync.inProgress` is in its deps and had just flipped false.
+    //
+    // `get_banks` is not one command -- it is a whole program-mode bracket:
+    // `PRG` round-trip, the 100 ms settle, `SCG` round-trip, `EPG` on guard
+    // drop. Two of those back to back, serialized behind the 5 Hz poll loop,
+    // each with its own 3-second budget. The second queues behind the first and
+    // blows its deadline, which is why the log shows `command_timeout` followed
+    // by `discarding expired queued command` (#139's expiry path -- the command
+    // sat too long, the scanner was not slow).
+    //
+    // Related to #393, which described this signature at STARTUP; #447 fixed
+    // that one by deleting the mount-time read. This is a different call site.
+
+    /**
+     * The post-sync chain inside the progress handler: from the scan-resume
+     * call that marks sync completion to the end of that `.then`.
+     */
+    function extractPostSyncChain(source: string): string {
+      const anchor = source.indexOf("requestScanResume('sync completion'");
+      if (anchor === -1) throw new Error('Could not locate the post-sync chain');
+      const end = source.indexOf('Failed to refresh channels after sync', anchor);
+      if (end === -1) throw new Error('Could not locate the end of the post-sync chain');
+      return stripComments(source.slice(anchor, end));
+    }
+
+    /**
+     * The bank-refetch effect, identified by the one deps array carrying both
+     * `sync.inProgress` and `sync.hasSyncedInitially`.
+     */
+    function extractBankRefetchEffect(source: string): { body: string; deps: string } {
+      const depsOpen = source.indexOf('}, [api, connectionStatus, syncInProgress');
+      if (depsOpen === -1) throw new Error('Could not locate the bank-refetch deps array');
+      const effectOpen = source.lastIndexOf('useEffect(() => {', depsOpen);
+      if (effectOpen === -1) throw new Error('Could not locate the bank-refetch effect');
+      const depsClose = source.indexOf(']);', depsOpen);
+      return {
+        body: stripComments(source.slice(effectOpen, depsOpen)),
+        deps: source.slice(depsOpen + 3, depsClose + 1),
+      };
+    }
+
+    it('the post-sync chain does not read banks', () => {
+      // THE BUG. The chain's own comment called the effect below "a second
+      // chance", which is backwards: the effect is the primary, because it
+      // re-runs precisely when `sync.inProgress` flips false.
+      const chain = extractPostSyncChain(APP_SOURCE);
+      expect(chain).not.toMatch(/getBanks\(\)/);
+    });
+
+    it('the bank-refetch effect still reads banks when a sync ends', () => {
+      // Not optional. Deleting BOTH calls would satisfy the guard above while
+      // leaving bank state at whatever it was before the sync -- which on a
+      // cold start is the all-enabled default that #393 was about.
+      const { body, deps } = extractBankRefetchEffect(BANK_REFRESH_SOURCE);
+      expect(body).toMatch(/getBanks\(\)/);
+      expect(deps).toMatch(/syncInProgress/);
+    });
+
+    it('the effect waits for the sync to release program mode', () => {
+      // Without the early return it fires DURING the sync, when every command
+      // is queued behind a 500-channel PRG bracket -- the timeout this issue is
+      // about, just earlier.
+      const { body } = extractBankRefetchEffect(BANK_REFRESH_SOURCE);
+      expect(body).toMatch(/if\s*\(\s*syncInProgress\s*\)\s*return\s*;/);
     });
   });
 });

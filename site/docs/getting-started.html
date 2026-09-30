@@ -68,6 +68,20 @@
             that carries <em>data</em>, not just power. A charge-only cable is
             the usual reason the app won't connect.
           </li>
+          <li id="requirements">
+            A computer that can run it:
+            <ul>
+              <li>
+                <strong>Mac:</strong> macOS 10.15 or later, with Safari 15.4 or
+                later. Bearpaw draws its window with the same engine as Safari.
+              </li>
+              <li><strong>Windows:</strong> Windows 10 or later, 64-bit.</li>
+              <li>
+                <strong>Linux:</strong> Ubuntu 22.04, Linux Mint 21, Debian 12,
+                or newer.
+              </li>
+            </ul>
+          </li>
           <li>
             Bearpaw installed on your computer. If you haven't done that yet, see
             the <a href="../index.html#download">download section</a>.
@@ -109,9 +123,13 @@
         </p>
         <div class="callout">
           <p>
-            Bearpaw doesn't keep a copy of your channels on the computer between
-            sessions. It re-reads them fresh every time it starts, so what you
-            see is what's actually in the radio.
+            Bearpaw does keep a saved copy of your channels between sessions,
+            but by default it still re-reads them from the radio at every
+            launch — so what you see is what's actually in the scanner. If you
+            never program on the radio's own keypad, you can turn that off for
+            an instant start: see
+            <a href="preferences.html#reread-channels">Re-read Channels on
+            Connect</a>.
           </p>
         </div>
 
@@ -129,17 +147,23 @@
         <ol>
           <li>
             <strong>"Scanning…" is replaced by the signal.</strong> The big line
-            shows the channel's name (its <em>alpha tag</em>) if it has one, or
+            shows the channel's name — its
+            <a href="glossary.html#alpha-tag">alpha tag</a>, the label you gave it —
+            if it has one, or
             the frequency if it doesn't.
           </li>
           <li>
             <strong>The detail line fills in</strong> underneath: the frequency,
-            the modulation (FM, AM, or NFM), the channel number, and, if the
-            transmission carries one, the CTCSS tone.
+            the <a href="glossary.html#modulation">modulation</a> (FM, AM or NFM —
+            how the signal carries sound), the channel number, and, if the
+            transmission carries one, its
+            <a href="glossary.html#ctcss--tone--dcs">CTCSS tone</a>. That's a
+            quiet code some radios send so only certain receivers hear them.
           </li>
           <li>
             <strong>The signal-strength bars</strong> on the right fill to match
-            the RSSI.
+            the <a href="glossary.html#rssi">RSSI</a> — how strong the signal is
+            where you are.
           </li>
           <li>
             When the transmission ends, the scanner resumes and the display goes
@@ -195,8 +219,9 @@
             <a href="channels.html">The Channels Tab</a>
           </li>
           <li>
-            <strong>Adjust the scanner itself</strong>, volume, squelch, Close
-            Call, custom searches: <a href="device-config.html">The Device Tab</a>
+            <strong>Adjust the scanner itself</strong> — volume,
+            <a href="glossary.html#squelch">squelch</a>,
+            <a href="glossary.html#close-call">Close Call</a>, custom searches: <a href="device-config.html">The Device Tab</a>
           </li>
           <li>
             <strong>Something not working?</strong>

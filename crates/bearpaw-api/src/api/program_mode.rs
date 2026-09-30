@@ -54,6 +54,10 @@ pub struct ProgramModeGuard {
     flag: Arc<AtomicBool>,
     /// True if PRG entry succeeded. Drop should only send EPG in that case.
     active: bool,
+    /// True for a guard from `enter_or_join` that joined a bracket someone
+    /// else opened. Its Drop touches nothing: the bracket and its flag belong
+    /// to the opener.
+    joined: bool,
 }
 
 impl ProgramModeGuard {
@@ -69,7 +73,12 @@ impl ProgramModeGuard {
     /// Conflict here lets the frontend retry once the sync finishes.
     pub async fn enter(state: &AppState) -> Result<Self, ApiError> {
         if state.sync_task_id.lock().unwrap().is_some() {
-            return Err(ApiError::Conflict("memory_sync_in_progress".to_string()));
+            // `sync_in_progress`, matching the six other sites and the three
+            // places API_SPEC documents this 409. This guard used to answer
+            // `memory_sync_in_progress` -- the only occurrence anywhere, and
+            // undocumented -- so a client handling the documented string got a
+            // generic failure from the one guard that fires most often.
+            return Err(ApiError::Conflict("sync_in_progress".to_string()));
         }
         let flag = state.program_mode_active.clone();
         // Set the flag *before* sending PRG so the poll loop suspends as
@@ -79,12 +88,14 @@ impl ProgramModeGuard {
             state: state.clone(),
             flag,
             active: false,
+            joined: false,
         };
         match send_raw_command(state, "PRG", false).await {
             Ok(resp) => {
                 // REGRESSION GUARD (#140): a transport-level Ok is not enough —
-                // the scanner can answer `PRG,NG`/`ERR` (e.g. it's in a menu).
-                // Treating that as success leaves an "active" guard that
+                // the scanner can answer `PRG,NG`/`ERR`. (Not from its menu or
+                // mid direct entry: a BC125AT accepts PRG in both -- see
+                // audit-reconciliation Conflict 6.) Treating that as success leaves an "active" guard that
                 // suspends polling and whose Drop sends a spurious EPG, while
                 // every subsequent CIN/SCG fails. Require an actual OK.
                 if !matches!(classify_response(&resp), ScannerReply::Ok) {
@@ -108,16 +119,80 @@ impl ProgramModeGuard {
             }
         }
     }
+
+    /// Enter program mode, or join the bracket that is already open.
+    ///
+    /// For helpers that run both standalone and inside a caller's bracket --
+    /// a `ProgramModeGuard` further up the stack, or the session
+    /// `program_mode_start` holds open across requests. Joining sends no `PRG`
+    /// and its Drop sends no `EPG`; opening goes through `enter`.
+    ///
+    /// REGRESSION GUARD (#684): these helpers used to send `PRG`/`EPG` by hand
+    /// and so skipped `enter`'s `PRG,NG` refusal (#140), its settle delay and
+    /// its `sync_in_progress` refusal. The refusal is checked on BOTH paths: a
+    /// memory sync sets `program_mode_active` too, and joining it would queue
+    /// behind the sync and time out.
+    ///
+    /// Whether a bracket is open is still read from the one global flag, so
+    /// two overlapping requests cannot tell whose bracket it is.
+    pub async fn enter_or_join(state: &AppState) -> Result<Self, ApiError> {
+        if state.program_mode_active.load(Ordering::Relaxed)
+            && state.sync_task_id.lock().unwrap().is_none()
+        {
+            return Ok(Self {
+                state: state.clone(),
+                flag: state.program_mode_active.clone(),
+                active: false,
+                joined: true,
+            });
+        }
+        Self::enter(state).await
+    }
+
+    /// Leave program mode now, awaiting the `EPG`. A joined guard does nothing.
+    ///
+    /// Drop cannot await, so it only QUEUES the `EPG`, and the flag stays set
+    /// until the poll thread sends it (#598). A caller that returns and is
+    /// called again at once -- `clear_temporary_lockouts` walks channels this
+    /// way -- would then see the flag, join the closing bracket, and send its
+    /// `CIN` after the `EPG`. Awaiting it here clears the flag before return,
+    /// which is what the hand-written brackets did. Drop still covers early
+    /// returns.
+    pub async fn close(mut self) {
+        if self.active && !self.joined {
+            let _ = send_raw_command(&self.state, "EPG", false).await;
+            self.active = false;
+        }
+    }
 }
 
 impl Drop for ProgramModeGuard {
     fn drop(&mut self) {
-        // Always clear the flag — leaving it stuck would freeze the live
-        // display indefinitely.
-        self.flag.store(false, Ordering::Relaxed);
-
+        // REGRESSION GUARD (`the_flag_survives_a_drop_that_queued_an_epg`):
+        // the flag is NOT cleared here when an EPG is on its way (#598).
+        //
+        // It used to be cleared unconditionally, up front, and the EPG queued
+        // afterwards. The poll loop yields STS/GLG on this flag, so it resumed
+        // polling a radio that had not left PRG yet -- a window exactly as wide
+        // as the queue backlog, and a plausible source of the STS parse drops
+        // logged on hardware.
+        //
+        // The poll loop clears it after the EPG actually goes out, which is the
+        // ordering `send_raw_command` already used for the EPGs it sends
+        // itself. A Drop cannot await a reply, which is why this path had its
+        // own, wrong, copy of the logic.
+        //
+        // The flag is still cleared HERE in every case where no EPG will
+        // arrive, because then nothing else ever would: the stuck flag freezes
+        // the live display, which is the hazard the original comment named and
+        // it has not gone away.
+        if self.joined {
+            // Someone else's bracket: leave its EPG and its flag to them.
+            return;
+        }
         if !self.active {
             // PRG never succeeded; nothing to EPG.
+            self.flag.store(false, Ordering::Relaxed);
             return;
         }
 
@@ -125,23 +200,34 @@ impl Drop for ProgramModeGuard {
         // can't await; fire-and-forget through the same mechanism
         // send_raw_command uses, but without waiting for the reply.
         let tx = self.state.command_tx.lock().ok().and_then(|g| g.clone());
-        if let Some(tx) = tx {
-            let (reply_tx, _) = std::sync::mpsc::channel();
-            let _ = tx.send(crate::api::control::ControlCommand::Raw {
-                command: "EPG".to_string(),
-                multiline: false,
-                reply: reply_tx,
-                // EPG is exempt from expiry in the drain (see
-                // control::should_execute_queued), but give it a generous
-                // deadline anyway so the intent is explicit: the bracket
-                // closer must run no matter how late.
-                deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
-            });
-            // Don't block on the reply: the poll thread will execute EPG
-            // on its next drain, and we've already cleared the flag so
-            // the poll loop will resume STS/GLG/PWR after that tick.
-        } else {
-            warn!("ProgramModeGuard dropped with no command channel; EPG not sent");
+        let queued = match tx {
+            Some(tx) => {
+                let (reply_tx, _) = std::sync::mpsc::channel();
+                tx.send(crate::api::control::ControlCommand::Raw {
+                    command: "EPG".to_string(),
+                    multiline: false,
+                    reply: reply_tx,
+                    // EPG is exempt from expiry in the drain (see
+                    // control::should_execute_queued), but give it a generous
+                    // deadline anyway so the intent is explicit: the bracket
+                    // closer must run no matter how late.
+                    deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
+                })
+                .is_ok()
+                // Don't block on the reply: the poll thread executes EPG on its
+                // next drain and clears the flag there (#598).
+            }
+            None => {
+                warn!("ProgramModeGuard dropped with no command channel; EPG not sent");
+                false
+            }
+        };
+
+        // Nothing is coming to clear it, so clear it here. Covers a missing
+        // sender and a receiver that has hung up -- in both cases the poll loop
+        // will never see the EPG, and a flag left set freezes the live display.
+        if !queued {
+            self.flag.store(false, Ordering::Relaxed);
         }
     }
 }

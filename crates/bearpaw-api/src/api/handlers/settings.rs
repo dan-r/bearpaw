@@ -2,8 +2,6 @@ use axum::extract::{Path, State};
 use axum::response::Json;
 use serde_json::{json, Value};
 
-use crate::protocol::defaults::CUSTOM_SEARCH_DEFAULTS;
-
 use crate::protocol::{classify_response, ScannerReply};
 
 use super::super::{
@@ -220,6 +218,14 @@ pub(crate) async fn set_key_beep(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     let _ = command_sender(&state)?;
+    // Refuse before the wire on a model whose `KBP` beep field is reserved.
+    // The UI hides the control there, so reaching here means an API client or
+    // a stale frontend -- and per the vendor spec a value in a reserved slot
+    // is a format error that aborts the WHOLE set command, taking the key lock
+    // sent alongside it. Same guard as `set_weather` (#432).
+    if !state.capabilities().has_key_beep {
+        return Err(ApiError::BadRequest("key_beep_unsupported".to_string()));
+    }
     // Validate before narrowing (99 = "auto" sentinel). #143.
     let level = body
         .get("level")
@@ -327,6 +333,16 @@ pub(crate) async fn set_search(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     let _ = command_sender(&state)?;
+    // The BC75XLT answers a `SCO` READ but rejects every write, including a
+    // write of the value it just reported (hardware 2026-09-02). Refused here
+    // rather than sent and hoped, the same guard `set_key_beep` and
+    // `set_weather` carry — the UI hides the control on such a model, so
+    // reaching this is an API client or a stale frontend.
+    if !state.capabilities().has_search_options {
+        return Err(ApiError::BadRequest(
+            "search_options_unsupported".to_string(),
+        ));
+    }
     // Validate before narrowing — a large i64 could wrap into a valid i32
     // delay. #143.
     let delay = body
@@ -348,8 +364,22 @@ pub(crate) async fn set_search(
         )
         .await;
         let response = response?;
-        let upper = response.trim().to_uppercase();
-        if !(upper == "OK" || upper.ends_with(",OK") || upper.starts_with("SCO,")) {
+        // REGRESSION GUARD (`a_rejected_sco_write_is_not_success`): the old
+        // check was `upper.starts_with("SCO,")`, which `SCO,ERR` satisfies --
+        // so a rejection was reported as `{"status":"ok"}` AND written into the
+        // settings cache, showing the user a value the radio never took.
+        //
+        // `classify_response` is the canonical classifier and already draws
+        // this distinction; `write_setting_verified` uses it. Only `Err` and
+        // `Ng` are refused, not "anything that is not OK" -- the `starts_with`
+        // clause was presumably protecting a non-OK ACK shape on some model,
+        // and there is no BC125AT here to prove otherwise. Narrowing it to the
+        // two known-bad replies fixes the reported bug without betting on an
+        // ACK shape this hardware cannot show us.
+        if matches!(
+            classify_response(&response),
+            ScannerReply::Err | ScannerReply::Ng
+        ) {
             return Err(ApiError::BadRequest("search_failed".to_string()));
         }
     }
@@ -454,6 +484,22 @@ pub(crate) async fn set_close_call(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if command_sender(&state).is_ok() {
+        // Field 5 (`hit_scan`) is reserved on some models -- written `1` on a
+        // BC75XLT it reads back empty (hardware 2026-08-28). A reserved field
+        // goes out EMPTY, per CLAUDE.md pitfall #9: an empty field means
+        // "leave unchanged", while a value in a reserved slot risks the
+        // format error that aborts the whole set command. The UI hides the
+        // control on such a model, so `lockout` there is a default, not a
+        // user choice -- writing it would be inventing an answer.
+        let hit_scan = if state.capabilities().has_close_call_hit_scan {
+            if lockout {
+                "1"
+            } else {
+                "0"
+            }
+        } else {
+            ""
+        };
         let _prg = ProgramModeGuard::enter(&state).await?;
         let response = send_raw_command(
             &state,
@@ -463,7 +509,7 @@ pub(crate) async fn set_close_call(
                 if alert_beep { 1 } else { 0 },
                 if alert_light { 1 } else { 0 },
                 band_str,
-                if lockout { 1 } else { 0 }
+                hit_scan
             ),
             false,
         )
@@ -525,6 +571,15 @@ pub(crate) async fn set_service_search(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     let _ = command_sender(&state)?;
+    // Refuse before the wire when the scanner has no `SSG` command. The UI
+    // hides the whole Service Search page on such a model, so reaching here
+    // means an API client or a stale frontend -- and a bare ERR from the radio
+    // is not something either can act on. Same guard as `set_weather` (#432).
+    if !state.capabilities().has_service_search_groups {
+        return Err(ApiError::BadRequest(
+            "service_search_unsupported".to_string(),
+        ));
+    }
     let groups = body
         .get("groups")
         .and_then(Value::as_array)
@@ -621,7 +676,8 @@ pub(crate) async fn set_custom_search(
             })
             .collect::<String>();
         let _prg = ProgramModeGuard::enter(&state).await?;
-        let response = send_raw_command(&state, &format!("CSG,{}", flags), false).await;
+        let write = csg_write_command(&state, &flags).await?;
+        let response = send_raw_command(&state, &write, false).await;
         let response = response?;
         let upper = response.trim().to_uppercase();
         if !(upper == "OK" || upper.ends_with(",OK")) {
@@ -630,6 +686,45 @@ pub(crate) async fn set_custom_search(
     }
     set_setting_section(&state, "custom_search", body);
     Ok(Json(json!({ "status": "ok" })))
+}
+
+/// Shape a `CSG` write the way the CONNECTED radio just said it wants one.
+///
+/// The field count is per-family, and the READ reports it. A BC125AT answers a
+/// bare mask; a BC75XLT answers `CSG,<mask>,[DLY],[DIR]` and rejects the bare
+/// form outright -- `CSG,0111010101` -> `CSG,ERR`, verified on hardware
+/// 2026-08-28 (see docs/wire_captures/2026-08-28/findings.md). A format error
+/// aborts the whole set command, so every bank toggle was silently a no-op on
+/// that model.
+///
+/// Echoing the shape the radio just reported beats a capability flag twice
+/// over: it needs no per-model table, and the trailing fields are a search
+/// delay and direction Bearpaw does not model -- writing back exactly what was
+/// read is what keeps them. `CSG,<mask>,,` would be shorter but is NOT what the
+/// probe exercised, and the spec's "only ',' parameters are not changed" note
+/// is not repeated in the CSG entry.
+///
+/// Caller holds the program-mode bracket. Shared with the `.ss` importer so
+/// that path cannot reproduce the bug this function exists to fix (#625).
+pub(crate) async fn csg_write_command(state: &AppState, flags: &str) -> Result<String, ApiError> {
+    let current = send_raw_command(state, "CSG", false).await?;
+    if matches!(
+        classify_response(&current),
+        ScannerReply::Ng | ScannerReply::Err
+    ) {
+        return Err(ApiError::BadRequest(
+            "custom_search_read_failed".to_string(),
+        ));
+    }
+    let trailing: Vec<String> = parse_command_parts(&current, "CSG")
+        .into_iter()
+        .skip(1)
+        .collect();
+    Ok(if trailing.is_empty() {
+        format!("CSG,{}", flags)
+    } else {
+        format!("CSG,{},{}", flags, trailing.join(","))
+    })
 }
 
 pub(crate) async fn get_custom_range(
@@ -679,22 +774,6 @@ pub(crate) async fn get_custom_range(
 /// Read-only seed: the 10 factory-default custom-search ranges Uniden
 /// preloads on `CLR`. See `docs/BC125AT_PROTOCOL.md` §5.5. No scanner
 /// round-trip — this is a constant table.
-pub(crate) async fn get_custom_search_defaults() -> Json<Value> {
-    let ranges: Vec<Value> = CUSTOM_SEARCH_DEFAULTS
-        .iter()
-        .enumerate()
-        .map(|(i, (lower, upper, label))| {
-            json!({
-                "index": i + 1,
-                "lower": lower,
-                "upper": upper,
-                "label": label,
-            })
-        })
-        .collect();
-    Json(json!({ "ranges": ranges }))
-}
-
 pub(crate) async fn set_custom_range(
     State(state): State<AppState>,
     Path(index): Path<u8>,

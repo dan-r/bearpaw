@@ -1,5 +1,5 @@
 import { renderHook, act } from '@testing-library/react';
-import { useStore } from '../useStore';
+import { useStore, mapStoredPreferences } from '../useStore';
 
 describe('useStore', () => {
   beforeEach(() => {
@@ -132,7 +132,7 @@ describe('useStore', () => {
       expect(result.current.fullActivityLog.map((e) => e.id)).toEqual(['new', 'mid', 'old']);
     });
 
-    it('does not clobber an existing in-memory log', () => {
+    it('merges initial history with an in-memory live hit', () => {
       const { result } = renderHook(() => useStore());
 
       act(() => {
@@ -150,7 +150,41 @@ describe('useStore', () => {
         ]);
       });
 
-      expect(result.current.fullActivityLog.map((e) => e.id)).toEqual(['live']);
+      expect(result.current.fullActivityLog.map((e) => e.id)).toEqual(['live', 'history']);
+    });
+
+    it('replaces old scope history while preserving and deduplicating new live hits', () => {
+      const { result } = renderHook(() => useStore());
+      useStore.setState({
+        fullActivityLog: [
+          { id: 'old-scope', timestamp: 100, frequency: 145.1, type: 'hit' },
+          {
+            id: 'live',
+            timestamp: 301,
+            frequency: 154.8,
+            channel: 3,
+            type: 'hit',
+          },
+        ],
+      });
+
+      act(() => {
+        result.current.hydrateActivityLogs(
+          [
+            { id: 'history', timestamp: 200, frequency: 151.5, type: 'hit' },
+            {
+              id: 'persisted-copy',
+              timestamp: 301,
+              frequency: 154.8,
+              channel: 3,
+              type: 'hit',
+            },
+          ],
+          { replace: true, preserveSince: 300 },
+        );
+      });
+
+      expect(result.current.fullActivityLog.map((e) => e.id)).toEqual(['live', 'history']);
     });
   });
 
@@ -220,6 +254,7 @@ describe('useStore', () => {
           taskId: null,
           message: '',
           percent: 0,
+          syncedAt: null,
         },
       });
     });
@@ -341,6 +376,93 @@ describe('useStore', () => {
       // hit threshold, retention window, and display mode.
       expect(result.current.preferences.hitMinDuration).toBe(before.hitMinDuration);
       expect(result.current.preferences.displayMode).toBe(before.displayMode);
+    });
+  });
+  describe('mapStoredPreferences (#509)', () => {
+    // The backend's shape, as GET /preferences actually returns it.
+    const stored = {
+      theme: 'field',
+      displayMode: 'alpha',
+      reduced_motion: true,
+      hit_min_duration: 5,
+      data_retention_days: 90,
+      audio_output_device: 'speakers',
+      check_updates_on_launch: false,
+      reread_memory_on_connect: false,
+      analytics_scope: 'all',
+      activity_export_timezone: 'utc',
+    };
+
+    it('restores analyticsScope from the backend', () => {
+      // THE BUG: analyticsScope was wired for the WRITE (PREFERENCE_KEY_MAP)
+      // but never read back, so every launch reset the store to 'scanner'
+      // while the backend kept scoping /activity-log by the saved 'all'. The
+      // toggle and the data disagreed, and neither looked wrong on its own.
+      expect(mapStoredPreferences(stored).analyticsScope).toBe('all');
+    });
+
+    it('reads every preference back from its stored key', () => {
+      expect(mapStoredPreferences(stored)).toEqual({
+        theme: 'field',
+        displayMode: 'alpha',
+        reducedMotion: true,
+        hitMinDuration: 5,
+        dataRetentionDays: 90,
+        audioOutputDevice: 'speakers',
+        checkUpdatesOnLaunch: false,
+        rereadMemoryOnConnect: false,
+        analyticsScope: 'all',
+        activityExportTimezone: 'utc',
+      });
+    });
+
+    it('covers every key in the store defaults', () => {
+      // Runtime companion to the return type. `Preferences` already makes an
+      // omission a compile error; this catches a key that is present but
+      // silently reads the wrong stored name, which types cannot see.
+      const { preferences } = useStore.getState();
+      expect(Object.keys(mapStoredPreferences({})).sort()).toEqual(Object.keys(preferences).sort());
+    });
+
+    it('falls back to defaults when the backend has nothing stored', () => {
+      // Asserted literally rather than against useStore.getState(): earlier
+      // tests in this file mutate preferences and the beforeEach only resets
+      // liveState, so comparing to live store state is order-dependent.
+      expect(mapStoredPreferences({})).toEqual({
+        theme: 'night',
+        displayMode: 'frequency',
+        reducedMotion: false,
+        hitMinDuration: 2,
+        dataRetentionDays: 30,
+        audioOutputDevice: 'default',
+        checkUpdatesOnLaunch: true,
+        rereadMemoryOnConnect: true,
+        analyticsScope: 'scanner',
+        activityExportTimezone: 'local',
+      });
+    });
+
+    it('keeps a stored false for rereadMemoryOnConnect', () => {
+      // Same `??`-not-`||` hazard as checkUpdatesOnLaunch below, and the same
+      // consequence: this defaults true, so `||` would coerce a stored false
+      // back on every launch and a user who turned re-reading OFF would get a
+      // 5-second sync at every start with no way to stop it.
+      expect(mapStoredPreferences({ reread_memory_on_connect: false }).rereadMemoryOnConnect).toBe(
+        false,
+      );
+    });
+
+    it('keeps a stored false for checkUpdatesOnLaunch', () => {
+      // `??`, not `||`. This defaults to true, so `||` would coerce a stored
+      // false back to true and the toggle would revert on every launch.
+      expect(mapStoredPreferences({ check_updates_on_launch: false }).checkUpdatesOnLaunch).toBe(
+        false,
+      );
+      expect(mapStoredPreferences({}).checkUpdatesOnLaunch).toBe(true);
+    });
+
+    it('treats an unrecognised analytics_scope as scanner', () => {
+      expect(mapStoredPreferences({ analytics_scope: 'nonsense' }).analyticsScope).toBe('scanner');
     });
   });
 });

@@ -1,8 +1,9 @@
 //! Blocking serial poll loop: drain control commands, then STS -> LiveState -> broadcast.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tracing::{debug, error, info, warn};
@@ -43,6 +44,36 @@ const MDL_CMD: &str = "MDL";
 pub(crate) const KEY_HOLD: &str = "KEY,H,P";
 pub(crate) const KEY_SCAN: &str = "KEY,S,P";
 
+/// The running poll thread, and the way to stop it (#688).
+///
+/// REGRESSION GUARD (#688): `with_graceful_shutdown` stops the HTTP server, not
+/// this thread. Without an explicit stop the process exited with the thread
+/// mid-poll and the USB interface still claimed -- the state #600 names as the
+/// precondition for the #513 wedge. Stopping lets the loop return between
+/// ticks, which drops the session; `rusb`'s `DeviceHandle` releases its claimed
+/// interfaces and closes the device on drop.
+pub struct PollLoopHandle {
+    stop: Arc<AtomicBool>,
+    thread: thread::JoinHandle<()>,
+}
+
+impl PollLoopHandle {
+    /// Ask the loop to stop and wait up to `timeout` for it. True when the
+    /// thread ended in time. Blocking: call from `spawn_blocking` in async code.
+    pub fn stop_and_join(self, timeout: Duration) -> bool {
+        self.stop.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + timeout;
+        while !self.thread.is_finished() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = self.thread.join();
+        true
+    }
+}
+
 /// Spawn a blocking thread: open serial, process command channel + STS poll, broadcast state.
 pub fn spawn_poll_loop(
     state: AppState,
@@ -50,13 +81,22 @@ pub fn spawn_poll_loop(
     baud: u32,
     assert_dtr: bool,
     cmd_rx: std::sync::mpsc::Receiver<ControlCommand>,
-) {
-    thread::spawn(move || {
+) -> PollLoopHandle {
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let thread = thread::spawn(move || {
         // catch_unwind (#143): a panic inside the poll loop (e.g. a poisoned
         // mutex unwrap) unwinds the thread WITHOUT hitting the Err branch —
         // the UI stayed "connected" forever while every command timed out.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_poll_loop(state.clone(), &port_name, baud, assert_dtr, cmd_rx)
+            run_poll_loop(
+                state.clone(),
+                &port_name,
+                baud,
+                assert_dtr,
+                cmd_rx,
+                &thread_stop,
+            )
         }));
         let message = match result {
             Ok(Ok(())) => return,
@@ -76,6 +116,7 @@ pub fn spawn_poll_loop(
             d.diagnostic_message = Some(message);
         }
     });
+    PollLoopHandle { stop, thread }
 }
 
 fn run_poll_loop(
@@ -84,9 +125,10 @@ fn run_poll_loop(
     baud: u32,
     assert_dtr: bool,
     cmd_rx: std::sync::mpsc::Receiver<ControlCommand>,
+    stop: &AtomicBool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some((vid, pid)) = parse_usb_target(port_name) {
-        return run_poll_loop_usb(state, vid, pid, cmd_rx);
+        return run_poll_loop_usb(state, vid, pid, cmd_rx, stop);
     }
 
     let transport = SerialTransport::new(port_name, baud).with_dtr_on_open(assert_dtr);
@@ -97,33 +139,43 @@ fn run_poll_loop(
     let mut poll_state = PollState::new();
     let mut reconnect_backoff = Duration::from_millis(RECONNECT_BACKOFF_INITIAL_MS);
 
-    let mut first_open = true;
     loop {
+        if stop.load(Ordering::Relaxed) {
+            info!("Poll loop stopped for shutdown");
+            return Ok(());
+        }
         let mut port = match transport.open() {
             Ok(p) => p,
             Err(e) => {
-                if first_open {
-                    return Err(e.to_string().into());
-                }
+                // REGRESSION GUARD (#513): a failed FIRST open must retry like
+                // any other, not kill the thread. This used to `return Err` on
+                // `first_open`, so starting Bearpaw while the scanner was
+                // unplugged -- or wedged -- left the process serving a
+                // permanently disconnected API, recoverable only by relaunching.
+                // A device that vanished MID-session was handled correctly; the
+                // very first open was the one path with no retry.
+                //
+                // Nothing is lost by retrying. The old fatal path set
+                // connection_status and diagnostic_message via the caller;
+                // `mark_disconnected` sets both, plus `diagnostic_code` and the
+                // liveState `stale` flag the frontend keys its disconnect UI
+                // on. So the failure is MORE visible now, and it heals itself
+                // when the scanner appears.
                 mark_disconnected(&state, &format!("serial open failed: {}", e));
-                thread::sleep(reconnect_backoff);
+                sleep_unless_stopped(reconnect_backoff, stop);
                 reconnect_backoff = next_backoff(reconnect_backoff);
                 continue;
             }
         };
-        first_open = false;
         reconnect_backoff = Duration::from_millis(RECONNECT_BACKOFF_INITIAL_MS);
 
         info!("Serial opened: {} @ {} baud", port_name, baud);
-        if let Ok(mut d) = state.device.write() {
-            d.port = Some(port_name.to_string());
-            d.connection_status = "connected".to_string();
-            d.clear_connection_diagnostic();
-        }
+        mark_port_opened(&state, port_name);
 
         // Device info: model from MDL (with retry because some scanners can return
         // stale command echoes immediately after connection).
         let mut mdl_set = false;
+        let mut device_gone = false;
         for attempt in 1..=5 {
             match transport.send(port.as_mut(), MDL_CMD) {
                 Ok(mdl_resp) => {
@@ -141,6 +193,7 @@ fn run_poll_loop(
                 Err(err) => {
                     warn!("MDL read failed on serial attempt {}: {}", attempt, err);
                     if err.is_device_gone() {
+                        device_gone = true;
                         break;
                     }
                 }
@@ -149,6 +202,20 @@ fn run_poll_loop(
         }
         if !mdl_set {
             warn!("Unable to read valid MDL response after retries (serial)");
+            // REGRESSION GUARD (`a_vanished_device_is_never_announced_as_connected`):
+            // announce a connect ONLY if the device is still there.
+            //
+            // The port being open makes "connected with no model" the honest
+            // status for a scanner whose MDL is merely garbled -- that is why
+            // this fallback exists (#539). It is the wrong answer when the
+            // retry loop broke out because the device VANISHED: that branch
+            // would tell the frontend the scanner arrived, moments before the
+            // poll loop marks it disconnected again. Since #551 this also
+            // BROADCASTS, so a wedged link (the documented USB STALL case)
+            // becomes a connect/disconnect storm at reconnect-backoff rate.
+            if should_announce_connect(mdl_set, device_gone) {
+                mark_connected_without_model(&state, port_name);
+            }
         }
 
         // Initial volume query. Writes to `state.live.volume` so the first
@@ -173,7 +240,7 @@ fn run_poll_loop(
         }
 
         let mut session_dead = false;
-        while !session_dead {
+        while !session_dead && !stop.load(Ordering::Relaxed) {
             // Drain control commands (hold, scan, direct, start sync)
             while let Ok(cmd) = cmd_rx.try_recv() {
                 match cmd {
@@ -267,6 +334,26 @@ fn run_poll_loop(
                                 e.to_string()
                             })
                         };
+                        // REGRESSION GUARD (#598): clear the program-mode
+                        // flag only AFTER the EPG has actually gone out.
+                        //
+                        // `ProgramModeGuard::drop` used to clear it up front
+                        // and then queue the EPG fire-and-forget. The poll loop
+                        // yields STS/GLG on this flag, so it resumed polling a
+                        // radio that had not left PRG yet -- a window exactly
+                        // as wide as the queue backlog.
+                        //
+                        // `send_raw_command` already had this ordering right
+                        // for the EPGs it sends itself; the guard's Drop path
+                        // bypassed it because a Drop cannot await a reply.
+                        //
+                        // Cleared whether or not the write succeeded: a failed
+                        // EPG still ends the bracket as far as this process is
+                        // concerned, and leaving the flag set would freeze the
+                        // live display.
+                        if command.eq_ignore_ascii_case("EPG") {
+                            state.program_mode_active.store(false, Ordering::Relaxed);
+                        }
                         let _ = reply.send(response);
                     }
                 }
@@ -379,12 +466,17 @@ fn run_poll_loop(
             thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
         }
 
+        if !session_dead {
+            // Stopped (#688), not disconnected: returning drops the port.
+            info!("Poll loop stopped for shutdown");
+            return Ok(());
+        }
         warn!(
             "Serial session ended for {} — scanner disconnected. Will attempt to reconnect.",
             port_name
         );
         mark_disconnected(&state, "scanner disconnected");
-        thread::sleep(reconnect_backoff);
+        sleep_unless_stopped(reconnect_backoff, stop);
         reconnect_backoff = next_backoff(reconnect_backoff);
     }
 }
@@ -394,6 +486,7 @@ fn run_poll_loop_usb(
     vid: u16,
     pid: u16,
     cmd_rx: std::sync::mpsc::Receiver<ControlCommand>,
+    stop: &AtomicBool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let transport = UsbTransport::new(vid, pid);
     let port_label = format!("usb:{:04x}:{:04x}", vid, pid);
@@ -406,37 +499,40 @@ fn run_poll_loop_usb(
     let mut tick: u32 = 0;
     let mut poll_state = PollState::new();
     let mut reconnect_backoff = Duration::from_millis(RECONNECT_BACKOFF_INITIAL_MS);
+    // One USB re-enumeration per wedge episode (#513). See
+    // `is_wedged_after_open` for why it is bounded and what clears it.
+    let mut wedge_reset_used = false;
 
-    // Outer reconnect loop. Returns only if the initial open fails (so the
-    // caller's error path can surface it); otherwise loops forever, opening
-    // and re-opening the session as the scanner appears/disappears.
-    let mut first_open = true;
+    // Outer reconnect loop. Loops forever, opening and re-opening the session
+    // as the scanner appears and disappears -- including before it has ever
+    // appeared (#513).
     loop {
+        if stop.load(Ordering::Relaxed) {
+            info!("Poll loop stopped for shutdown");
+            return Ok(());
+        }
         let mut session = match transport.open() {
             Ok(s) => s,
             Err(e) => {
-                if first_open {
-                    return Err(e.to_string().into());
-                }
-                // Subsequent opens after a reconnect: device probably still
-                // gone. Mark disconnected, back off, retry.
+                // REGRESSION GUARD (#513): see the matching comment in
+                // `run_poll_loop`. A failed FIRST open retries like any other.
+                // Observed on macOS: with the scanner off the bus, this logged
+                // `Poll loop exited: usb device not found` once and the thread
+                // ended, so plugging the scanner back in did nothing until the
+                // app was relaunched.
                 mark_disconnected(&state, &format!("USB open failed: {}", e));
-                thread::sleep(reconnect_backoff);
+                sleep_unless_stopped(reconnect_backoff, stop);
                 reconnect_backoff = next_backoff(reconnect_backoff);
                 continue;
             }
         };
-        first_open = false;
         reconnect_backoff = Duration::from_millis(RECONNECT_BACKOFF_INITIAL_MS);
 
         info!("USB opened: {:04x}:{:04x}", vid, pid);
-        if let Ok(mut d) = state.device.write() {
-            d.port = Some(port_label.clone());
-            d.connection_status = "connected".to_string();
-            d.clear_connection_diagnostic();
-        }
+        mark_port_opened(&state, &port_label);
 
         let mut mdl_set = false;
+        let mut device_gone = false;
         for attempt in 1..=5 {
             match transport.send(&mut session, MDL_CMD) {
                 Ok(mdl_resp) => {
@@ -454,14 +550,57 @@ fn run_poll_loop_usb(
                 Err(err) => {
                     warn!("MDL read failed on usb attempt {}: {}", attempt, err);
                     if err.is_device_gone() {
+                        device_gone = true;
                         break;
                     }
                 }
             }
             thread::sleep(Duration::from_millis(120));
         }
-        if !mdl_set {
+        // REGRESSION GUARD (#513): a device we just claimed cannot be gone. If
+        // the `MDL` handshake above says otherwise -- on any attempt, write or
+        // read, by any error `is_device_gone` accepts -- the endpoint is
+        // treated as wedged. The replug is the only cure anyone has confirmed;
+        // `clear_halt` already ran during `open` and demonstrably does not
+        // heal it. Re-enumerating is that replug in software; it invalidates
+        // this session, so drop it and let the outer loop open a fresh one.
+        // Bounded to one attempt per episode by `wedge_reset_used`.
+        //
+        // `is_wedged_after_open` carries what is and is not evidenced here:
+        // the recovery is hardware-verified, the wedge itself never
+        // reproduced. Read it before concluding anything from this branch.
+        if is_wedged_after_open(mdl_set, device_gone, wedge_reset_used) {
+            warn!(
+                "USB endpoint appears wedged on {} (claimed, then reported gone \
+                 on the first read) — re-enumerating, which is what a replug does",
+                port_label
+            );
+            wedge_reset_used = true;
+            if let Err(e) = transport.reset(&mut session) {
+                // Expected on a device that re-enumerated under us, and not a
+                // reason to skip the reopen: the reset is what we came for and
+                // the session is spent either way.
+                warn!("USB reset returned {} — reopening regardless", e);
+            }
+            drop(session);
+            mark_disconnected(&state, "USB endpoint wedged; re-enumerated, reopening");
+            sleep_unless_stopped(reconnect_backoff, stop);
+            reconnect_backoff = next_backoff(reconnect_backoff);
+            continue;
+        }
+        if mdl_set {
+            // A scanner that answered is not wedged. Re-arm, so a wedge later
+            // in this process's life gets its own reset rather than inheriting
+            // a spent one.
+            wedge_reset_used = false;
+        } else {
             warn!("Unable to read valid MDL response after retries (usb)");
+            // See the serial path: a device that vanished must not be
+            // announced as connected. This transport is the one the USB STALL
+            // wedge actually happens on.
+            if should_announce_connect(mdl_set, device_gone) {
+                mark_connected_without_model(&state, &port_label);
+            }
         }
 
         // Initial volume query. Writes to `state.live.volume` so the first
@@ -488,7 +627,7 @@ fn run_poll_loop_usb(
         // Inner per-session loop. Breaks out (to the outer reconnect loop)
         // the moment any transport call signals the device is gone.
         let mut session_dead = false;
-        while !session_dead {
+        while !session_dead && !stop.load(Ordering::Relaxed) {
             while let Ok(cmd) = cmd_rx.try_recv() {
                 match cmd {
                     ControlCommand::Hold { reply, deadline } => {
@@ -580,6 +719,26 @@ fn run_poll_loop_usb(
                                 e.to_string()
                             })
                         };
+                        // REGRESSION GUARD (#598): clear the program-mode
+                        // flag only AFTER the EPG has actually gone out.
+                        //
+                        // `ProgramModeGuard::drop` used to clear it up front
+                        // and then queue the EPG fire-and-forget. The poll loop
+                        // yields STS/GLG on this flag, so it resumed polling a
+                        // radio that had not left PRG yet -- a window exactly
+                        // as wide as the queue backlog.
+                        //
+                        // `send_raw_command` already had this ordering right
+                        // for the EPGs it sends itself; the guard's Drop path
+                        // bypassed it because a Drop cannot await a reply.
+                        //
+                        // Cleared whether or not the write succeeded: a failed
+                        // EPG still ends the bracket as far as this process is
+                        // concerned, and leaving the flag set would freeze the
+                        // live display.
+                        if command.eq_ignore_ascii_case("EPG") {
+                            state.program_mode_active.store(false, Ordering::Relaxed);
+                        }
                         let _ = reply.send(response);
                     }
                 }
@@ -691,6 +850,12 @@ fn run_poll_loop_usb(
             thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
         }
 
+        if !session_dead {
+            // Stopped (#688), not disconnected: returning drops the session,
+            // which releases the claimed interface.
+            info!("Poll loop stopped for shutdown");
+            return Ok(());
+        }
         // Session dropped here. Log once (not per failed poll) and let the
         // outer loop reopen with backoff.
         warn!(
@@ -698,8 +863,141 @@ fn run_poll_loop_usb(
             port_label
         );
         mark_disconnected(&state, "scanner disconnected");
-        thread::sleep(reconnect_backoff);
+        sleep_unless_stopped(reconnect_backoff, stop);
         reconnect_backoff = next_backoff(reconnect_backoff);
+    }
+}
+
+/// Record that a port opened, WITHOUT claiming the scanner is connected.
+///
+/// REGRESSION GUARD (#539, `opening_a_port_does_not_claim_connected`): this
+/// function must never set `connection_status`. It used to, inline in both
+/// poll loops, and that made the connect-side broadcast in
+/// `update_device_info_from_mdl` dead code -- the flag it gates on asks whether
+/// the status was already "connected", which this write guaranteed. The
+/// user-visible result was that a replug never told the frontend the scanner
+/// came back, so the UI read "disconnected" for the rest of the session.
+///
+/// The status now flips when the `MDL` reply lands, so "connected" means "we
+/// know which radio this is" rather than "a file descriptor opened" -- which is
+/// also what the channel-cache capacity guard needs, since it cannot run
+/// before the model is known.
+///
+/// Extracted from the two loops rather than left inline SO THAT it is
+/// testable: a guard that rebuilds this sequence by hand passes whether or not
+/// the loops still set the status.
+fn mark_port_opened(state: &AppState, port_label: &str) {
+    if let Ok(mut d) = state.device.write() {
+        d.port = Some(port_label.to_string());
+        d.clear_connection_diagnostic();
+    }
+}
+
+/// After the MDL retries gave up, should the frontend be told a scanner is here?
+///
+/// Extracted from both poll loops SO THAT it can be tested: `run_poll_loop` has
+/// no fake transport, so a guard written against the loop cannot exist, and a
+/// guard written against `mark_connected_without_model` alone cannot see which
+/// branch reached it -- which is exactly how this shipped wrong.
+///
+/// Yes when the scanner answered nothing intelligible but is still there: the
+/// port is open, the loop is about to poll it, and "connected, model unknown"
+/// is the honest report (#539).
+///
+/// No when the retries ended because the device VANISHED. Announcing a connect
+/// there tells the frontend the scanner arrived moments before the poll loop
+/// marks it gone again -- and since #551 that announcement is broadcast, so a
+/// wedged link turns into a connect/disconnect storm at reconnect-backoff rate.
+///
+/// Test: `a_vanished_device_is_never_announced_as_connected`.
+fn should_announce_connect(mdl_set: bool, device_gone: bool) -> bool {
+    !mdl_set && !device_gone
+}
+
+/// True when a failed first `MDL` means the USB endpoint is WEDGED rather than
+/// the scanner unplugged — so re-enumerating it is worth a try (#513).
+///
+/// The discriminator is that `open()` already succeeded. It walked the bus,
+/// matched the VID/PID, opened the device and claimed the interface, so the
+/// scanner demonstrably IS attached. A device that is genuinely gone fails
+/// EARLIER, at `open()`, with `NotFound` — it never reaches this decision at
+/// all. So a "device gone" verdict from the `MDL` handshake after a successful
+/// claim is not a report of an absent device. In the #513 report it was
+/// `rusb::Error::Io` on the first read, which `is_device_gone` classifies as
+/// gone (correctly, for every other caller), arriving from a pipe that has
+/// stopped carrying data for this process. The predicate is broader than that
+/// symptom: it fires on any error `is_device_gone` accepts (`NoDevice`, `Io`,
+/// `Pipe`, `Other`), from any of the handshake's attempts, write or read.
+///
+/// That is the #513 wedge as reported: after the backend stopped mid-poll,
+/// every later open succeeded and then failed its first read with
+/// `Input/Output Error`, indefinitely, until the scanner was physically
+/// replugged. `UsbTransport::reset` asks the OS to do what that replug does.
+///
+/// **This has never been observed curing a real wedge, because the wedge would
+/// not reproduce.** On 2026-09-03, against a BC125AT on macOS 27.0, thirteen
+/// attempts produced thirteen clean reconnects: one `SIGTERM` mid-poll (the
+/// issue's own recipe), six `SIGKILL` mid-poll at varying offsets in the tick,
+/// and six `SIGKILL` inside the `PRG` bracket of a memory sync. What IS
+/// verified is the recovery: forcing this branch on real hardware made
+/// `reset()` re-enumerate the radio in ~2.6 s, after which the reopen succeeded
+/// and `MDL` answered normally.
+///
+/// The issue's recipe (`kill <pid>`, a `SIGTERM`) was right for the build it
+/// was written against. `SIGTERM` had no handler until `faf5918` (#600),
+/// committed 2026-08-31, two days after the 2026-08-29 sighting, so it killed
+/// the process mid-poll. The handler alone did not make the USB side clean
+/// either: `with_graceful_shutdown` stopped the HTTP server, not the poll
+/// thread, so the process still exited mid-poll with the interface claimed
+/// until #688 stopped the thread first. The bench runs predate #688, so the
+/// bench `SIGTERM` was a fair attempt at the recipe. Why none of the
+/// thirteen reproduced is unknown; a kill landing inside a bulk transfer that
+/// was never hit is one candidate.
+///
+/// So if this is being read while chasing a recurrence: the log line
+/// `USB endpoint appears wedged` (a `warn`, so it survives the default filter)
+/// marks this branch firing. It is logged BEFORE the reset, so it says nothing
+/// about the outcome. A reopen that fails logs further `warn`s (`MDL read
+/// failed`, `Unable to read valid MDL response`); one that succeeds logs only
+/// `USB opened` at `info`, which the default filter drops. Its absence rules
+/// out only the FIRST wedge of an episode: once `reset_used` is set, a wedge
+/// that persists or recurs before an `MDL` answers takes the ordinary path and
+/// logs nothing here. Do not assume the reasoning above has been proven
+/// against hardware — only the recovery has. See #672.
+///
+/// `reset_used` bounds it to ONE reset per wedge episode, cleared by the next
+/// `MDL` that answers. Without that bound a scanner that is powered off but
+/// still attached — a state that also opens, claims and then cannot talk —
+/// would be re-enumerated on every reconnect for as long as it stayed off.
+///
+/// Test: `a_claimed_device_that_says_gone_on_the_first_read_is_wedged`.
+fn is_wedged_after_open(mdl_set: bool, device_gone: bool, reset_used: bool) -> bool {
+    !mdl_set && device_gone && !reset_used
+}
+
+/// Report connected when the port is open but `MDL` never answered.
+///
+/// The #539 fix moved the "connected" flip to the MDL chokepoint so the
+/// connect edge is a real edge. That leaves the five-failed-attempts path with
+/// no one to set the status, and the poll loop is about to start polling
+/// regardless -- so a scanner whose MDL is garbled would read as permanently
+/// disconnected. Connected with no model is the honest answer there, and it is
+/// what the code did before #539.
+///
+/// Broadcasts on the edge, for the same reason the MDL path does.
+///
+/// Test: `an_unidentified_scanner_still_reports_connected`.
+fn mark_connected_without_model(state: &AppState, port_label: &str) {
+    let mut changed = false;
+    if let Ok(mut d) = state.device.write() {
+        if d.connection_status != "connected" {
+            d.connection_status = "connected".to_string();
+            changed = true;
+        }
+        d.port = Some(port_label.to_string());
+    }
+    if changed {
+        broadcast_device_info(state);
     }
 }
 
@@ -720,6 +1018,26 @@ fn mark_disconnected(state: &AppState, reason: &str) {
         }
         d.diagnostic_code = Some("scanner_disconnected".to_string());
         d.diagnostic_message = Some(reason.to_string());
+        // REGRESSION GUARD (`identity_survives_a_disconnect_so_the_flush_finds_its_profile`):
+        // `scanner_id` and `serial_number` are deliberately NOT cleared here.
+        //
+        // #575 suggested clearing them on disconnect, and that is wrong for a
+        // reason the issue could not see. `flush_channel_cache` keys on
+        // `AppState::scanner_id()`, which falls back to
+        // `PLACEHOLDER_SCANNER_ID` when the field is None, and the periodic
+        // flush runs every CHANNEL_CACHE_FLUSH_SECS regardless of whether a
+        // radio is attached. Nothing clears `shadow.channels` on disconnect
+        // either -- so clearing the id would mean: unplug, wait 30 s, and the
+        // departed radio's whole channel map is written under the placeholder
+        // profile, where `adopt_placeholder_cache` can later hand it to a
+        // DIFFERENT scanner.
+        //
+        // The #575 harm is a stale serial surviving a SWAP, and the
+        // unconditional assign in `update_device_info_from_mdl` fixes that
+        // completely: the next connect overwrites both fields together. What
+        // remains here after a disconnect describes the last-connected radio,
+        // consistently, which is a coherent thing for a "disconnected" status
+        // to sit beside.
     }
     // Also flag liveState as stale so the frontend's "stale" UI fires
     // (the frontend treats `stale: true` as a disconnect indicator).
@@ -764,6 +1082,21 @@ fn broadcast_state_stale(state: &AppState) {
         "timestamp": timestamp,
     });
     let _ = state.ws_tx.send(msg.to_string());
+}
+
+/// Sleep for a reconnect backoff, ending early once `stop` is set (#688). The
+/// backoff reaches `RECONNECT_BACKOFF_MAX_MS` (5 s), longer than shutdown waits
+/// for this thread, so a plain sleep made quitting with the scanner unplugged
+/// time out.
+fn sleep_unless_stopped(duration: Duration, stop: &AtomicBool) {
+    let deadline = Instant::now() + duration;
+    while !stop.load(Ordering::Relaxed) {
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        thread::sleep((deadline - now).min(Duration::from_millis(50)));
+    }
 }
 
 /// Double the reconnect delay, capped at RECONNECT_BACKOFF_MAX_MS, so a
@@ -843,14 +1176,132 @@ fn update_device_info_from_mdl(state: &AppState, mdl_resp: &str, port_label: &st
                 ));
             }
         }
+        // Read the USB serial ONCE per connect (#570).
+        //
+        // This ran twice -- here and again below for the profile lookup -- and
+        // each call enumerates every serial port on the machine, or opens a
+        // second USB handle on the `usb:` path. Two independent reads is also
+        // two chances to disagree, and the two consumers would then key the
+        // scanner cache and the profile off different answers for one radio.
+        let usb_serial = crate::config::usb_serial_for_port(port_label);
         // Cache the USB serial number so autodetect can prefer this
         // physical unit on reconnect. Best-effort: skipped silently for
         // the `usb:` pseudo-target (macOS no-CDC-bind path) and any port
         // without a USB serial number reported.
         if !port_label.starts_with("usb:") {
-            if let Some(serial) = crate::config::usb_serial_for_port(port_label) {
-                crate::config::save_last_scanner_cache(&serial, port_label, &model);
+            if let Some(serial) = usb_serial.as_deref() {
+                crate::config::save_last_scanner_cache(serial, port_label, &model);
             }
+        }
+        // Resolve WHICH radio this is before touching its cached memory (#414).
+        //
+        // Order matters and is not arbitrary: the profile has to exist before
+        // the cache is keyed on it, and the pre-#414 rows have to be adopted
+        // before the load runs, or the first launch after upgrading finds an
+        // empty profile and re-syncs for nothing.
+        //
+        // A serial the transport cannot read is passed through as None rather
+        // than guessed at -- `match_index` records it explicitly, so a scanner
+        // whose serial failed to read gets its own stable profile instead of
+        // colliding with a real one. `usb_serial` is read once, above.
+        let previous_id = state.device.read().ok().and_then(|d| d.scanner_id.clone());
+        let resolved = super::scanner_registry::resolve_scanner(
+            &state.preferences_db_path,
+            &model,
+            usb_serial.as_deref(),
+        );
+        if let Ok(mut d) = state.device.write() {
+            // REGRESSION GUARD (`the_serial_number_does_not_latch_across_a_swap`):
+            // both fields are assigned UNCONDITIONALLY, and they move together.
+            //
+            // This was `if d.serial_number.is_none()`, so the serial latched on
+            // the first successful read and never moved again. `scanner_id` had
+            // no such gate, so after a unit swap on the same port path the two
+            // disagreed: `DeviceInfo` carried the new model, the new
+            // capabilities and the new profile beside the OLD unit's serial --
+            // under one lock, which is the contradiction the doc on
+            // `DeviceInfo.scanner_id` says this field placement exists to
+            // prevent.
+            //
+            // Blanking on an empty read is deliberate. A stale identifier is
+            // worse than none at the moment it gets read: the user is on the
+            // Device tab asking why their channels disappeared.
+            //
+            // An unconditional assign would be the wrong trade if the serial
+            // read were flappy -- stale swapped for blinking. It is not:
+            // answered on hardware 2026-08-31 (#570), the descriptor read
+            // succeeds against a device `UsbTransport` has already claimed.
+            d.scanner_id = resolved.clone();
+            d.serial_number = usb_serial.clone();
+        }
+
+        // REGRESSION GUARD (`a_different_radio_does_not_inherit_the_last_ones_channels`):
+        // a DIFFERENT scanner on the same port means the shadow belongs to the
+        // radio that just left. Clear it.
+        //
+        // Nothing else does. `mark_disconnected` touches DeviceInfo and
+        // `live.stale` only, and `load_channel_cache`'s "a populated shadow
+        // wins" rule -- correct for a reconnect of the SAME radio -- then
+        // declines to load, so the capacity guard never sees the stale map
+        // either. The next flush writes that map under the NEW scanner_id,
+        // and `save_channels` DELETEs the target profile's rows before
+        // inserting. Reproduced: a BC75XLT's 300 channels landed in a
+        // BC125AT's profile.
+        //
+        // Reachable wherever two units share a port string across a replug --
+        // two CP210x radios both landing on /dev/ttyUSB0, say. Same-capacity
+        // units are the worst case, because the capacity guard cannot catch it
+        // on the next launch either: 300 == 300.
+        //
+        // Only on a CHANGE. `previous_id.is_some()` keeps the first connect of
+        // a session from wiping channels a handler read off the wire before any
+        // MDL landed.
+        if previous_id.is_some() && previous_id != resolved {
+            if let Ok(mut shadow) = state.shadow.write() {
+                shadow.channels.clear();
+                shadow.last_sync = 0.0;
+            }
+            info!("scanner changed; cleared the previous radio's channel memory");
+        }
+        if let Some(id) = resolved.as_deref() {
+            super::channel_cache::adopt_placeholder_cache(
+                &state.preferences_db_path,
+                id,
+                &model,
+                caps.channel_count,
+            );
+        }
+
+        // Adopt cached channel memory now that we know WHICH radio this is.
+        //
+        // REGRESSION GUARD (`a_cache_from_a_larger_scanner_is_discarded`,
+        // `a_cache_from_a_smaller_scanner_is_discarded`,
+        // `a_matching_cache_is_loaded_on_connect`,
+        // `a_reconnect_does_not_overwrite_live_channels`): this must run HERE
+        // and nowhere earlier. The capacity guard compares the cache against
+        // `channel_count`, and before the `MDL` reply is parsed there is no
+        // model -- `AppState::capabilities()` answers with the BC125AT default
+        // of 500, which would wave a 500-row cache onto a BC75XLT.
+        //
+        // Use the local `caps`, never `state.capabilities()`: that takes
+        // `device.read()`, and this function held `device.write()` until the
+        // block above closed. Same-thread read-while-write on a std `RwLock`
+        // deadlocks.
+        //
+        // Deliberately NOT gated on `transitioned_to_connected`. That flag is
+        // always false in production -- both poll loops set
+        // `connection_status = "connected"` when the port opens, before the
+        // MDL probe -- so gating on it would pass every unit test and never
+        // fire on hardware. See #539. `load_channel_cache` does its own
+        // gating on an empty shadow, which is the honest condition anyway:
+        // load only when there is nothing live to lose.
+        let adopted = super::channel_cache::load_channel_cache(state, caps.channel_count);
+        if adopted > 0 {
+            info!(
+                "Adopted {} cached channels for {}; no memory sync needed to \
+                 render the channel list",
+                adopted, model
+            );
         }
         // Push the new state to the frontend so its indicator flips back
         // to green without waiting for a REST poll. Only broadcast on
@@ -1328,6 +1779,170 @@ mod tests {
         );
     }
 
+    /// REGRESSION GUARD (#570): the CONNECT PATH resolves the same profile
+    /// every time, not just `resolve_scanner` called with the same literal.
+    ///
+    /// `a_known_scanner_keeps_its_profile` passes the identical model and
+    /// serial to `resolve_scanner` twice, which cannot observe anything that
+    /// happens between the wire and that call -- the `MDL` parse, the case
+    /// fold, the serial read, and `match_index` construction all sit in
+    /// `update_device_info_from_mdl` and are bypassed entirely.
+    ///
+    /// This drives the whole path twice. A profile that changed between two
+    /// connects of one radio would orphan its channel cache behind a key
+    /// nothing looks up again, and `adopt_placeholder_cache` cannot recover
+    /// that -- it only ever moves rows out of `_default`.
+    ///
+    /// Also asserts the CASE FOLD survives the round trip, which is the half
+    /// the direct-call guard cannot reach: `MDL,bc125at` is a reply Bearpaw
+    /// must accept (`model_match_is_case_insensitive_at_connect`), and
+    /// `scanners.match_index` is UNIQUE -- so an unfolded spelling would sit
+    /// beside the folded one as a second profile for one radio, forever.
+    #[test]
+    fn the_connect_path_resolves_one_profile_per_radio() {
+        let state = crate::api::default_state();
+
+        update_device_info_from_mdl(&state, "MDL,BC125AT", "/dev/cu.test");
+        let first = state
+            .device
+            .read()
+            .unwrap()
+            .scanner_id
+            .clone()
+            .expect("a connect must resolve a profile");
+
+        update_device_info_from_mdl(&state, "MDL,BC125AT", "/dev/cu.test");
+        let second = state.device.read().unwrap().scanner_id.clone();
+        assert_eq!(
+            second.as_ref(),
+            Some(&first),
+            "reconnecting the same radio must land on the same profile"
+        );
+
+        // Same radio, lowercase reply. Real hardware reports uppercase, but the
+        // crate accepts either and this is the one place a spelling difference
+        // becomes a permanent second profile.
+        update_device_info_from_mdl(&state, "MDL,bc125at", "/dev/cu.test");
+        let lowercase = state.device.read().unwrap().scanner_id.clone();
+        assert_eq!(
+            lowercase.as_ref(),
+            Some(&first),
+            "a lowercase MDL reply is the same radio, not a new one"
+        );
+    }
+
+    /// REGRESSION GUARD (#575): `serial_number` names the CURRENTLY connected
+    /// unit, never a previous one.
+    ///
+    /// The assignment was `if d.serial_number.is_none() { ... }`, so the field
+    /// latched on the first successful read and never moved again --
+    /// `mark_disconnected` does not clear it either. `scanner_id` on the line
+    /// above was always assigned, so after a unit swap on the same port path
+    /// the two disagreed: `GET /status` and the Device tab reported the FIRST
+    /// unit's serial while the cache was already keyed on the SECOND unit's
+    /// profile.
+    ///
+    /// `DeviceInfo` then carried the new model, the new capabilities and the
+    /// new `scanner_id` beside the old unit's serial -- under one lock, which
+    /// is exactly the contradiction the doc on `DeviceInfo.scanner_id` says
+    /// the field placement exists to prevent.
+    ///
+    /// The profile was always right, because `match_index` is built from the
+    /// freshly-read value. The harm is a user reading a stale identifier off
+    /// the Device tab and trusting it, at the one moment they are diagnosing
+    /// "why did my channels disappear?".
+    ///
+    /// A stale value is worse than a blank one here, so the assignment is
+    /// unconditional in BOTH directions: a read that comes back empty blanks
+    /// the field rather than leaving the last unit's serial standing.
+    ///
+    /// That was an open question when #575 was filed -- an unconditional
+    /// assign would trade a stale value for a blinking one if the read were
+    /// flappy. Answered on hardware 2026-08-31 (#570): the descriptor read
+    /// succeeds against a device `UsbTransport` has already claimed, so it does
+    /// not flap. See `usb_serial_reads_from_a_live_bc125at`.
+    #[test]
+    fn the_serial_number_does_not_latch_across_a_swap() {
+        let state = crate::api::default_state();
+
+        // A previous unit left its serial behind. In this test environment
+        // `usb_serial_for_port("/dev/cu.test")` answers None, which is exactly
+        // the case that used to latch: `is_none()` was false, so the stale
+        // value survived every subsequent connect.
+        if let Ok(mut d) = state.device.write() {
+            d.serial_number = Some("PREVIOUS-UNIT".to_string());
+        }
+
+        update_device_info_from_mdl(&state, "MDL,BC75XLT", "/dev/cu.test");
+
+        let d = state.device.read().unwrap();
+        assert_eq!(
+            d.serial_number, None,
+            "a connect must replace the serial with what THIS radio reported, \
+             even when that is nothing: {:?}",
+            d.serial_number
+        );
+        assert_eq!(
+            d.model.as_deref(),
+            Some("BC75XLT"),
+            "precondition: the connect path ran"
+        );
+    }
+
+    /// REGRESSION GUARD (#575): a disconnect must NOT clear the scanner
+    /// identity, because the periodic flush still needs it.
+    ///
+    /// #575 proposed clearing `scanner_id` and `serial_number` in
+    /// `mark_disconnected`. Doing that reaches a worse bug than the one it
+    /// fixes: `flush_channel_cache` keys on `AppState::scanner_id()`, which
+    /// falls back to `PLACEHOLDER_SCANNER_ID` when the field is None; the
+    /// periodic flush runs every CHANNEL_CACHE_FLUSH_SECS whether or not a
+    /// radio is attached; and nothing clears `shadow.channels` on disconnect.
+    ///
+    /// So: unplug, wait 30 s, and the departed radio's entire channel map is
+    /// written under the placeholder profile -- where `adopt_placeholder_cache`
+    /// can later move it onto a DIFFERENT scanner. That is the #571 loss by a
+    /// new route.
+    ///
+    /// This test drives exactly that sequence, so the tidy-up is caught rather
+    /// than reasoned about.
+    #[test]
+    fn identity_survives_a_disconnect_so_the_flush_finds_its_profile() {
+        use crate::api::channel_cache::{load_channels, PLACEHOLDER_SCANNER_ID};
+
+        let state = crate::api::default_state();
+        update_device_info_from_mdl(&state, "MDL,BC75XLT", "/dev/cu.test");
+        let resolved = state
+            .device
+            .read()
+            .unwrap()
+            .scanner_id
+            .clone()
+            .expect("precondition: connecting resolved a profile");
+
+        // A synced radio, then the cable comes out.
+        if let Ok(mut shadow) = state.shadow.write() {
+            shadow.channels = channel_map(300);
+            shadow.last_sync = 1_000_000_000.0;
+        }
+        mark_disconnected(&state, "unplugged");
+
+        // What the 30-second timer does next.
+        crate::api::channel_cache::flush_channel_cache(&state);
+
+        assert_eq!(
+            load_channels(&state.preferences_db_path, &resolved).len(),
+            300,
+            "a flush after disconnect must still write to the radio's own profile"
+        );
+        assert_eq!(
+            load_channels(&state.preferences_db_path, PLACEHOLDER_SCANNER_ID).len(),
+            0,
+            "and must NOT land under the placeholder, where another scanner \
+             could adopt it"
+        );
+    }
+
     #[test]
     fn next_backoff_doubles_until_cap() {
         let start = Duration::from_millis(RECONNECT_BACKOFF_INITIAL_MS);
@@ -1345,5 +1960,979 @@ mod tests {
         }
         // After enough doublings we should be sitting at the cap.
         assert_eq!(current.as_millis(), RECONNECT_BACKOFF_MAX_MS as u128);
+    }
+
+    // ---- Channel-cache adoption on connect (#413 PR 3) --------------------
+
+    /// Write `count` channels into THIS state's own cache database.
+    ///
+    /// Seeding `state.preferences_db_path` rather than a private temp file is
+    /// the whole point: the connect path reads that path and nothing else, so a
+    /// test that seeds a `migrated_db()`-style path of its own asserts an empty
+    /// shadow and passes for a build with no load at all. That is the shape of
+    /// the two failed `buildEmptyDraft` guard attempts recorded in CLAUDE.md.
+    fn seed_cache(state: &AppState, count: u16, synced_at: f64) {
+        crate::api::channel_cache::save_channels(
+            &state.preferences_db_path,
+            crate::api::channel_cache::PLACEHOLDER_SCANNER_ID,
+            &channel_map(count),
+            synced_at,
+        );
+    }
+
+    /// `count` channels, indexed 1..=count, as a completed walk would leave
+    /// them: every slot the radio has gets a row, which is what makes
+    /// `max(index) == channel_count` the capacity signal the guard relies on.
+    fn channel_map(count: u16) -> std::collections::HashMap<u16, crate::state::ChannelData> {
+        use crate::state::ChannelData;
+        let mut map = std::collections::HashMap::new();
+        for index in 1..=count {
+            map.insert(
+                index,
+                ChannelData {
+                    index,
+                    frequency: 146.0 + (index as f64) / 1000.0,
+                    modulation: "FM".to_string(),
+                    alpha_tag: format!("CH{index}"),
+                    ..Default::default()
+                },
+            );
+        }
+        map
+    }
+
+    fn shadow_len(state: &AppState) -> usize {
+        state.shadow.read().unwrap().channels.len()
+    }
+
+    /// REGRESSION GUARD: a cache matching the connected scanner is adopted,
+    /// so the channel list renders without a 30-45 s memory sync.
+    ///
+    /// This is the positive half of the capacity guard and it is not optional:
+    /// every negative assertion below ("this cache is discarded") also passes
+    /// for a build that never loads anything at all.
+    #[test]
+    fn a_matching_cache_is_loaded_on_connect() {
+        let state = crate::api::default_state();
+        seed_cache(&state, 300, 1_000_000_000.0);
+
+        update_device_info_from_mdl(&state, "MDL,BC75XLT", "/dev/cu.test");
+
+        assert_eq!(
+            shadow_len(&state),
+            300,
+            "a 300-channel cache must be adopted by a 300-channel scanner"
+        );
+        let shadow = state.shadow.read().unwrap();
+        assert_eq!(
+            shadow.channels.get(&1).map(|c| c.alpha_tag.as_str()),
+            Some("CH1"),
+            "the adopted rows must be the cached ones"
+        );
+    }
+
+    /// REGRESSION GUARD: a cache written by a BIGGER scanner is discarded.
+    ///
+    /// Without this, a BC125AT's 500-row cache loads onto a BC75XLT and 200
+    /// channels the radio does not have render as real. Nothing panics --
+    /// `index_to_bank` returns 0 above `channel_count` while the frontend's
+    /// `deriveBankFromIndex` clamps to `bankCount`, so the phantoms land in
+    /// bank 10 of a radio whose bank 10 holds 30 channels -- and `export_csv`
+    /// writes all 500 rows to the user's file. Plausible-looking and silent,
+    /// which is exactly what the bank-derivation third rail warns about.
+    #[test]
+    fn a_cache_from_a_larger_scanner_is_discarded() {
+        let state = crate::api::default_state();
+        seed_cache(&state, 500, 1_000_000_000.0);
+
+        update_device_info_from_mdl(&state, "MDL,BC75XLT", "/dev/cu.test");
+
+        assert_eq!(
+            shadow_len(&state),
+            0,
+            "a 500-channel cache must not render on a 300-channel scanner"
+        );
+    }
+
+    /// REGRESSION GUARD: a cache written by a SMALLER scanner is discarded too.
+    ///
+    /// Paired with the test above on purpose, and it is the one that pins the
+    /// guard to `!=` rather than `>`. A `>` comparison passes the larger-cache
+    /// test and silently admits this one: a BC75XLT's 300 rows load onto a
+    /// BC125AT, and because the frontend suppresses its startup sync whenever
+    /// channels exist, the wrong radio's memory renders and never refreshes.
+    /// Both directions are the same mistake.
+    #[test]
+    fn a_cache_from_a_smaller_scanner_is_discarded() {
+        let state = crate::api::default_state();
+        seed_cache(&state, 300, 1_000_000_000.0);
+
+        update_device_info_from_mdl(&state, "MDL,BC125AT", "/dev/cu.test");
+
+        assert_eq!(
+            shadow_len(&state),
+            0,
+            "a 300-channel cache must not render on a 500-channel scanner"
+        );
+    }
+
+    /// REGRESSION GUARD: a reconnect must not overwrite live channel memory.
+    ///
+    /// Nothing clears `shadow.channels` on disconnect (`mark_disconnected`
+    /// touches `DeviceInfo` and `live.stale` only), and the reconnect loop
+    /// re-runs this function on every successful reopen -- every few seconds
+    /// for a flapping USB link. An unconditional load would stomp edits made
+    /// this session with rows up to CHANNEL_CACHE_FLUSH_SECS old.
+    #[test]
+    fn a_reconnect_does_not_overwrite_live_channels() {
+        use crate::state::ChannelData;
+        let state = crate::api::default_state();
+        seed_cache(&state, 300, 1_000_000_000.0);
+
+        // First connect adopts the cache.
+        update_device_info_from_mdl(&state, "MDL,BC75XLT", "/dev/cu.test");
+        assert_eq!(shadow_len(&state), 300, "precondition: cache adopted");
+
+        // The user edits a channel; it is on the radio but not yet flushed.
+        state.shadow.write().unwrap().channels.insert(
+            1,
+            ChannelData {
+                index: 1,
+                alpha_tag: "EDITED".to_string(),
+                ..Default::default()
+            },
+        );
+
+        // The scanner drops and comes back.
+        mark_disconnected(&state, "unplugged");
+        update_device_info_from_mdl(&state, "MDL,BC75XLT", "/dev/cu.test");
+
+        assert_eq!(
+            state
+                .shadow
+                .read()
+                .unwrap()
+                .channels
+                .get(&1)
+                .map(|c| c.alpha_tag.as_str()),
+            Some("EDITED"),
+            "a reconnect must not replace live memory with the older cache"
+        );
+    }
+
+    /// REGRESSION GUARD: adopting a cache restores WHEN the radio was read.
+    ///
+    /// `shadow.last_sync` is what the periodic flush re-persists and what PR 4
+    /// reports. Leaving it at its 0.0 default would make the next flush stamp
+    /// "now" (the `epoch_now()` fallback), erasing the real age of the memory
+    /// within one flush interval of launch -- and a staleness indicator that
+    /// always reads "moments ago" is worse than none.
+    #[test]
+    fn a_loaded_cache_restores_the_sync_time() {
+        let state = crate::api::default_state();
+        seed_cache(&state, 300, 1_000_000_000.0);
+
+        update_device_info_from_mdl(&state, "MDL,BC75XLT", "/dev/cu.test");
+
+        assert_eq!(
+            state.shadow.read().unwrap().last_sync,
+            1_000_000_000.0,
+            "the adopted cache's sync time must survive into the shadow"
+        );
+    }
+
+    /// REGRESSION GUARD: channels survive a restart, and the app does not
+    /// reset how old it says they are.
+    ///
+    /// This is #413's headline acceptance criterion -- "channels survive a
+    /// restart with no memory sync" -- and it is the one thing none of the
+    /// other guards actually prove. `each_state_gets_its_own_databases` gives
+    /// every test state a private database, which is what keeps the suite
+    /// parallel-safe, but it also means the flush and the load are only ever
+    /// exercised against files the other never sees. Both halves can be green
+    /// while the pair is broken.
+    ///
+    /// So this drives the real sequence: session A completes a sync and
+    /// flushes; session B -- a fresh process pointed at the SAME database --
+    /// connects and adopts.
+    ///
+    /// Then B flushes again, because that is what a running app does every
+    /// CHANNEL_CACHE_FLUSH_SECS, and the recorded age has to survive it.
+    /// Without that last assertion the app reports "synced moments ago" 30
+    /// seconds after every launch -- the #538 bug arriving by a different
+    /// route, and invisible to every other guard here.
+    #[test]
+    fn channels_survive_a_restart_and_keep_their_age() {
+        // `PLACEHOLDER_SCANNER_ID` was imported here until #576. Both sessions
+        // identify the same radio now, so the test reads under the resolved
+        // profile and never touches the placeholder.
+        use crate::api::channel_cache::{flush_channel_cache, last_synced_at};
+        const SYNCED_AT: f64 = 1_000_000_000.0;
+
+        // --- Session A: connect, complete a sync, flush. ---
+        //
+        // A identifies its radio before flushing, which a real session always
+        // does -- the flush reads `capabilities().channel_count` to decide
+        // whether the map covers the whole scanner (#567), and an
+        // unidentified state answers with the BC125AT default of 500 while
+        // holding a BC75XLT's 300. Seeding through the raw `save_channels`
+        // instead would keep the test green while removing the flush from the
+        // pair this test exists to exercise.
+        let a = crate::api::default_state();
+        update_device_info_from_mdl(&a, "MDL,BC75XLT", "/dev/cu.test");
+        {
+            let mut shadow = a.shadow.write().unwrap();
+            shadow.channels = channel_map(300);
+            shadow.last_sync = SYNCED_AT;
+        }
+        flush_channel_cache(&a);
+
+        // --- Session B: a fresh process on the same database. ---
+        let mut b = crate::api::default_state();
+        b.preferences_db_path = a.preferences_db_path.clone();
+        assert!(
+            b.shadow.read().unwrap().channels.is_empty(),
+            "precondition: a new session starts with no channel memory"
+        );
+
+        update_device_info_from_mdl(&b, "MDL,BC75XLT", "/dev/cu.test");
+
+        assert_eq!(
+            shadow_len(&b),
+            300,
+            "a restart must adopt the previous session's channels with no sync"
+        );
+        assert_eq!(
+            b.shadow.read().unwrap().last_sync,
+            SYNCED_AT,
+            "the restored memory must carry the time the RADIO was read"
+        );
+
+        // --- And the periodic flush must not relabel it as fresh. ---
+        //
+        // Read under the RESOLVED profile, not the placeholder. Both sessions
+        // identify the same radio, so both use its own key throughout.
+        // (Adoption of pre-identity placeholder rows is a different path, and
+        // it has its own guards: `a_matching_cache_is_loaded_on_connect` and
+        // `a_placeholder_cache_from_another_radio_is_not_adopted`.)
+        flush_channel_cache(&b);
+        assert_eq!(
+            last_synced_at(&b.preferences_db_path, &b.scanner_id()),
+            Some(SYNCED_AT),
+            "a flush in the new session must preserve the original sync time, \
+             not stamp the restart"
+        );
+    }
+
+    /// REGRESSION GUARD (#539): reconnecting must broadcast that the scanner
+    /// came back.
+    ///
+    /// `broadcast_device_info` has two callers: `mark_disconnected` and this
+    /// one, gated on `transitioned_to_connected`. Both poll loops used to set
+    /// `connection_status = "connected"` when the PORT OPENED, before the MDL
+    /// probe -- so by the time this function tested the flag it was always
+    /// already "connected", the gate was always false, and the connect-side
+    /// broadcast was dead code.
+    ///
+    /// The user-visible result: after any unplug/replug, the frontend kept the
+    /// "disconnected" value it received on the disconnect edge. Both of its
+    /// `getDeviceInfo` fetches are mount-only, and `useConnectionStatus`
+    /// returns 'disconnected' whenever `deviceInfo.connection_status` says so
+    /// -- regardless of WebSocket health or `stale` clearing. The UI read
+    /// disconnected for the rest of the session while the radio worked fine.
+    ///
+    /// Proven by running this sequence against the old code: the disconnect
+    /// broadcast fired and the reconnect produced `[]`.
+    #[test]
+    fn a_reconnect_broadcasts_that_the_scanner_came_back() {
+        let state = crate::api::default_state();
+
+        // A live session.
+        update_device_info_from_mdl(&state, "MDL,BC125AT", "/dev/cu.test");
+        assert_eq!(
+            state.device.read().unwrap().connection_status,
+            "connected",
+            "precondition: connected after the first MDL"
+        );
+
+        let mut rx = state.ws_tx.subscribe();
+
+        // The scanner is unplugged.
+        mark_disconnected(&state, "unplugged");
+        let first = rx.try_recv().expect("a disconnect must broadcast");
+        assert!(
+            first.contains("\"connection_status\":\"disconnected\""),
+            "expected a disconnect broadcast, got {first}"
+        );
+        while rx.try_recv().is_ok() {} // drain state_stale
+
+        // It comes back. This mirrors what both poll loops do on a successful
+        // open -- port and diagnostics, but NOT the status -- and then the MDL
+        // reply arrives.
+        mark_port_opened(&state, "/dev/cu.test");
+        update_device_info_from_mdl(&state, "MDL,BC125AT", "/dev/cu.test");
+
+        let mut msgs = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            msgs.push(m);
+        }
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("\"connection_status\":\"connected\"")),
+            "the frontend must be told the scanner came back; broadcasts: {msgs:?}"
+        );
+    }
+
+    /// REGRESSION GUARD (#539): opening a port must NOT claim connected.
+    ///
+    /// This is the half the reconnect guard above cannot cover. That test
+    /// drives `mark_port_opened` too, but a test that instead rebuilt the
+    /// port-open sequence by hand would pass whether or not the real loops
+    /// still set the status -- measured: reintroducing
+    /// `connection_status = "connected"` into the serial loop left the whole
+    /// suite green until this assertion existed.
+    ///
+    /// "connected" has to mean "we know which radio this is". The channel-cache
+    /// capacity guard depends on it too: it cannot run before the model is
+    /// known, and `AppState::capabilities()` answers with the BC125AT default
+    /// until then.
+    #[test]
+    fn opening_a_port_does_not_claim_connected() {
+        let state = crate::api::default_state();
+        assert_eq!(
+            state.device.read().unwrap().connection_status,
+            "disconnected",
+            "precondition"
+        );
+
+        mark_port_opened(&state, "/dev/cu.test");
+
+        let d = state.device.read().unwrap();
+        assert_eq!(
+            d.connection_status, "disconnected",
+            "an open file descriptor is not a known scanner"
+        );
+        assert_eq!(
+            d.port.as_deref(),
+            Some("/dev/cu.test"),
+            "the port is recorded"
+        );
+    }
+
+    /// A scanner that never answers `MDL` still reports connected.
+    ///
+    /// Paired with the guard above so the fix cannot be "only announce a model
+    /// we recognise". The port is open and the poll loop is running, so the
+    /// honest status is connected even though the model is unknown -- that is
+    /// the pre-#539 behaviour and it must survive. Without this, a scanner
+    /// whose MDL is garbled reads as permanently disconnected, which is a
+    /// worse bug than the one being fixed.
+    #[test]
+    fn an_unidentified_scanner_still_reports_connected() {
+        let state = crate::api::default_state();
+        mark_connected_without_model(&state, "/dev/cu.test");
+
+        let d = state.device.read().unwrap();
+        assert_eq!(d.connection_status, "connected");
+        assert_eq!(d.port.as_deref(), Some("/dev/cu.test"));
+    }
+
+    /// REGRESSION GUARD (#414): connecting resolves a real profile, and the
+    /// cache is keyed on it rather than on the shared placeholder.
+    #[test]
+    fn connecting_resolves_a_profile_and_keys_the_cache_on_it() {
+        let state = crate::api::default_state();
+        assert_eq!(
+            state.scanner_id(),
+            "_default",
+            "precondition: no profile before the first MDL"
+        );
+
+        update_device_info_from_mdl(&state, "MDL,BC75XLT", "/dev/cu.test");
+
+        let id = state.scanner_id();
+        assert_ne!(id, "_default", "a connect must resolve a real profile");
+        assert_eq!(
+            state.device.read().unwrap().scanner_id.as_deref(),
+            Some(id.as_str()),
+            "the id must live on DeviceInfo, beside the model it was resolved with"
+        );
+    }
+
+    /// REGRESSION GUARD (#414): channels cached before profiles existed are
+    /// adopted onto the scanner they belong to, not orphaned.
+    ///
+    /// Everything cached pre-#414 sits under `_default`. Nothing looks that key
+    /// up any more, so without the move a user who upgrades silently loses
+    /// their cache and pays a re-sync on the next launch.
+    #[test]
+    fn pre_identity_cached_channels_are_adopted_on_connect() {
+        let state = crate::api::default_state();
+        // 300 rows, exactly a BC75XLT's memory.
+        crate::api::channel_cache::save_channels(
+            &state.preferences_db_path,
+            "_default",
+            &channel_map(300),
+            1_000_000_000.0,
+        );
+
+        update_device_info_from_mdl(&state, "MDL,BC75XLT", "/dev/cu.test");
+
+        let id = state.scanner_id();
+        assert_eq!(
+            crate::api::channel_cache::load_channels(&state.preferences_db_path, &id).len(),
+            300,
+            "the rows must now live under this scanner's profile"
+        );
+        assert!(
+            crate::api::channel_cache::load_channels(&state.preferences_db_path, "_default")
+                .is_empty(),
+            "and must no longer sit under the placeholder"
+        );
+        assert_eq!(
+            shadow_len(&state),
+            300,
+            "and must be loaded into the shadow"
+        );
+    }
+
+    /// REGRESSION GUARD (#414): a placeholder cache from a DIFFERENT radio is
+    /// left alone.
+    ///
+    /// Adoption is a one-way move. If a user's pre-#414 cache came from their
+    /// BC125AT and they plug the BC75XLT in first, re-keying blindly would hand
+    /// 500 BC125AT channels to the BC75XLT's profile -- where the capacity
+    /// guard discards them at load, and the BC125AT never finds them again
+    /// because they now live under someone else's key. Silent, permanent, and
+    /// exactly the shape of loss the whole cache exists to avoid.
+    ///
+    /// Paired with the guard above on purpose: asserting only that adoption
+    /// happens also passes for a build that adopts unconditionally.
+    #[test]
+    fn a_placeholder_cache_from_another_radio_is_not_adopted() {
+        let state = crate::api::default_state();
+        // 500 rows -- a BC125AT's memory, not a BC75XLT's.
+        crate::api::channel_cache::save_channels(
+            &state.preferences_db_path,
+            "_default",
+            &channel_map(500),
+            1_000_000_000.0,
+        );
+
+        update_device_info_from_mdl(&state, "MDL,BC75XLT", "/dev/cu.test");
+
+        assert_eq!(
+            crate::api::channel_cache::load_channels(&state.preferences_db_path, "_default").len(),
+            500,
+            "the other radio's cache must stay where the right scanner can find it"
+        );
+        assert_eq!(
+            shadow_len(&state),
+            0,
+            "and must not render on the wrong scanner"
+        );
+    }
+
+    /// REGRESSION GUARD (#571): a radio Bearpaw does not support never adopts
+    /// someone else's pre-#414 cache.
+    ///
+    /// Adoption used to turn on `max_index == channel_count` alone, and the
+    /// `_default` rows carry no model. `for_model_or_default` hands an
+    /// UNRECOGNISED model the BC125AT family's 500 channels, and this function
+    /// deliberately connects to unsupported radios rather than refusing them --
+    /// so plugging in anything that answers `MDL,<something>` presented as a
+    /// 500-channel radio and matched a BC125AT's placeholder cache exactly.
+    ///
+    /// The move is a one-way UPDATE. Afterwards the real BC125AT finds an empty
+    /// profile and re-syncs, while the stranger's UI renders 500 channels it
+    /// never had: `GET /channels` serves the shadow, and `export_csv` writes
+    /// them to the user's file as that radio's memory.
+    ///
+    /// The capacity test cannot answer this -- 500 == 500 is exactly what the
+    /// fallback produced. Recognition is a different question, so it is asked
+    /// separately, inside `adopt_placeholder_cache` rather than at this call
+    /// site: a guard on the data cannot be skipped by a future caller.
+    #[test]
+    fn an_unsupported_model_does_not_adopt_the_placeholder_cache() {
+        let state = crate::api::default_state();
+        // A BC125AT's memory, waiting for the BC125AT.
+        crate::api::channel_cache::save_channels(
+            &state.preferences_db_path,
+            "_default",
+            &channel_map(500),
+            1_000_000_000.0,
+        );
+
+        // An SDS100 is a real Uniden scanner Bearpaw does not support. It
+        // resolves through the fallback, so it claims 500 channels.
+        update_device_info_from_mdl(&state, "MDL,SDS100", "/dev/cu.test");
+
+        assert_eq!(
+            crate::api::channel_cache::load_channels(&state.preferences_db_path, "_default").len(),
+            500,
+            "the BC125AT's cache must stay where the BC125AT can still find it"
+        );
+        assert_eq!(
+            shadow_len(&state),
+            0,
+            "and must not render as the unsupported radio's own memory"
+        );
+    }
+
+    /// The positive half of #571, and not optional: the guard above also passes
+    /// for a build that never adopts anything at all.
+    ///
+    /// KNOWN AMBIGUITY, deliberately not closed here. Every model in the
+    /// BC125AT family -- BC125AT, BCT125AT, UBC125XLT, UBC126AT, AE125H -- has
+    /// 500 channels, so a user who owns two of them still gets one radio's
+    /// pre-identity cache attached to whichever they plug in first. Capacity
+    /// cannot separate them and the `_default` rows carry no model, so telling
+    /// them apart needs the model recorded at WRITE time -- impossible
+    /// retroactively, which is the whole nature of a migration path. Adoption
+    /// is a one-hop migration from a pre-#414 install, and the rows only ever
+    /// move to a radio that is at least the right family and capacity.
+    #[test]
+    fn a_supported_model_still_adopts_the_placeholder_cache() {
+        let state = crate::api::default_state();
+        crate::api::channel_cache::save_channels(
+            &state.preferences_db_path,
+            "_default",
+            &channel_map(500),
+            1_000_000_000.0,
+        );
+
+        update_device_info_from_mdl(&state, "MDL,BC125AT", "/dev/cu.test");
+
+        assert_eq!(
+            crate::api::channel_cache::load_channels(&state.preferences_db_path, "_default").len(),
+            0,
+            "a supported radio of the right capacity must still take the rows"
+        );
+        assert_eq!(
+            shadow_len(&state),
+            500,
+            "and must render them without paying for a re-sync"
+        );
+    }
+
+    /// A profile that already has its own channels is never overwritten by the
+    /// placeholder rows.
+    #[test]
+    fn adoption_never_overwrites_a_profile_that_has_memory() {
+        let state = crate::api::default_state();
+        update_device_info_from_mdl(&state, "MDL,BC75XLT", "/dev/cu.test");
+        let id = state.scanner_id();
+
+        // This profile already synced once.
+        crate::api::channel_cache::save_channels(
+            &state.preferences_db_path,
+            &id,
+            &channel_map(300),
+            2_000_000_000.0,
+        );
+        // And a stale placeholder set is still lying around.
+        crate::api::channel_cache::save_channels(
+            &state.preferences_db_path,
+            "_default",
+            &channel_map(300),
+            1_000_000_000.0,
+        );
+
+        let moved = crate::api::channel_cache::adopt_placeholder_cache(
+            &state.preferences_db_path,
+            &id,
+            "BC75XLT",
+            300,
+        );
+
+        assert_eq!(
+            moved, 0,
+            "a profile with its own memory must not be rewritten"
+        );
+        assert_eq!(
+            crate::api::channel_cache::last_synced_at(&state.preferences_db_path, &id),
+            Some(2_000_000_000.0),
+            "its own, newer sync time must survive"
+        );
+    }
+    /// REGRESSION GUARD: a device that VANISHED must never be announced as
+    /// connected.
+    ///
+    /// Both MDL retry loops break out early when the transport reports the
+    /// device is gone, and the very next statement used to run the
+    /// "connected, model unknown" fallback -- so the one branch that had just
+    /// learned the scanner left was the branch that said it arrived. Harmless
+    /// while nothing listened; #551 made that state BROADCAST, which turns a
+    /// wedged link (the documented USB STALL wedge) into a connect/disconnect
+    /// storm at reconnect-backoff rate, roughly 2 Hz.
+    ///
+    /// Asserted on the predicate rather than the loop because `run_poll_loop`
+    /// has no fake transport. A guard on `mark_connected_without_model` alone
+    /// cannot see which branch called it -- which is how this shipped.
+    #[test]
+    fn a_vanished_device_is_never_announced_as_connected() {
+        // The scanner is still there, just not answering intelligibly. The
+        // port is open and about to be polled, so connected-with-no-model is
+        // the honest report -- this is the #539 case the fallback exists for.
+        assert!(
+            should_announce_connect(false, false),
+            "a garbled MDL must still report connected"
+        );
+
+        // The transport said the device is gone. Saying "connected" here is a
+        // lie the poll loop will contradict within a tick.
+        assert!(
+            !should_announce_connect(false, true),
+            "a vanished device must NOT be announced as connected"
+        );
+
+        // A successful MDL means update_device_info_from_mdl already announced
+        // it, with a model. The fallback must not fire a second time.
+        assert!(!should_announce_connect(true, false));
+        assert!(!should_announce_connect(true, true));
+    }
+
+    /// REGRESSION GUARD (#513): the wedge and an unplug are told apart by WHERE
+    /// the failure happened, not by what it says.
+    ///
+    /// This predicate reads a "device gone" verdict as a wedge, which sounds
+    /// backwards until you notice it is only ever consulted AFTER `open()`
+    /// found the scanner on the bus, opened it and claimed its interface. A
+    /// device that is actually absent fails at `open()` with `NotFound` and
+    /// never arrives here. What arrived here in #513 was `rusb::Error::Io` —
+    /// which `is_device_gone` folds in with the real ones, correctly for every
+    /// other caller — from a pipe that has quietly stopped carrying data.
+    ///
+    /// Asserted on the predicate rather than the loop for the same reason as
+    /// `a_vanished_device_is_never_announced_as_connected` above: `rusb`'s
+    /// `DeviceHandle` is a thin FFI wrapper with no injectable backend, so
+    /// neither the wedge nor the reset can be produced in a test. The DECISION
+    /// is pinned here; the reset's effect on hardware is verified by hand.
+    #[test]
+    fn a_claimed_device_that_says_gone_on_the_first_read_is_wedged() {
+        // The #513 report, exactly: open and claim succeed, the first MDL read
+        // returns Input/Output Error. The replug is the only confirmed cure;
+        // re-enumeration is that replug in software.
+        assert!(
+            is_wedged_after_open(false, true, false),
+            "a claimed device reporting gone on its first read is wedged, not absent"
+        );
+
+        // A garbled-but-answering scanner is the #539 case: it is talking, the
+        // bytes are just wrong. Re-enumerating a working pipe would turn a
+        // cosmetic fault into a dropped session.
+        assert!(
+            !is_wedged_after_open(false, false, false),
+            "a garbled MDL is not a wedge — the pipe is carrying data"
+        );
+
+        // MDL answered. Nothing to heal.
+        assert!(!is_wedged_after_open(true, false, false));
+        assert!(!is_wedged_after_open(true, true, false));
+
+        // Bounded to one reset per episode. A scanner powered off but still
+        // attached also opens, claims and then cannot talk — and would
+        // otherwise be re-enumerated on every reconnect until someone switched
+        // it back on.
+        assert!(
+            !is_wedged_after_open(false, true, true),
+            "the reset must not repeat while the episode is unresolved"
+        );
+    }
+
+    /// REGRESSION GUARD: a DIFFERENT radio must not inherit the last one's
+    /// channels, and must not overwrite its profile with them.
+    ///
+    /// Found by review, then reproduced: connect a BC75XLT, sync 300 channels,
+    /// then connect a BC125AT on the same port string. Nothing clears
+    /// `shadow.channels` on disconnect, so the BC75XLT's map was still in
+    /// memory; `load_channel_cache` declined to load ("a populated shadow
+    /// wins", which is correct for a reconnect of the SAME radio) so the
+    /// capacity guard never saw it; and the next flush wrote those 300
+    /// channels under the BC125AT's `scanner_id`, DELETEing that profile's own
+    /// rows first.
+    ///
+    /// Reachable wherever two units share a port string across a replug -- two
+    /// CP210x radios both landing on `/dev/ttyUSB0`. Two same-capacity units
+    /// are the worst case: the capacity guard cannot catch it on the next
+    /// launch either, because the counts match.
+    ///
+    /// The existing reconnect guard passes both connects the SAME model, so it
+    /// exercised a same-radio reconnect and never an identity change. This is
+    /// the case no test in the suite covered.
+    #[test]
+    fn a_different_radio_does_not_inherit_the_last_ones_channels() {
+        let state = crate::api::default_state();
+
+        // Radio A: 300 channels, synced and persisted.
+        update_device_info_from_mdl(&state, "MDL,BC75XLT", "/dev/ttyUSB0");
+        let id_a = state.scanner_id();
+        {
+            let mut shadow = state.shadow.write().unwrap();
+            shadow.channels = channel_map(300);
+            shadow.last_sync = 1_000_000_000.0;
+        }
+        crate::api::channel_cache::flush_channel_cache(&state);
+
+        // Radio B arrives on the same port string.
+        update_device_info_from_mdl(&state, "MDL,BC125AT", "/dev/ttyUSB0");
+        let id_b = state.scanner_id();
+        assert_ne!(id_a, id_b, "precondition: a different radio");
+
+        assert_eq!(
+            shadow_len(&state),
+            0,
+            "the departed radio's channels must not still be in memory"
+        );
+
+        // And a flush must not write them into B's profile.
+        crate::api::channel_cache::flush_channel_cache(&state);
+        assert!(
+            crate::api::channel_cache::load_channels(&state.preferences_db_path, &id_b).is_empty(),
+            "the new radio's profile must not be filled with the old radio's channels"
+        );
+        assert_eq!(
+            crate::api::channel_cache::load_channels(&state.preferences_db_path, &id_a).len(),
+            300,
+            "and the departed radio's own cache must survive intact"
+        );
+    }
+
+    /// Paired with the guard above: reconnecting the SAME radio must KEEP its
+    /// channels. Clearing unconditionally would throw away live edits on every
+    /// USB blip -- a flapping link reconnects every few seconds.
+    #[test]
+    fn the_same_radio_reconnecting_keeps_its_channels() {
+        let state = crate::api::default_state();
+        update_device_info_from_mdl(&state, "MDL,BC75XLT", "/dev/ttyUSB0");
+        state.shadow.write().unwrap().channels = channel_map(300);
+
+        mark_disconnected(&state, "unplugged");
+        update_device_info_from_mdl(&state, "MDL,BC75XLT", "/dev/ttyUSB0");
+
+        assert_eq!(
+            shadow_len(&state),
+            300,
+            "the same radio's live channel memory must survive a replug"
+        );
+    }
+
+    /// Ceiling for `wait_until` below, not a tuning knob. The two guards that
+    /// use it assert a state transition a correct loop reaches in milliseconds
+    /// on Linux and in about a second on macOS, where `UsbTransport::open`
+    /// pays for a full libusb `Context::new()` and bus enumeration before it
+    /// can report "no such device". A build carrying the #513 bug never
+    /// reaches it at all — so this is how long a FAILING run takes, and has no
+    /// bearing on how long a passing one does.
+    ///
+    /// This replaced a fixed 900 ms sleep that sampled the transition at an
+    /// arbitrary instant (#623). The sleep was tuned for the liveness half of
+    /// the guard, where longer is safer, and silently raced the diagnostic
+    /// half, where longer is *required*: on macOS with no scanner attached the
+    /// first enumeration outran it and `diagnostic_code` was still `None` when
+    /// the assertion fired. It failed on the one platform whose users actually
+    /// take the USB path.
+    const OPEN_FAILURE_WAIT: Duration = Duration::from_secs(15);
+
+    /// One full `RECONNECT_BACKOFF_INITIAL_MS` plus slack. The loop must
+    /// survive this window AFTER its first failed open to have demonstrably
+    /// retried rather than returned.
+    const RETRY_INTERVAL_OBSERVE: Duration =
+        Duration::from_millis(RECONNECT_BACKOFF_INITIAL_MS + 200);
+
+    /// Poll `predicate` until it holds or `timeout` elapses; report whether it
+    /// held. A bounded wait, unlike a sleep, cannot pass or fail on how busy
+    /// the host was — it only reports sooner or later.
+    fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if predicate() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// True once a failed open has been reported through `mark_disconnected`.
+    fn reported_disconnected(state: &AppState) -> bool {
+        let device = state.device.read().expect("device lock");
+        device.connection_status == "disconnected"
+            && device.diagnostic_code.as_deref() == Some("scanner_disconnected")
+    }
+
+    /// REGRESSION GUARD (#513): a failed open must RETRY, not end the loop.
+    ///
+    /// `run_poll_loop` used to `return Err` when the very first open failed, so
+    /// starting Bearpaw while the scanner was unplugged — or wedged — left the
+    /// process serving a permanently disconnected API, recoverable only by
+    /// relaunching. A device that vanished MID-session was handled correctly;
+    /// the first open was the one path with no retry.
+    ///
+    /// Both loop functions carried this guard as a COMMENT ONLY, with no test,
+    /// until this one. That matters because the supervisor restructure in #416
+    /// moves exactly this code, and a regression here is silent: it presents as
+    /// "Bearpaw won't reconnect after I unplugged it", which is the original
+    /// #513 report.
+    ///
+    /// Two observables, in this order, because they need opposite timing and a
+    /// single sleep cannot serve both (#623):
+    ///
+    /// 1. The failure is reported through `mark_disconnected` — an UPPER bound,
+    ///    waited for, since restoring the `return Err` never reports it at all.
+    /// 2. The thread is still running one retry interval later — a LOWER bound,
+    ///    since the bug ends it almost immediately and the fix never ends it.
+    ///
+    /// Mutation-verified in both directions before this landed.
+    ///
+    /// NOTE: the spawned thread is deliberately detached and runs for the life
+    /// of the test binary; its stop flag is never set, so that the lower-bound
+    /// check below measures the retry and not a stop. It settles at one failed
+    /// open per `RECONNECT_BACKOFF_MAX_MS` (5 s), which costs nothing
+    /// measurable.
+    #[test]
+    fn a_failed_serial_open_retries_instead_of_ending_the_loop() {
+        let state = device_only_state();
+        let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let loop_state = state.clone();
+
+        let handle = thread::spawn(move || {
+            run_poll_loop(
+                loop_state,
+                "/dev/bearpaw-nonexistent-test-port",
+                115_200,
+                false,
+                cmd_rx,
+                &AtomicBool::new(false),
+            )
+        });
+
+        // The failure goes through `mark_disconnected`, not the fatal exit
+        // path. That is what makes it MORE visible than the old behaviour: it
+        // sets `diagnostic_code` and the liveState `stale` flag the frontend
+        // keys its disconnect UI on, which the old `return Err` path did not.
+        assert!(
+            wait_until(OPEN_FAILURE_WAIT, || reported_disconnected(&state)),
+            "the retry path must report through mark_disconnected; nothing did \
+             within {:?}, which is what restoring the #513 `return Err` looks \
+             like — the loop leaves without saying why",
+            OPEN_FAILURE_WAIT
+        );
+        assert!(
+            state.live.read().expect("live lock").stale,
+            "mark_disconnected must flag liveState stale so the disconnect UI fires"
+        );
+
+        thread::sleep(RETRY_INTERVAL_OBSERVE);
+        assert!(
+            !handle.is_finished(),
+            "a failed serial open must retry; the loop ended instead, which is \
+             the #513 bug — Bearpaw serves a permanently disconnected API until \
+             it is relaunched"
+        );
+    }
+
+    /// REGRESSION GUARD (#513), USB half — paired with
+    /// `a_failed_serial_open_retries_instead_of_ending_the_loop`.
+    ///
+    /// The two loop functions are separate ~310-line bodies carrying duplicated
+    /// copies of this guard, so a fix or a regression in one does not touch the
+    /// other. Pinning only the serial half would stay green for a build where
+    /// the USB path — the one macOS actually uses for a BC125AT — kills its
+    /// thread on a failed open. That is the exact shape the original report
+    /// described: "this logged `Poll loop exited: usb device not found` once and
+    /// the thread ended, so plugging the scanner back in did nothing."
+    ///
+    /// This is also the half that was environment-dependent under the old fixed
+    /// sleep (#623): it is the one whose open cost is a libusb enumeration, so
+    /// it is the one that outran a 900 ms sample on macOS.
+    #[test]
+    fn a_failed_usb_open_retries_instead_of_ending_the_loop() {
+        let state = device_only_state();
+        let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let loop_state = state.clone();
+
+        // Not an assigned USB vendor id, so this cannot collide with hardware
+        // attached to the machine running the suite.
+        let handle = thread::spawn(move || {
+            run_poll_loop_usb(loop_state, 0xFFFF, 0xFFFF, cmd_rx, &AtomicBool::new(false))
+        });
+
+        assert!(
+            wait_until(OPEN_FAILURE_WAIT, || reported_disconnected(&state)),
+            "the retry path must report through mark_disconnected; nothing did \
+             within {:?}, on the transport macOS uses for a BC125AT",
+            OPEN_FAILURE_WAIT
+        );
+
+        thread::sleep(RETRY_INTERVAL_OBSERVE);
+        assert!(
+            !handle.is_finished(),
+            "a failed USB open must retry; the loop ended instead, which is the \
+             #513 bug on the transport macOS uses for a BC125AT"
+        );
+    }
+
+    /// REGRESSION GUARD (#688): a stopped poll loop ends, on both transports.
+    ///
+    /// Shutdown used to stop only the HTTP server, so the process exited with
+    /// this thread mid-poll and the USB interface still claimed. Driven through
+    /// `spawn_poll_loop`, the entry point `run_server_with_shutdown` uses, so a
+    /// handle that is never wired to the loop fails here too.
+    ///
+    /// No scanner is attached, so these exercise the stop check in the
+    /// reconnect loop. The check inside a live session cannot be reached
+    /// without hardware (`rusb` has no injectable backend); it needs a real
+    /// scanner to verify.
+    fn assert_stops(target: &str) {
+        let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let handle = spawn_poll_loop(
+            device_only_state(),
+            target.to_string(),
+            115_200,
+            false,
+            cmd_rx,
+        );
+        // Let it reach the reconnect backoff first, so the stop has to be
+        // observed by a running loop rather than before it began.
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            handle.stop_and_join(Duration::from_secs(3)),
+            "a stopped poll loop on {target} must end; it kept running, which is \
+             the #688 bug -- the process exits with the scanner session mid-transfer"
+        );
+    }
+
+    #[test]
+    fn a_stopped_serial_poll_loop_ends() {
+        assert_stops("/dev/bearpaw-nonexistent-test-port");
+    }
+
+    /// REGRESSION GUARD (#688): a reconnect backoff wakes on stop. At its 5 s
+    /// cap a plain sleep outlasts `POLL_LOOP_STOP_TIMEOUT`, so quitting with the
+    /// scanner unplugged would time out instead of stopping.
+    #[test]
+    fn a_reconnect_backoff_ends_early_when_stopped() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let setter = stop.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            setter.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        sleep_unless_stopped(Duration::from_millis(RECONNECT_BACKOFF_MAX_MS), &stop);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a 5 s backoff must end soon after stop; it took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_stopped_usb_poll_loop_ends() {
+        // Not an assigned USB vendor id; see the #513 USB guard above.
+        assert_stops("usb:ffff:ffff");
     }
 }

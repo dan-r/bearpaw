@@ -9,6 +9,7 @@ import {
   deriveBankFromIndex,
   visibleChannelColumns,
   channelGridTemplate,
+  reconcileUntouchedFields,
 } from '../ChannelsTab';
 import capabilityFixture from '../../../../test/fixtures/scanner-capabilities.json';
 import { createTestChannel, createTestChannelDraft } from '../../../../test/fixtures';
@@ -424,6 +425,69 @@ describe('ChannelsTab', () => {
       });
     });
 
+    // REGRESSION GUARD (#625): a settings restore that skipped settings must
+    // not report an unqualified success.
+    //
+    // `import_bc75xlt_ss` applied no settings at all and returned
+    // `settings_applied: 0`, which this handler ignored -- so the toast read
+    // "Config restored" while the file's bank mask, priority and Close Call
+    // values were never written. The backend now NAMES what it refused, and
+    // the toast has to carry those names or the report is decorative.
+    it('should name the settings the scanner could not accept', async () => {
+      vi.mocked(pickAndReadFile).mockResolvedValue({
+        name: 'scanner.bc75xlt_ss',
+        bytes: new TextEncoder().encode('Misc\tK+S'),
+      });
+      vi.mocked(confirmDialog).mockResolvedValue(true);
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: vi.fn().mockResolvedValue({
+          imported: 300,
+          settings_applied: 6,
+          settings_skipped: [
+            { command: 'BLT', label: 'Backlight' },
+            { command: 'SSG', label: 'Service search groups' },
+          ],
+          errors: [],
+        }),
+      }) as unknown as typeof fetch;
+      mockApiClient.getChannels = vi.fn().mockResolvedValue(mockChannels);
+
+      render(<ChannelsTab />);
+      await userEvent.click(screen.getByRole('button', { name: /Import/i }));
+
+      await waitFor(() => expect(toast.success).toHaveBeenCalled());
+      const message = vi.mocked(toast.success).mock.calls[0][0] as string;
+      expect(message).toContain('Backlight');
+      expect(message).toContain('Service search groups');
+      expect(message).toContain('300');
+    });
+
+    // The paired half: a restore that skipped NOTHING must stay a clean
+    // success. Asserting only the message above passes for a build that
+    // appends "Not supported by this scanner: ." to every restore.
+    it('should report a clean success when nothing was skipped', async () => {
+      vi.mocked(pickAndReadFile).mockResolvedValue(pickedSs());
+      vi.mocked(confirmDialog).mockResolvedValue(true);
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: vi.fn().mockResolvedValue({
+          imported: 500,
+          settings_applied: 12,
+          settings_skipped: [],
+          errors: [],
+        }),
+      }) as unknown as typeof fetch;
+      mockApiClient.getChannels = vi.fn().mockResolvedValue(mockChannels);
+
+      render(<ChannelsTab />);
+      await userEvent.click(screen.getByRole('button', { name: /Import/i }));
+
+      await waitFor(() => expect(toast.success).toHaveBeenCalled());
+      const message = vi.mocked(toast.success).mock.calls[0][0] as string;
+      expect(message).toBe('Config restored (500 channels)');
+    });
+
     it('should not import a .ss file when the confirm is declined', async () => {
       vi.mocked(pickAndReadFile).mockResolvedValue(pickedSs());
       vi.mocked(confirmDialog).mockResolvedValue(false);
@@ -476,6 +540,31 @@ describe('ChannelsTab', () => {
 
       await waitFor(() => {
         expect(toast.error).toHaveBeenCalledWith('Failed to export channels');
+      });
+    });
+
+    // REGRESSION GUARD (#639): an export refused because channel memory is
+    // incomplete must SAY SO.
+    //
+    // The backend refuses rather than inventing the missing rows, but every
+    // export handler collapsed non-200 into "Failed to export", which reads as
+    // a broken app rather than an action the user can take. The generic case
+    // above is the paired half: a build that returns the sync message for
+    // every failure passes this one alone.
+    it('should tell the user to sync when the channel image is incomplete', async () => {
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: false,
+        json: vi.fn().mockResolvedValue({ error: 'memory_not_synced', code: 409 }),
+      } as unknown as Response);
+
+      render(<ChannelsTab />);
+      await userEvent.click(screen.getByRole('button', { name: /Export/i }));
+      await userEvent.click(await screen.findByRole('menuitem', { name: /^CSV$/i }));
+
+      await waitFor(() => {
+        expect(toast.error).toHaveBeenCalledWith(
+          'Sync scanner memory before exporting — the channel list is incomplete',
+        );
       });
     });
   });
@@ -760,6 +849,50 @@ describe('ChannelsTab', () => {
       expect(row).not.toHaveAttribute('data-cleared');
       // ...and it is not stuck showing as an ordinary pending edit either.
       expect(row).not.toHaveClass('bg-brand-primary/10');
+    });
+
+    // REGRESSION GUARD: a channel nobody has touched is not pending.
+    //
+    // A BC75XLT reserves the CIN modulation field, so the backend reports an
+    // EMPTY STRING for every channel. `draftChanges` normalised its own side
+    // with `?? 'AUTO'` -- which only falls through on null/undefined, so ''
+    // survived it -- while comparing against `channel.modulation || 'AUTO'`,
+    // where '' does not. The two sides normalised the same value differently,
+    // so every channel compared as changed: all 300 sat permanently in
+    // pendingChannelIds and Upload Changes would have rewritten every one.
+    //
+    // Asserts with NO drafts at all, which is the state right after a memory
+    // sync -- the moment the bug was reported from.
+    it('leaves untouched channels non-pending when the model reports no modulation', () => {
+      setMockStore(
+        createMockStore({
+          // Exactly what the backend returns for a BC75XLT: modulation ''.
+          channels: [
+            createTestChannel({ index: 1, frequency: 145.13, modulation: '', alpha_tag: '' }),
+            createTestChannel({ index: 2, frequency: 146.955, modulation: '', alpha_tag: '' }),
+          ],
+          memoryDrafts: {},
+        }),
+      );
+
+      render(<ChannelsTab />);
+
+      expect(screen.getByRole('button', { name: /Upload Changes/i })).toBeDisabled();
+    });
+
+    // The paired half: a model that DOES report modulation must still compare
+    // equal when untouched, so the fix cannot be "always normalise to AUTO".
+    it('leaves untouched channels non-pending when the model reports modulation', () => {
+      setMockStore(
+        createMockStore({
+          channels: [createTestChannel({ index: 1, frequency: 145.13, modulation: 'NFM' })],
+          memoryDrafts: {},
+        }),
+      );
+
+      render(<ChannelsTab />);
+
+      expect(screen.getByRole('button', { name: /Upload Changes/i })).toBeDisabled();
     });
 
     // REGRESSION GUARD (#272): the end-to-end half of the buildEmptyDraft
@@ -1103,6 +1236,345 @@ describe('ChannelsTab', () => {
       expect(screen.getByRole('button', { name: /reorder channel 1/i })).toBeDisabled();
     });
   });
+
+  describe('post-write verification failures are recovered, not reported (#556)', () => {
+    // The upload's recovery branch checked `channel_write_mismatch` -- a string
+    // that exists NOWHERE in the Rust crate. It was dead code, and not
+    // decoration: it re-reads the channel and, when the primary fields match,
+    // treats the write as SUCCEEDED.
+    //
+    // What the backend really emits after an acknowledged CIN whose readback
+    // disagrees is `channel_not_persisted` (mod.rs:2181). mod.rs:2078 records
+    // one on hardware -- a cleared slot on a BC75XLT returned 400 after the
+    // write had already landed. Users saw "Failed to upload N channel edits"
+    // for writes that worked.
+
+    const uploadOneEdit = async (failWith: string, refreshed: ChannelData) => {
+      const target = createTestChannel({ index: 1, frequency: 151.25, bank: 1, alpha_tag: 'Old' });
+      setMockStore(
+        createMockStore({
+          channels: [target],
+          memoryDrafts: {
+            1: createTestChannelDraft({ ...buildDraft(target), alpha_tag: 'New' }),
+          },
+        }),
+      );
+      mockApiClient.startProgramMode = vi.fn().mockResolvedValue(undefined);
+      mockApiClient.endProgramMode = vi.fn().mockResolvedValue(undefined);
+      mockApiClient.getChannel = vi.fn().mockResolvedValue(refreshed);
+      mockApiClient.updateChannel = vi
+        .fn()
+        .mockRejectedValue({ payload: { detail: failWith }, message: failWith });
+      mockApiClient.getChannels = vi.fn().mockResolvedValue([refreshed]);
+
+      render(<ChannelsTab />);
+      await userEvent.click(screen.getByRole('button', { name: /Upload Changes/i }));
+      await waitFor(() => expect(mockApiClient.endProgramMode).toHaveBeenCalled());
+    };
+
+    it('treats channel_not_persisted as success when the scanner has the new value', async () => {
+      // The write landed; only the verification disagreed.
+      await uploadOneEdit(
+        'channel_not_persisted',
+        createTestChannel({ index: 1, frequency: 151.25, bank: 1, alpha_tag: 'New' }),
+      );
+
+      // Twice: once by the pre-write reconciliation (#549), once by the
+      // recovery re-read.
+      expect(mockApiClient.getChannel).toHaveBeenCalledTimes(2);
+      expect(toast.error).not.toHaveBeenCalledWith(expect.stringMatching(/Failed to upload/i));
+    });
+
+    it('still reports a failure when the scanner does NOT have the new value', async () => {
+      // Paired on purpose: recovering unconditionally would report every failed
+      // write as a success, which is worse than the bug being fixed.
+      await uploadOneEdit(
+        'channel_not_persisted',
+        createTestChannel({ index: 1, frequency: 151.25, bank: 1, alpha_tag: 'Old' }),
+      );
+
+      expect(toast.error).toHaveBeenCalledWith(expect.stringMatching(/Failed to upload/i));
+    });
+
+    it('does not recover from a write the scanner refused outright', async () => {
+      // `channel_write_rejected` fires BEFORE anything is written, so
+      // re-reading would only confirm the old value. The honest report is a
+      // failure, and re-reading would be a pointless round trip.
+      await uploadOneEdit(
+        'channel_write_rejected',
+        createTestChannel({ index: 1, frequency: 151.25, bank: 1, alpha_tag: 'Old' }),
+      );
+
+      // ONCE, not twice: the pre-write reconciliation (#549) still reads the
+      // channel, but no recovery re-read follows. Asserting "not called" would
+      // be wrong -- and asserting nothing about the count would pass for a
+      // build that recovers from every error.
+      expect(mockApiClient.getChannel).toHaveBeenCalledTimes(1);
+      expect(toast.error).toHaveBeenCalledWith(expect.stringMatching(/Failed to upload/i));
+    });
+  });
+
+  describe('channel staleness and Refresh (#413)', () => {
+    // Since #413 the channel list can be a cache of arbitrary age, adopted at
+    // connect with no sync at all. The page where a user EDITS channels is
+    // where that age has to be visible and correctable -- the same reasoning
+    // DeviceTab records for its own Refresh control.
+
+    const withSync = (partial: Record<string, unknown>) => {
+      setMockStore(
+        createMockStore({
+          channels: mockChannels,
+          sync: {
+            inProgress: false,
+            hasSyncedInitially: false,
+            taskId: null,
+            message: '',
+            percent: 0,
+            syncedAt: null,
+            ...partial,
+          },
+        }),
+      );
+    };
+
+    it('shows how old the channel list is', () => {
+      withSync({ syncedAt: Date.now() / 1000 - 3 * 86400 });
+      render(<ChannelsTab />);
+      expect(screen.getByText('Synced 3d ago')).toBeInTheDocument();
+    });
+
+    it('offers a Refresh that re-reads the scanner', async () => {
+      withSync({ syncedAt: Date.now() / 1000 - 3 * 86400 });
+      mockApiClient.syncMemory = vi
+        .fn()
+        .mockResolvedValue({ status: 'started', task_id: 'sync-test' });
+
+      render(<ChannelsTab />);
+      await userEvent.click(screen.getByRole('button', { name: /Refresh/i }));
+
+      expect(mockApiClient.syncMemory).toHaveBeenCalled();
+    });
+
+    it('hides the control entirely when memory has never been read', () => {
+      // null is a fresh install, or a cache the capacity guard rejected. A
+      // sync is almost always already running then, so the affordance would
+      // offer to start something that is underway.
+      withSync({ syncedAt: null });
+      render(<ChannelsTab />);
+      expect(screen.queryByRole('button', { name: /Refresh/i })).not.toBeInTheDocument();
+    });
+
+    it('disables Refresh while a sync is already running', () => {
+      // A second POST returns already_running, so this is a UI-honesty guard
+      // rather than a correctness one -- but a button that appears to do
+      // nothing reads as broken.
+      withSync({ syncedAt: Date.now() / 1000 - 3 * 86400, inProgress: true });
+      render(<ChannelsTab />);
+      expect(screen.getByRole('button', { name: /Reading/i })).toBeDisabled();
+    });
+  });
+
+  describe('the pre-upload re-read is not skipped for a lockout edit (#573)', () => {
+    // #549 re-reads each channel before writing so a field the user did NOT
+    // edit carries the scanner's value rather than the draft's cached basis.
+    // That re-read lived inside `if (!change.lockoutChanged)`, so ticking L/O
+    // -- an ordinary batched draft edit, not an immediate action (see the
+    // LOCKOUT note in the row-render loop) -- skipped it entirely and the CIN
+    // write pushed the cached frequency back over a keypad retune.
+    //
+    // This exercises `handleUploadDrafts`, not `reconcileUntouchedFields` in
+    // isolation. The function was always correct; the call site never reached
+    // it. Asserting the helper again passes for a build that never calls it --
+    // the vacuous shape CLAUDE.md already records.
+    //
+    // The channel is index 1 on purpose. `reorderTargets` maps a channel to
+    // its POSITION in the bank, so a lone channel in bank 1 always targets
+    // index 1 -- numbering it anything else would make `targetIndex !==
+    // channelIndex` and drag the reorder path into a test about lockout.
+    const uploadLockoutEditOverKeypadRetune = async () => {
+      // The cache says 154.100. The radio was retuned to 155.400 on its own
+      // keypad, which 45% of users do "all the time" (poll, n=20, 2026-08-30).
+      const cached = createTestChannel({
+        index: 1,
+        frequency: 154.1,
+        bank: 1,
+        alpha_tag: 'Fire 1',
+        lockout: false,
+      });
+      const onScanner = createTestChannel({
+        index: 1,
+        frequency: 155.4,
+        bank: 1,
+        alpha_tag: 'Fire 1',
+        lockout: false,
+      });
+
+      setMockStore(
+        createMockStore({
+          channels: [cached],
+          // The L/O tick is the ONLY edit in the batch.
+          memoryDrafts: {
+            1: createTestChannelDraft({ ...buildDraft(cached), lockout: true }),
+          },
+        }),
+      );
+      mockApiClient.startProgramMode = vi.fn().mockResolvedValue(undefined);
+      mockApiClient.endProgramMode = vi.fn().mockResolvedValue(undefined);
+      mockApiClient.getChannel = vi.fn().mockResolvedValue(onScanner);
+      mockApiClient.updateChannel = vi.fn().mockResolvedValue(onScanner);
+      mockApiClient.getChannels = vi.fn().mockResolvedValue([onScanner]);
+
+      render(<ChannelsTab />);
+      await userEvent.click(screen.getByRole('button', { name: /Upload Changes/i }));
+      await waitFor(() => expect(mockApiClient.endProgramMode).toHaveBeenCalled());
+    };
+
+    it('re-reads and adopts the scanner frequency when the batch includes a lockout edit', async () => {
+      await uploadLockoutEditOverKeypadRetune();
+
+      expect(mockApiClient.getChannel).toHaveBeenCalledWith(1);
+      expect(mockApiClient.updateChannel).toHaveBeenCalledWith(
+        1,
+        expect.objectContaining({ frequency: 155.4 }),
+      );
+    });
+
+    it('does not let the re-read clobber the staged lockout edit', async () => {
+      await uploadLockoutEditOverKeypadRetune();
+
+      // The scanner reports lockout:false; the user just ticked it on. Adopting
+      // `latest.lockout` unconditionally would discard the only edit in the
+      // batch -- the half-fix the frequency assertion alone would accept.
+      expect(mockApiClient.updateChannel).toHaveBeenCalledWith(
+        1,
+        expect.objectContaining({ lockout: true }),
+      );
+    });
+  });
+
+  describe('collision-safe reorder upload (#618)', () => {
+    const uploadPermutation = async (sourceIndex: number, arrowUps: number) => {
+      const cached = [
+        createTestChannel({
+          index: 1,
+          bank: 1,
+          alpha_tag: 'Alpha',
+          frequency: 145.1,
+          modulation: 'FM',
+          tone_squelch: 123,
+          tone_squelch_kind: 'ctcss',
+          delay: -5,
+          lockout: true,
+          priority: false,
+        }),
+        createTestChannel({
+          index: 2,
+          bank: 1,
+          alpha_tag: 'Bravo',
+          frequency: 146.2,
+          modulation: 'NFM',
+          tone_squelch: null,
+          tone_squelch_kind: 'dcs',
+          tone_dcs_code: 23,
+          delay: 2,
+          lockout: false,
+          priority: true,
+        }),
+        createTestChannel({
+          index: 3,
+          bank: 1,
+          alpha_tag: 'Charlie',
+          frequency: 147.3,
+          modulation: 'AM',
+          tone_squelch: null,
+          tone_squelch_kind: 'search',
+          delay: 0,
+          lockout: false,
+          priority: false,
+        }),
+      ];
+      // Alpha was edited from the keypad after Bearpaw's cached sync. A
+      // reorder touches no fields, so the scanner's newer value must travel
+      // with this source channel to its new slot.
+      const scannerSources = cached.map((channel) => ({ ...channel }));
+      scannerSources[0] = {
+        ...scannerSources[0],
+        alpha_tag: 'Alpha keypad',
+        frequency: 145.9875,
+        delay: -10,
+      };
+      const scannerMemory = new Map(scannerSources.map((channel) => [channel.index, channel]));
+
+      setMockStore(createMockStore({ channels: cached }));
+      mockApiClient.startProgramMode = vi.fn().mockResolvedValue(undefined);
+      mockApiClient.endProgramMode = vi.fn().mockResolvedValue(undefined);
+      mockApiClient.getChannel = vi.fn(async (index: number) => ({
+        ...scannerMemory.get(index)!,
+      }));
+      mockApiClient.updateChannel = vi.fn(
+        async (index: number, payload: Omit<ChannelData, 'index'>) => {
+          const updated = { ...payload, index } as ChannelData;
+          scannerMemory.set(index, updated);
+          return { ...updated };
+        },
+      );
+      mockApiClient.getChannels = vi.fn(async () =>
+        [...scannerMemory.values()].sort((a, b) => a.index - b.index),
+      );
+
+      render(<ChannelsTab />);
+      const grip = screen.getByRole('button', {
+        name: new RegExp(`reorder channel ${sourceIndex}, position ${sourceIndex} of 3`, 'i'),
+      });
+      grip.focus();
+      await userEvent.keyboard('{Enter}');
+      for (let move = 0; move < arrowUps; move += 1) {
+        await userEvent.keyboard('{ArrowUp}');
+      }
+      await userEvent.keyboard('{Enter}');
+      await userEvent.click(screen.getByRole('button', { name: /Upload Changes/i }));
+      await waitFor(() => expect(mockApiClient.endProgramMode).toHaveBeenCalled());
+
+      return { scannerMemory, scannerSources };
+    };
+
+    const expectPermutation = (
+      scannerMemory: Map<number, ChannelData>,
+      expectedSources: ChannelData[],
+    ) => {
+      const channelSemantics = (channel: ChannelData) => ({
+        index: channel.index,
+        frequency: channel.frequency,
+        alpha_tag: channel.alpha_tag,
+        modulation: channel.modulation,
+        delay: channel.delay,
+        lockout: channel.lockout,
+        priority: channel.priority,
+        bank: channel.bank,
+        tone_squelch: channel.tone_squelch ?? null,
+        tone_squelch_kind: channel.tone_squelch_kind ?? 'none',
+        tone_dcs_code: channel.tone_dcs_code ?? null,
+      });
+      expectedSources.forEach((source, offset) => {
+        expect(channelSemantics(scannerMemory.get(offset + 1)!)).toEqual(
+          channelSemantics({ ...source, index: offset + 1 }),
+        );
+      });
+      expect(new Set([...scannerMemory.values()].map((channel) => channel.alpha_tag)).size).toBe(3);
+    };
+
+    it('uploads a two-way swap without overwriting the second source', async () => {
+      const { scannerMemory, scannerSources } = await uploadPermutation(2, 1);
+
+      expectPermutation(scannerMemory, [scannerSources[1], scannerSources[0], scannerSources[2]]);
+    });
+
+    it('uploads a three-way rotation with every field and keypad edit intact', async () => {
+      const { scannerMemory, scannerSources } = await uploadPermutation(3, 2);
+
+      expectPermutation(scannerMemory, [scannerSources[2], scannerSources[0], scannerSources[1]]);
+    });
+  });
 });
 
 describe('deriveBankFromIndex (#401)', () => {
@@ -1309,5 +1781,116 @@ describe('remaining model assumptions (#398 audit)', () => {
     expect(fromDraft).toBe('AUTO');
     expect(fromBackend || 'AUTO').toBe(fromDraft);
     expect(fromBackend ?? 'AUTO').not.toBe(fromDraft);
+  });
+
+  describe('reconcileUntouchedFields (#413 stale write-back)', () => {
+    // A CIN write is all-or-nothing: every field goes out on every write, so
+    // "leave this alone" can only be expressed as "send its current value".
+    // That value used to come from the cache, which was safe only while the
+    // cache was re-read every launch. #413 made channel memory persist, so a
+    // channel edited at the radio's keypad could have its stale frequency
+    // written back by a Bearpaw edit to an unrelated field.
+
+    const base = createTestChannel({
+      index: 7,
+      frequency: 146.52,
+      alpha_tag: 'OLD TAG',
+      modulation: 'FM',
+      delay: 2,
+    });
+
+    // What the draft produces when the user edits ONLY the alpha tag.
+    const draftPayload = () => {
+      const { index: _index, ...rest } = base;
+      return { ...rest, alpha_tag: 'NEW TAG' };
+    };
+
+    it('takes the scanner value for a field the user did not edit', () => {
+      // The frequency was changed on the keypad while Bearpaw was closed.
+      const latest = createTestChannel({ ...base, frequency: 147.36 });
+
+      const { payload, reconciled } = reconcileUntouchedFields(draftPayload(), base, latest);
+
+      expect(payload.frequency).toBe(147.36);
+      expect(reconciled).toContain('frequency');
+    });
+
+    it('keeps the user edit for a field they DID change', () => {
+      // The scanner disagrees about the alpha tag too, but the user typed this
+      // one -- their edit is the entire point of the upload.
+      const latest = createTestChannel({ ...base, alpha_tag: 'SCANNER TAG' });
+
+      const { payload, reconciled } = reconcileUntouchedFields(draftPayload(), base, latest);
+
+      expect(payload.alpha_tag).toBe('NEW TAG');
+      expect(reconciled).not.toContain('alpha_tag');
+    });
+
+    it('keeps a user-edited FREQUENCY over the scanner value', () => {
+      // The alpha-tag case above passes even if the untouched-check is deleted
+      // entirely, because that test never edits a field the scanner disagrees
+      // about. Measured by mutation: removing `next.frequency ===
+      // base.frequency` left all four other guards green. Retuning a channel
+      // in Bearpaw while it also moved on the keypad is the collision that
+      // matters -- the user's number must win, or Bearpaw silently discards
+      // what they typed.
+      const edited = { ...draftPayload(), frequency: 151.625 };
+      const latest = createTestChannel({ ...base, frequency: 147.36 });
+
+      const { payload, reconciled } = reconcileUntouchedFields(edited, base, latest);
+
+      expect(payload.frequency).toBe(151.625);
+      expect(reconciled).not.toContain('frequency');
+    });
+
+    it('reports nothing when the scanner agrees with the cache', () => {
+      const { payload, reconciled } = reconcileUntouchedFields(draftPayload(), base, base);
+
+      expect(reconciled).toEqual([]);
+      expect(payload.frequency).toBe(146.52);
+      expect(payload.alpha_tag).toBe('NEW TAG');
+    });
+
+    it('normalises modulation the way draftChanges does', () => {
+      // A BC75XLT reserves the CIN modulation field, so the backend reports an
+      // EMPTY STRING. `draftChanges` normalises that to 'AUTO' with `||`. If
+      // this function used `??` instead, '' would survive on one side and
+      // 'AUTO' on the other, and every channel on that model would look
+      // reconciled on every upload -- the #272 failure by a new route.
+      const emptyMod = createTestChannel({ ...base, modulation: '' });
+      const payloadFromEmpty = { ...draftPayload(), modulation: 'AUTO' };
+
+      const { reconciled } = reconcileUntouchedFields(payloadFromEmpty, emptyMod, emptyMod);
+
+      expect(reconciled).not.toContain('modulation');
+    });
+
+    it('reconciles tone as one unit, never field by field', () => {
+      // kind, Hz and DCS code interlock (#132). Adopting one without the
+      // others produces a combination the scanner never reported.
+      const dcsBase = createTestChannel({
+        ...base,
+        tone_squelch: null,
+        tone_squelch_kind: 'dcs',
+        tone_dcs_code: 23,
+      });
+      const { index: _i, ...rest } = dcsBase;
+      const untouchedDraft = { ...rest, alpha_tag: 'NEW TAG' };
+
+      // The keypad changed it to a CTCSS tone.
+      const latest = createTestChannel({
+        ...dcsBase,
+        tone_squelch: 103.5,
+        tone_squelch_kind: 'ctcss',
+        tone_dcs_code: null,
+      });
+
+      const { payload, reconciled } = reconcileUntouchedFields(untouchedDraft, dcsBase, latest);
+
+      expect(reconciled).toContain('tone');
+      expect(payload.tone_squelch).toBe(103.5);
+      expect(payload.tone_squelch_kind).toBe('ctcss');
+      expect(payload.tone_dcs_code).toBeNull();
+    });
   });
 });

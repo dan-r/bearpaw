@@ -205,6 +205,25 @@ pub(crate) async fn post_memory_sync(
     // guard) so nothing corrupts, but it is 200 pointless round-trips, a
     // progress bar that stalls at 60%, and 200 error-shaped replies in the log.
     let max_channels = state.capabilities().channel_count;
+    // REGRESSION GUARD (`the_sync_is_registered_before_its_command_is_queued`,
+    // #606): REGISTER BEFORE QUEUING. Do not move this below the send.
+    //
+    // `ProgramModeGuard::enter` refuses with 409 based on `sync_task_id`. This
+    // assignment used to sit AFTER the send, so in the gap between the two a
+    // handler entering program mode saw `None`, got no refusal, set
+    // `program_mode_active`, and queued its `PRG` behind the already-queued
+    // `StartSync`. The poll thread then dispatched the sync INLINE for ~5 s
+    // without draining the queue, and that `PRG` expired at its 3-second
+    // budget.
+    //
+    // The window was not theoretical or narrow: the guard above catches it in
+    // roughly half of 50 rounds, and it fired once per launch on hardware
+    // (2026-09-01, `command=PRG elapsed_ms=3010 command_timeout`).
+    //
+    // The `take()` in the error path below is what keeps this safe: a send that
+    // fails un-registers the task, so a failed start cannot leave the API
+    // permanently answering 409.
+    *state.sync_task_id.lock().unwrap() = Some(task_id.clone());
     tx.send(ControlCommand::StartSync {
         task_id: task_id.clone(),
         max_channels,
@@ -213,7 +232,6 @@ pub(crate) async fn post_memory_sync(
         state.sync_task_id.lock().unwrap().take();
         ApiError::SendFailed
     })?;
-    *state.sync_task_id.lock().unwrap() = Some(task_id.clone());
     Ok(Json(MemorySyncResponse {
         status: "started".to_string(),
         task_id,
@@ -224,11 +242,32 @@ pub(crate) async fn post_memory_sync(
 /// frontend can re-check after a WebSocket reconnect: if "Sync complete" was
 /// broadcast into a dead socket, the client's `inProgress` flag is stale and
 /// the full-screen overlay would otherwise stay up forever (#137).
+///
+/// Also carries `synced_at` (#413): epoch seconds for when channel memory was
+/// last read from the radio, or `null` if it never has been. This endpoint
+/// rather than `GET /memory/channels` because that one is a documented BARE
+/// ARRAY -- adding a field there means an envelope, which breaks every existing
+/// client. "How stale is this memory" belongs beside "is a sync running"
+/// anyway, and the frontend already calls this on every WS connect.
+///
+/// Read from `shadow.last_sync`, not from SQLite: it is the same value the
+/// cache stores (`flush_channel_cache` persists it, `load_channel_cache`
+/// restores it), and reading memory keeps this handler off blocking I/O.
 pub(crate) async fn get_memory_sync_status(State(state): State<AppState>) -> Json<Value> {
     let task_id = state.sync_task_id.lock().unwrap().clone();
+    // 0.0 is `ShadowState`'s default and means "never synced". Serialize it as
+    // null rather than as a timestamp -- 0.0 renders as 1 January 1970, which
+    // is not a staleness report, it is a bug that looks like data.
+    let synced_at = state
+        .shadow
+        .read()
+        .ok()
+        .map(|shadow| shadow.last_sync)
+        .filter(|ts| *ts > 0.0);
     Json(json!({
         "in_progress": task_id.is_some(),
         "task_id": task_id,
+        "synced_at": synced_at,
     }))
 }
 
@@ -264,8 +303,9 @@ pub(crate) async fn program_mode_start(
     // The matching EPG is in program_mode_end.
     //
     // REGRESSION GUARD (#262): a transport-level Ok is not enough — the scanner
-    // answers `PRG,NG`/`ERR` when it can't enter program mode (e.g. it's sitting
-    // in its own on-device menu), and that comes back as Ok("PRG,NG"). Treating
+    // answers `PRG,NG`/`ERR` when it can't enter program mode, and that comes
+    // back as Ok("PRG,NG"). (Its own menu is not such a state on a BC125AT --
+    // audit-reconciliation Conflict 6.) Treating
     // it as success sets program_mode_active (freezing the live display on
     // "Programming") while every later CIN/SCG write fails against a scanner
     // that never left normal operation. Classify the reply as
@@ -378,5 +418,106 @@ mod tests {
         assert!(result.is_ok());
         assert!(state.program_mode_active.load(Ordering::Relaxed));
         assert_eq!(state.live.read().unwrap().mode, ScannerMode::Programming);
+    }
+
+    /// REGRESSION GUARD: sync status reports WHEN memory was last read.
+    ///
+    /// #413 wants "last synced 3 days ago" on screen, and this endpoint is the
+    /// only memory endpoint that can carry it: `GET /memory/channels` is a
+    /// documented bare JSON array, so adding a field there means an envelope
+    /// and a breaking change for every existing client.
+    #[tokio::test]
+    async fn sync_status_reports_when_memory_was_last_read() {
+        let state = default_state();
+        state.shadow.write().unwrap().last_sync = 1_000_000_000.0;
+
+        let Json(body) = get_memory_sync_status(State(state)).await;
+
+        assert_eq!(
+            body["synced_at"].as_f64(),
+            Some(1_000_000_000.0),
+            "the endpoint must surface shadow.last_sync: {body}"
+        );
+    }
+
+    /// REGRESSION GUARD: never-synced reports `null`, not the epoch.
+    ///
+    /// `ShadowState::default` leaves `last_sync` at 0.0. Passing that through
+    /// renders as 1 January 1970 in any client that formats it as a date --
+    /// which is not a staleness report, it is a bug that looks like data.
+    /// Paired with the guard above: asserting only that a real timestamp
+    /// survives would also pass for a build that emits 0.0 here.
+    #[tokio::test]
+    async fn sync_status_reports_null_when_memory_has_never_been_read() {
+        let state = default_state();
+
+        let Json(body) = get_memory_sync_status(State(state)).await;
+
+        assert!(
+            body["synced_at"].is_null(),
+            "a never-synced scanner must report null, not the 1970 epoch: {body}"
+        );
+        // The pre-existing fields must keep working -- this endpoint is what
+        // clears the stuck sync overlay after a WS reconnect (#137).
+        assert_eq!(body["in_progress"], serde_json::json!(false));
+        assert!(body["task_id"].is_null());
+    }
+
+    /// REGRESSION GUARD (#606): `sync_task_id` is registered BEFORE `StartSync`
+    /// is queued.
+    ///
+    /// `ProgramModeGuard::enter` refuses with 409 based on `sync_task_id`. The
+    /// assignment used to sit AFTER the send, so in the gap between the two a
+    /// handler entering program mode saw `None`, got no refusal, set
+    /// `program_mode_active`, and queued its `PRG` behind the already-queued
+    /// `StartSync`. The poll thread then dispatched the sync INLINE for ~5 s
+    /// without draining the queue, and that `PRG` expired at its 3-second
+    /// budget.
+    ///
+    /// Measured on hardware 2026-09-01, once per page load, twice out of two:
+    /// `scanner command failed command=PRG elapsed_ms=3010 command_timeout`.
+    ///
+    /// THIS IS A SOURCE-LEVEL GUARD, ON PURPOSE, and the reasoning matters
+    /// because the obvious alternative does not work. A behavioural version --
+    /// observe `sync_task_id` from a thread receiving the command -- was
+    /// written first and thrown away: the window is two adjacent statements, so
+    /// the observation is a race. Against the buggy ordering it caught the bug
+    /// in 1 of 50 rounds, and at 500 rounds it still passed outright on one run
+    /// in three. A guard that catches a regression a third of the time trains
+    /// people to rerun, which is the failure shape `each_state_gets_its_own_databases`
+    /// is about.
+    ///
+    /// The ordering IS the fix, so asserting the ordering is the honest test.
+    /// This cannot see timing -- but there is no timing here to see, only two
+    /// statements whose order is the whole behaviour.
+    #[test]
+    fn the_sync_is_registered_before_its_command_is_queued() {
+        const SOURCE: &str = include_str!("memory.rs");
+
+        let handler = SOURCE
+            .split_once("pub(crate) async fn post_memory_sync")
+            .expect("post_memory_sync must exist")
+            .1;
+        // Stop at the next item so a later function's code cannot satisfy this.
+        let handler = handler
+            .split_once("\npub(crate) ")
+            .map(|(before, _)| before)
+            .unwrap_or(handler);
+
+        let register = handler
+            .find("*state.sync_task_id.lock().unwrap() = Some(task_id.clone());")
+            .expect("post_memory_sync must register the task id");
+        let queue = handler
+            .find("tx.send(ControlCommand::StartSync")
+            .expect("post_memory_sync must queue StartSync");
+
+        assert!(
+            register < queue,
+            "sync_task_id must be registered BEFORE StartSync is queued. \n\
+             Between those two statements `ProgramModeGuard::enter` sees `None`, \n\
+             skips its 409, and queues a PRG behind the sync that will not be \n\
+             drained for ~5 s -- a guaranteed 3-second command_timeout, once per \n\
+             launch on real hardware."
+        );
     }
 }

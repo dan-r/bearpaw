@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { motion } from 'motion/react';
-import { Search, Lock, GripVertical, ChevronDown } from 'lucide-react';
+import { Search, Lock, GripVertical, ChevronDown, RefreshCw } from 'lucide-react';
 import { DndProvider, useDrag, useDrop } from 'react-dnd';
 // TouchBackend, not HTML5Backend: the app ships in Tauri's WKWebView, where
 // react-dnd's HTML5 backend never fires dragover/drop — rows show the (+)
@@ -23,6 +23,7 @@ import { useScannerCapabilities } from '../../../hooks/useScannerCapabilities';
 import { confirmDialog, saveExport, pickAndReadFile } from '../../../tauri-shell';
 import type { ChannelData, ChannelDraft } from '../../../types';
 import { ChannelEditSheet } from './ChannelEditSheet';
+import { formatSyncedAt } from '../ScannerUI';
 
 const bankTabs = Array.from({ length: 10 }, (_, index) => index + 1);
 
@@ -383,6 +384,93 @@ export function deriveBankFromIndex(index: number, channelsPerBank: number, bank
 // Exported for tests only (#272). The guard on buildEmptyDraft has to assert
 // the REAL function's output — earlier attempts asserted a hand-built copy in
 // the test file and passed happily with the bug reintroduced.
+/**
+ * Prefer the scanner's value for any field the user did NOT edit.
+ *
+ * A `CIN` write is all-or-nothing: every field goes out on every write. So
+ * "leave this field alone" can only be expressed as "send its current value",
+ * and the question is current according to WHOM. It should always have been
+ * the scanner. It was the cache, which was harmless only while the cache was
+ * re-read every launch -- #413 made channel memory persist, and the latent
+ * assumption became a bug: editing an alpha tag on a channel whose frequency
+ * was changed at the radio's keypad wrote the stale frequency back, silently
+ * reverting the user's work.
+ *
+ * `base` is the pre-edit channel the draft was built from, so a field where
+ * `payload` and `base` agree is one the user did not touch. Only those adopt
+ * the scanner's value; an edited field always wins, because that edit is the
+ * entire point of the upload.
+ *
+ * Normalisation mirrors `draftChanges`' own `hasChanges` comparison exactly --
+ * `?? ''` for alpha, `|| 'AUTO'` for modulation, `?? null` for tone. Getting
+ * that wrong in either direction marks untouched fields as edited (#272) or
+ * edited fields as untouched, and the second silently discards user input.
+ *
+ * Tone is reconciled as a UNIT, never field by field: kind, Hz and DCS code
+ * interlock (#132), and adopting one without the others produces a combination
+ * the scanner never reported.
+ *
+ * Exported for its test: asserting the real function is the point (see
+ * CLAUDE.md "Third-rail flows" on guards that hand-rebuilt the shape they meant
+ * to check and passed while the bug was live).
+ */
+export function reconcileUntouchedFields(
+  payload: Omit<ChannelData, 'index'>,
+  base: ChannelData,
+  latest: ChannelData,
+): { payload: Omit<ChannelData, 'index'>; reconciled: string[] } {
+  const reconciled: string[] = [];
+  const next = { ...payload };
+
+  if (next.frequency === base.frequency && latest.frequency !== next.frequency) {
+    next.frequency = latest.frequency;
+    reconciled.push('frequency');
+  }
+
+  const baseAlpha = base.alpha_tag ?? '';
+  const latestAlpha = latest.alpha_tag ?? '';
+  if (next.alpha_tag === baseAlpha && latestAlpha !== next.alpha_tag) {
+    next.alpha_tag = latestAlpha;
+    reconciled.push('alpha_tag');
+  }
+
+  const baseMod = base.modulation || 'AUTO';
+  const latestMod = latest.modulation || 'AUTO';
+  if (next.modulation === baseMod && latestMod !== next.modulation) {
+    next.modulation = latestMod;
+    reconciled.push('modulation');
+  }
+
+  if (next.delay === base.delay && latest.delay !== next.delay) {
+    next.delay = latest.delay;
+    reconciled.push('delay');
+  }
+
+  // Tone as one unit. `tone_squelch` is the only tone field the edit sheet
+  // exposes, so it alone decides whether the user touched the group.
+  const baseTone = base.tone_squelch ?? null;
+  const latestTone = latest.tone_squelch ?? null;
+  const latestKind = latest.tone_squelch_kind ?? 'none';
+  const latestDcs = latest.tone_dcs_code ?? null;
+  // Both sides normalised. Comparing a normalised scanner value against a raw
+  // draft value made 'none' !== undefined fire a reconcile on every channel
+  // that had no tone at all -- caught by `reports nothing when the scanner
+  // agrees with the cache`.
+  const nextKind = next.tone_squelch_kind ?? 'none';
+  const nextDcs = next.tone_dcs_code ?? null;
+  if (
+    next.tone_squelch === baseTone &&
+    (latestTone !== next.tone_squelch || latestKind !== nextKind || latestDcs !== nextDcs)
+  ) {
+    next.tone_squelch = latestTone;
+    next.tone_squelch_kind = latestKind;
+    next.tone_dcs_code = latestDcs;
+    reconciled.push('tone');
+  }
+
+  return { payload: next, reconciled };
+}
+
 export function buildDraft(channel: ChannelData, clearedDelay = 2): ChannelDraft {
   if (channel.frequency === 0) {
     return buildEmptyDraft(clearedDelay);
@@ -453,6 +541,35 @@ export function ChannelsTab() {
   const setMemoryDraft = useStore((state) => state.setMemoryDraft);
   const clearMemoryDrafts = useStore((state) => state.clearMemoryDrafts);
   const setChannels = useStore((state) => state.setChannels);
+  // How old this channel list is, and whether a re-read is already running.
+  // The scanner has no change notification -- it answers questions and never
+  // volunteers that something moved (the same reasoning DeviceTab records for
+  // its own Refresh). Since #413 the list can be a cache of arbitrary age, so
+  // the page that edits channels is the page that has to show that age and
+  // offer to fix it.
+  const syncedAt = useStore((state) => state.sync.syncedAt);
+  const syncInProgress = useStore((state) => state.sync.inProgress);
+  const updateSync = useStore((state) => state.updateSync);
+  const syncedLabel = formatSyncedAt(syncedAt);
+
+  const handleRefreshChannels = useCallback(async () => {
+    try {
+      const result = await api.syncMemory();
+      if (result.status === 'started' || result.status === 'already_running') {
+        // Mirror App.tsx's own start path so the shared overlay comes up. The
+        // sync is ~5 s and holds the radio in program mode throughout, so the
+        // blocking overlay is the honest report -- not a thing to route around.
+        updateSync({
+          inProgress: true,
+          taskId: result.task_id || null,
+          message: 'Syncing scanner memory...',
+        });
+      }
+    } catch (error) {
+      console.warn('Failed to start memory sync', error);
+      toast.error('Unable to refresh channels');
+    }
+  }, [api, updateSync]);
   const setImportProgress = useStore((state) => state.setImportProgress);
 
   const capabilities = useScannerCapabilities();
@@ -614,10 +731,13 @@ export function ChannelsTab() {
 
         const parsedFrequency = Number.parseFloat(draft?.frequency ?? channel.frequency.toString());
         const parsedDelay = Number.parseInt(draft?.delay ?? channel.delay.toString(), 10);
+        const draftTone = draft?.tone_squelch;
         const parsedTone =
-          (draft?.tone_squelch ?? '').trim() === ''
-            ? null
-            : Number.parseFloat(draft?.tone_squelch ?? '');
+          draftTone === undefined
+            ? channel.tone_squelch
+            : draftTone.trim() === ''
+              ? null
+              : Number.parseFloat(draftTone);
 
         const toneHz = Number.isFinite(parsedTone ?? NaN) ? parsedTone : null;
         // Tone discriminator (#132): the edit sheet's tone field is
@@ -628,16 +748,26 @@ export function ChannelsTab() {
         // deserialize as 'none' on the backend and erase DCS on every edit.
         const originalKind = channel.tone_squelch_kind ?? (channel.tone_squelch ? 'ctcss' : 'none');
         const toneKind =
-          toneHz !== null
-            ? ('ctcss' as const)
-            : originalKind === 'dcs' || originalKind === 'search'
-              ? originalKind
-              : ('none' as const);
+          draftTone === undefined
+            ? originalKind
+            : toneHz !== null
+              ? ('ctcss' as const)
+              : originalKind === 'dcs' || originalKind === 'search'
+                ? originalKind
+                : ('none' as const);
 
         const normalized = {
           frequency: Number.isFinite(parsedFrequency) ? parsedFrequency : channel.frequency,
           alpha_tag: draft?.alpha_tag ?? channel.alpha_tag ?? '',
-          modulation: draft?.modulation ?? channel.modulation ?? 'AUTO',
+          // `|| 'AUTO'`, not `?? 'AUTO'`. A BC75XLT reserves the CIN
+          // modulation field, so the backend reports an EMPTY STRING, and `??`
+          // only falls through on null/undefined -- '' survives it. The
+          // comparison below already uses `||` for exactly this reason, so
+          // this side normalised to '' while that side normalised to 'AUTO'
+          // and every channel on that model compared as changed. All 300 sat
+          // permanently in pendingChannelIds, and Upload Changes would have
+          // rewritten every one of them.
+          modulation: draft?.modulation ?? (channel.modulation || 'AUTO'),
           delay: Number.isFinite(parsedDelay) ? parsedDelay : channel.delay,
           tone_squelch: toneHz,
           tone_squelch_kind: toneKind,
@@ -815,9 +945,29 @@ export function ChannelsTab() {
     setIsUploading(true);
     const failed: Array<{ index: number; detail?: string }> = [];
     const warnings: Array<{ index: number; detail: string }> = [];
+    // Channels where the scanner's value replaced the draft's for a field the
+    // user never touched. Reported rather than applied silently: this changes
+    // which side wins a conflict, and an invisible reconciliation trades a bug
+    // you can describe for one you cannot.
+    const reconciledChannels: number[] = [];
 
     try {
       await api.startProgramMode();
+      // Snapshot every SOURCE before writing any TARGET. Reorders are
+      // permutations, so a target can also be a source later in this batch.
+      // Reading immediately before each write let an earlier write overwrite
+      // that later source; a two-way swap then duplicated one channel and lost
+      // the other. The up-front snapshot also preserves keypad edits for every
+      // untouched field without observing our own writes.
+      const latestBySource = new Map<number, ChannelData>();
+      for (const change of draftChanges) {
+        try {
+          latestBySource.set(change.channelIndex, await api.getChannel(change.channelIndex));
+        } catch (refreshError) {
+          console.warn('Failed to refresh channel before upload', refreshError);
+        }
+      }
+
       for (const change of draftChanges) {
         try {
           let payload = change.payload;
@@ -827,17 +977,31 @@ export function ChannelsTab() {
             ...payload,
             bank: targetBank,
           };
-          if (!change.lockoutChanged) {
-            try {
-              const latest = await api.getChannel(change.channelIndex);
+          // REGRESSION GUARD (#573): the snapshot read above is UNCONDITIONAL.
+          // Only adoption of lockout/priority is gated on
+          // `!change.lockoutChanged`, because taking `latest.lockout` there
+          // would discard the staged tick. A failed read leaves `payload` on
+          // the draft, matching the previous best-effort behaviour.
+          const latest = latestBySource.get(change.channelIndex);
+          if (latest) {
+            if (!change.lockoutChanged) {
               payload = {
                 ...payload,
                 lockout: latest.lockout,
                 priority: latest.priority,
                 bank: latest.bank || payload.bank,
               };
-            } catch (refreshError) {
-              console.warn('Failed to refresh channel before upload', refreshError);
+            }
+            // Every OTHER field the user did not edit also comes from the
+            // scanner, not from the draft's cached basis. See
+            // `reconcileUntouchedFields`. Only reachable when the snapshot
+            // read succeeded; a missing snapshot leaves `payload` on the
+            // draft, so a marginal read degrades to the prior best-effort
+            // behaviour rather than reverting a staged edit.
+            const outcome = reconcileUntouchedFields(payload, change.channel, latest);
+            payload = outcome.payload;
+            if (outcome.reconciled.length > 0) {
+              reconciledChannels.push(change.channelIndex);
             }
           }
 
@@ -863,9 +1027,26 @@ export function ChannelsTab() {
             detail,
             error: apiError,
           });
-          if (detail === 'channel_write_mismatch') {
+          // The backend never emits `channel_write_mismatch` -- grep the crate:
+          // the string exists only here. This branch was dead, and it is not
+          // decoration: it re-reads the channel and, if the primary fields
+          // match, treats the write as SUCCEEDED rather than failed.
+          //
+          // The strings that actually reach here for a post-write verification
+          // failure are `channel_not_persisted` (mod.rs:2181) and
+          // `channel_readback_failed` (mod.rs:2159). Both mean the CIN was
+          // acknowledged and the follow-up read then disagreed or could not be
+          // parsed -- exactly the case this recovery exists for. mod.rs:2078
+          // records one on hardware: a cleared slot on a BC75XLT returned 400
+          // `channel_not_persisted` after the write had already landed.
+          //
+          // `channel_write_rejected` and `channel_write_wrong_mode` are
+          // deliberately NOT here: those fire before anything is written, so
+          // re-reading would only confirm the old value and the honest report
+          // is a failure.
+          if (detail === 'channel_not_persisted' || detail === 'channel_readback_failed') {
             try {
-              const refreshed = await api.getChannel(change.channelIndex);
+              const refreshed = await api.getChannel(change.targetIndex ?? change.channelIndex);
               const matchesPrimaryFields =
                 refreshed.frequency === change.payload.frequency &&
                 refreshed.alpha_tag === change.payload.alpha_tag &&
@@ -938,8 +1119,11 @@ export function ChannelsTab() {
       console.warn('Failed to refresh channels after upload', error);
     }
 
+    const reconciledNote =
+      reconciledChannels.length > 0 ? ` (${reconciledChannels.length} refreshed from scanner)` : '';
+
     if (failed.length === 0 && warnings.length === 0) {
-      toast.success(`Uploaded ${draftChanges.length} channel edits`);
+      toast.success(`Uploaded ${draftChanges.length} channel edits${reconciledNote}`);
     } else if (failed.length === 0 && warnings.length > 0) {
       toast.error(`Uploaded with ${warnings.length} warnings (lockout not applied)`);
     } else if (failed.length > 0) {
@@ -978,11 +1162,28 @@ export function ChannelsTab() {
     toast.success('Drafts discarded');
   }, [draftChanges, isUploading, clearMemoryDrafts, setBankOrders]);
 
+  // An export is a backup, so the backend refuses one built from a partial
+  // channel image rather than inventing the missing rows (#639). That is not a
+  // failure the user can do anything about unless we say what it is — every
+  // export handler used to collapse it into "Failed to export", which reads as
+  // a broken app rather than "sync first".
+  const exportFailureMessage = async (response: Response, fallback: string) => {
+    try {
+      const body = await response.json();
+      if (body?.error === 'memory_not_synced') {
+        return 'Sync scanner memory before exporting — the channel list is incomplete';
+      }
+    } catch {
+      // Non-JSON body: fall through to the generic message.
+    }
+    return fallback;
+  };
+
   const handleExportCSV = async () => {
     try {
       const response = await fetch(`${API_BASE}/memory/export/csv`);
       if (!response.ok) {
-        throw new Error('Failed to export CSV');
+        throw new Error(await exportFailureMessage(response, 'Failed to export channels'));
       }
       const bytes = new Uint8Array(await response.arrayBuffer());
       const where = await saveExport('channels.csv', bytes);
@@ -990,7 +1191,7 @@ export function ChannelsTab() {
       toast.success(where === 'saved' ? 'Channels saved' : 'Channels exported successfully');
     } catch (error) {
       console.error('Failed to export CSV', error);
-      toast.error('Failed to export channels');
+      toast.error(error instanceof Error ? error.message : 'Failed to export channels');
     }
   };
 
@@ -1000,7 +1201,11 @@ export function ChannelsTab() {
     const toastId = toast.loading('Exporting BC75XLT format…');
     try {
       const response = await fetch(`${API_BASE}/memory/export/bc75xlt_ss`);
-      if (!response.ok) throw new Error(String(response.status));
+      if (!response.ok) {
+        throw new Error(
+          await exportFailureMessage(response, 'Failed to export BC75XLT settings file'),
+        );
+      }
       const bytes = new Uint8Array(await response.arrayBuffer());
       const where = await saveExport('scanner.bc75xlt_ss', bytes);
       toast.dismiss(toastId);
@@ -1010,7 +1215,9 @@ export function ChannelsTab() {
     } catch (error) {
       console.error('Failed to export BC75XLT settings file', error);
       toast.dismiss(toastId);
-      toast.error('Failed to export BC75XLT settings file');
+      toast.error(
+        error instanceof Error ? error.message : 'Failed to export BC75XLT settings file',
+      );
     } finally {
       setIsExportingSs(false);
     }
@@ -1026,7 +1233,7 @@ export function ChannelsTab() {
     try {
       const response = await fetch(`${API_BASE}/memory/export/bc125at_ss`);
       if (!response.ok) {
-        throw new Error('Failed to export BC125AT format');
+        throw new Error(await exportFailureMessage(response, 'Failed to export BC125AT format'));
       }
       const bytes = new Uint8Array(await response.arrayBuffer());
       const where = await saveExport('scanner.bc125at_ss', bytes);
@@ -1040,7 +1247,9 @@ export function ChannelsTab() {
       );
     } catch (error) {
       console.error('Failed to export BC125AT format', error);
-      toast.error('Failed to export BC125AT format', { id: toastId });
+      toast.error(error instanceof Error ? error.message : 'Failed to export BC125AT format', {
+        id: toastId,
+      });
     } finally {
       setIsExportingSs(false);
     }
@@ -1091,10 +1300,25 @@ export function ChannelsTab() {
       }
 
       const result = await response.json();
-      const { imported, errors } = result;
+      const { imported, errors, settings_skipped: settingsSkipped } = result;
+
+      // A setting this scanner cannot accept is not an error — the restore
+      // worked — but it must not be reported as an unqualified success
+      // either. The backend names each one it refused (#625); saying
+      // "Config restored" while silently dropping the file's backlight and
+      // service-search groups is the bug this reports its way out of.
+      const skippedNames: string[] = Array.isArray(settingsSkipped)
+        ? settingsSkipped.map(
+            (s: { label?: string; command?: string }) => s.label ?? s.command ?? '',
+          )
+        : [];
 
       if (errors && errors.length > 0) {
         toast.error(`Imported ${imported} — ${errors.length} item(s) failed`);
+      } else if (isSs && skippedNames.length > 0) {
+        toast.success(
+          `Config restored (${imported} channels). Not supported by this scanner: ${skippedNames.join(', ')}.`,
+        );
       } else if (isSs) {
         toast.success(`Config restored (${imported} channels)`);
       } else {
@@ -1168,6 +1392,24 @@ export function ChannelsTab() {
                 onChange={(e) => setSearchTerm(e.target.value)}
               />
             </div>
+            {syncedLabel && (
+              <div className="flex items-center gap-2 shrink-0">
+                <span className="text-xs font-normal text-white/40 text-nowrap">{syncedLabel}</span>
+                <button
+                  type="button"
+                  onClick={handleRefreshChannels}
+                  disabled={syncInProgress}
+                  className="flex items-center gap-1.5 rounded border border-white/5 bg-black/20 px-2.5 py-1 text-xs font-normal text-white/70 transition-colors hover:bg-black/40 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <RefreshCw
+                    size={12}
+                    aria-hidden
+                    className={cn(syncInProgress && 'animate-spin')}
+                  />
+                  {syncInProgress ? 'Reading…' : 'Refresh'}
+                </button>
+              </div>
+            )}
           </div>
 
           <div className="flex gap-2 shrink-0">

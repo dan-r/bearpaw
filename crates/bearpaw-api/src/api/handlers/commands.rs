@@ -8,7 +8,8 @@ use std::time::Duration;
 use tracing::warn;
 
 use crate::protocol::{classify_response, ScannerReply};
-use crate::state::ChannelData;
+
+use crate::state::{ChannelData, ScannerMode};
 
 use super::super::{
     command_sender, send_raw_command, set_channel_lockout_on_scanner, set_setting_section,
@@ -156,6 +157,84 @@ pub(crate) async fn post_key(
     Ok(Json(json!({ "status": "ok" })))
 }
 
+/// Whether a lockout write about to run should put the scanner back into scan
+/// once it finishes.
+///
+/// REGRESSION GUARD (`a_lockout_during_scan_resumes_scanning`,
+/// `a_lockout_while_held_resumes_scanning`,
+/// `a_lockout_while_tuned_direct_does_not_resume_scanning`,
+/// `a_failed_lockout_during_scan_still_resumes_scanning`): #678. A lockout is
+/// a `PRG` / `CIN` / `EPG` bracket, and leaving program mode parks the radio
+/// in HOLD at channel 1. `commanded_mode` is not told: only a `Hold` or `Scan`
+/// command moves it, so it still reads `SCAN` and the UI shows "Scanning..."
+/// over a radio that has stopped. The frontend's resume was gated on seeing
+/// `HOLD`, which a scanning user never produces, and the Ctrl+L shortcut had
+/// no resume at all. The backend owns scanner state, so the resume lives here,
+/// where every caller gets it.
+///
+/// HOLD resumes too. The held channel is gone either way -- `EPG` leaves the
+/// radio at channel 1, not where the user held it -- and resuming after a
+/// held lockout is what the frontend already did before this moved here.
+/// DIRECT and PGM do not: a manual tune and someone else's program mode are
+/// not a scan to go back to.
+///
+/// Decided BEFORE the write, from the mode the user left the radio in:
+/// afterwards the live frame describes the bracket, not the user's intent.
+/// Only a bracket this call OPENS parks the radio, so an already-active
+/// program mode (the write rides someone else's bracket) is not resumed.
+fn should_resume_scan_after_lockout(state: &AppState, mode_before: ScannerMode) -> bool {
+    matches!(mode_before, ScannerMode::Scan | ScannerMode::Hold)
+        && !state.program_mode_active.load(Ordering::Relaxed)
+}
+
+/// How long to let the radio leave program mode before pressing Scan.
+///
+/// `EPG` is a mode transition, and `ProgramModeGuard` documents that the
+/// firmware answers `NG` to a command that lands before a transition settles.
+/// Its `MODE_TRANSITION_SETTLE` (100 ms) was measured for `PRG` entry only. The
+/// one delay with any field history for a Scan after `EPG` is the 1 s the
+/// frontend waited before this resume moved here, so that is what this keeps.
+/// Unmeasured on hardware: shorten it only against a capture.
+const LOCKOUT_RESUME_SETTLE: Duration = Duration::from_millis(1000);
+
+/// Put the scanner back into scan after a lockout bracket.
+///
+/// Runs whether or not the lockout write succeeded: a failure after `PRG`
+/// still ends with `EPG`, and the radio is parked either way. A failed resume
+/// is warned, not propagated -- by the time it runs the lockout is already
+/// committed (or already reported as failed), and turning a landed write into
+/// an error is the #532 mistake.
+async fn resume_scan_after_lockout(state: &AppState) {
+    tokio::time::sleep(LOCKOUT_RESUME_SETTLE).await;
+    if let Err(e) = send_mode_command(
+        state,
+        |reply| ControlCommand::Scan {
+            reply,
+            deadline: std::time::Instant::now() + Duration::from_secs(3),
+        },
+        "scan",
+    )
+    .await
+    {
+        warn!(error = ?e, "lockout written, but scan did not resume");
+    }
+}
+
+/// Write a channel's lockout bit, then resume scan if the user was scanning.
+async fn write_lockout_and_resume(
+    state: &AppState,
+    channel: u16,
+    locked: bool,
+    mode_before: ScannerMode,
+) -> Result<ChannelData, ApiError> {
+    let resume = should_resume_scan_after_lockout(state, mode_before);
+    let result = set_channel_lockout_on_scanner(state, channel, locked).await;
+    if resume {
+        resume_scan_after_lockout(state).await;
+    }
+    result
+}
+
 #[derive(Deserialize)]
 pub(crate) struct LockoutRequest {
     mode: String,
@@ -174,7 +253,10 @@ pub(crate) async fn post_lockout(
                 .channel
                 .or(live.channel)
                 .ok_or_else(|| ApiError::BadRequest("channel_required".to_string()))?;
-            if !(1..=500).contains(&channel) {
+            // CLAUDE.md pitfall #10: never hardcode 500. A BC75XLT has 300
+            // channels, so a literal bound accepted 301-500 and passed them to
+            // a radio that has no such slot.
+            if !(1..=state.capabilities().channel_count).contains(&channel) {
                 return Err(ApiError::BadRequest("channel_out_of_range".to_string()));
             }
             let frequency = body.frequency.unwrap_or(live.frequency);
@@ -185,7 +267,8 @@ pub(crate) async fn post_lockout(
                 .contains_key(&channel);
             let locked = if was_locked {
                 if command_sender(&state).is_ok() {
-                    let updated = set_channel_lockout_on_scanner(&state, channel, false).await?;
+                    let updated =
+                        write_lockout_and_resume(&state, channel, false, live.mode).await?;
                     state
                         .shadow
                         .write()
@@ -197,7 +280,8 @@ pub(crate) async fn post_lockout(
                 false
             } else {
                 if command_sender(&state).is_ok() {
-                    let updated = set_channel_lockout_on_scanner(&state, channel, true).await?;
+                    let updated =
+                        write_lockout_and_resume(&state, channel, true, live.mode).await?;
                     state
                         .shadow
                         .write()
@@ -225,40 +309,42 @@ pub(crate) async fn post_lockout(
                 .channel
                 .or(live.channel)
                 .ok_or_else(|| ApiError::BadRequest("channel_required".to_string()))?;
-            if !(1..=500).contains(&index) {
+            // Same bound, same reason. Both modes are reachable from the same
+            // UI control, so fixing one would leave the other wrong.
+            if !(1..=state.capabilities().channel_count).contains(&index) {
                 return Err(ApiError::BadRequest("channel_out_of_range".to_string()));
             }
-            let updated = if command_sender(&state).is_ok() {
-                let current = {
-                    let shadow = state.shadow.read().unwrap();
-                    shadow
-                        .channels
-                        .get(&index)
-                        .map(|c| c.lockout)
-                        .unwrap_or(false)
-                };
-                set_channel_lockout_on_scanner(&state, index, !current).await?
-            } else {
-                let mut shadow = state.shadow.write().unwrap();
-                let ch = shadow.channels.entry(index).or_insert(ChannelData {
-                    index,
-                    frequency: live.frequency,
-                    modulation: live.modulation,
-                    alpha_tag: live.alpha_tag.unwrap_or_default(),
-                    delay: 2,
-                    lockout: false,
-                    priority: false,
-                    tone_squelch: None,
-                    tone_squelch_kind: Default::default(),
-                    tone_dcs_code: None,
-                    // Capability-aware: a BC75XLT's banks are 30 wide, so
-                    // the free function's fixed /50 reported the wrong bank in
-                    // the KEY-command echo. See #401.
-                    bank: state.capabilities().index_to_bank(index),
-                });
-                ch.lockout = !ch.lockout;
-                ch.clone()
+            // REGRESSION GUARD
+            // (`a_permanent_lockout_without_a_scanner_fails_instead_of_inventing_a_channel`):
+            // with no scanner attached this FAILS. It used to fabricate.
+            //
+            // The old else-arm built a `ChannelData` out of live state -- with
+            // a hardcoded `delay: 2` -- inserted it into `shadow.channels`, and
+            // returned HTTP 200 while nothing reached the radio (#556,
+            // finding 1). That is a direct violation of the rule in
+            // `channel_cache`'s module header: the cache is a read accelerator,
+            // and nothing may write to it and upload later. A value invented
+            // here never came back from a scanner read, because there was no
+            // scanner.
+            //
+            // #413 changed the severity without changing this code. The shadow
+            // is flushed to SQLite within 30 s and re-adopted at every connect,
+            // so an invented row now persists across restarts instead of dying
+            // with the session.
+            //
+            // `command_sender` is checked rather than assumed: every other
+            // write path in this module already answers `device_disconnected`
+            // here, and this was the one that pretended otherwise.
+            command_sender(&state)?;
+            let current = {
+                let shadow = state.shadow.read().unwrap();
+                shadow
+                    .channels
+                    .get(&index)
+                    .map(|c| c.lockout)
+                    .unwrap_or(false)
             };
+            let updated = write_lockout_and_resume(&state, index, !current, live.mode).await?;
             state
                 .shadow
                 .write()

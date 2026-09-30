@@ -103,6 +103,101 @@ pub struct ScannerCapabilities {
     pub has_contrast: bool,
     /// Whether `WXS` (weather alert priority) works. Absent on the BC75XLT.
     pub has_weather_alert: bool,
+    /// Whether `SSG` (the service-search avoid mask) exists on this model.
+    ///
+    /// Named for the mask, not the feature: the BC75XLT HAS service search --
+    /// its owner's manual documents ten service bands on the `Svc` key -- but
+    /// no command to enable or disable one remotely. Its settings command is
+    /// `SSP,[SVC_INDEX],[DLY],[DIR]`, which carries a per-service delay and
+    /// direction and no enable flag, and `SSG` is absent from the vendor
+    /// spec's command table entirely.
+    ///
+    /// Uniden's own tool agrees: in a real `.bc75xlt_ss` the `Service` row's
+    /// on/off slot is empty, while the BC125AT's carries `On|Off` (see
+    /// `docs/SS_FILE_FORMAT.md`). The service list also differs -- `WX` leads
+    /// it and there is no `Military Air` -- so the BC125AT band names are
+    /// wrong here even where the mask would fit.
+    pub has_service_search_groups: bool,
+    /// Whether `SCO` (general-search delay and code search) can be WRITTEN.
+    ///
+    /// The BC75XLT ANSWERS `SCO` -- a read returns its live delay -- but
+    /// rejects every write, including a write of the value it just reported.
+    /// Measured on hardware 2026-09-02: `SCO,2,0` and `SCO,1,0` both came back
+    /// `Err`, and five delay values pushed through `set_search` left the read
+    /// at 1. That rules out a bad value and leaves the command itself.
+    ///
+    /// Named for what Bearpaw can CONTROL, per the rule on
+    /// `has_backlight_control`: the radio has search options and a menu to set
+    /// them, it just cannot be told them over the wire.
+    ///
+    /// A real `.bc75xlt_ss` makes this worse than a silent no-op: its
+    /// `GeneralSearch` delay column carries a constant 2 the same way the
+    /// `C-Freq` delay column does (docs/SS_FILE_FORMAT.md), so an import that
+    /// trusts it puts a rejected `SCO` in the error list of every otherwise
+    /// clean restore.
+    pub has_search_options: bool,
+    /// Close Call band labels, indexed by their position in the `CLC` mask.
+    ///
+    /// `None` marks a reserved position -- present in the 5-character mask,
+    /// but not a band. The families disagree on positions 4 and 5:
+    ///
+    /// | Pos | BC125AT | BC75XLT |
+    /// |---|---|---|
+    /// | 4 | UHF | reserved |
+    /// | 5 | 800 MHz | UHF |
+    ///
+    /// Verified on hardware 2026-08-28: writing `11111` to a BC75XLT reads
+    /// back `11101` -- position 4 is forced to 0. Bearpaw used the BC125AT
+    /// order for both, so on that radio the "UHF" switch wrote the reserved
+    /// slot while "800 MHz" -- a band it cannot even receive -- was the real
+    /// UHF control. See `docs/wire_captures/2026-08-28/findings.md`.
+    ///
+    /// A labels list rather than a "position 4 is reserved" bool because the
+    /// swap changes two facts at once: which slot is dead AND what slot 5 is
+    /// called. Fixing only the first leaves a "UHF" switch that writes
+    /// nothing and looks correct -- worse than the visibly-wrong 800 MHz row
+    /// that would at least prompt someone to check.
+    pub close_call_bands: &'static [Option<&'static str>],
+    /// Whether `CLC` field 5 (`hit_scan`, "Lockout Hits While Scanning") is
+    /// settable.
+    ///
+    /// Reserved on the BC75XLT: written `1`, it reads back empty (hardware
+    /// 2026-08-28). Accepted without an error, then silently discarded -- so
+    /// nothing surfaces the failure except reading the field back.
+    pub has_close_call_hit_scan: bool,
+    /// Whether Bearpaw can clear a channel's priority flag on this model.
+    ///
+    /// The BC125AT family refuses an in-place priority `1`->`0` `CIN` write
+    /// (#203), so the only mechanism is `DCH,<n>` plus a full rewrite -- what
+    /// `clear_channel_priority_locked` does, verified on hardware 2026-08-03
+    /// (#251).
+    ///
+    /// A BC75XLT refuses the same in-place write AND has no `DCH` at all
+    /// (hardware 2026-08-28). It needs neither: its firmware moves the flag
+    /// within a bank by itself, so designating a new priority channel clears
+    /// the old one as a side effect -- measured in both directions, and the
+    /// behaviour its owner's manual implies by having no keypad clear step.
+    ///
+    /// Named for what Bearpaw can do, like `has_backlight_control`. False here
+    /// does NOT mean priority cannot be moved; it means the *clear* is the
+    /// radio's job rather than ours, and attempting one would fail.
+    pub has_priority_clear: bool,
+    /// Whether the `KBP` key-beep field is settable on this model.
+    ///
+    /// The BC125AT's `KBP` is `[BEEP],[LOCK]`; the BC75XLT's is `[RSV],[LOCK]`
+    /// -- the beep slot is reserved. Confirmed on hardware: that model answers
+    /// `KBP,,0` inside program mode (settings probe 2026-08-26), with field 1
+    /// empty, and its owner's manual documents no key-beep setting at all.
+    ///
+    /// Separate from `key_beep_needs_program_mode`, which says WHERE `KBP` may
+    /// be sent. Both are true of a BC75XLT at once: the command exists and is
+    /// program-mode only, and carries a key lock Bearpaw reads for the settings
+    /// file -- only the beep half is missing.
+    ///
+    /// Writing a number into that reserved slot is the format-error hazard in
+    /// CLAUDE.md pitfall #8 applied to `KBP`: per the vendor spec one bad field
+    /// aborts the whole set command, discarding the key lock sent with it.
+    pub has_key_beep: bool,
     /// Whether `KBP` (key beep) is accepted outside program mode.
     ///
     /// The BC125AT takes it in either mode. The BC75XLT replies `KBP,NG`
@@ -123,6 +218,25 @@ pub struct ScannerCapabilities {
     /// `buildEmptyDraft` must match it exactly or cleared channels stay
     /// permanently pending. See the third-rail table in CLAUDE.md.
     pub cleared_delay: i8,
+    /// Whether this model's USB serial identifies the UNIT rather than the
+    /// model.
+    ///
+    /// Measured on both units 2026-08-26: every BC125AT reports usb_serial
+    /// `0001`. It is a firmware constant, so `BC125AT:0001` never meant "this
+    /// radio" -- it meant "a BC125AT". The BC75XLT's comes from a CP2104 bridge
+    /// that Silicon Labs programs per unit, so there it is a real
+    /// discriminator.
+    ///
+    /// `scanner_registry::match_index` reads this to decide whether the serial
+    /// belongs in the identity key at all. Including a constant bought no
+    /// precision and cost a profile split whenever the descriptor read failed:
+    /// the same radio would key as `BC125AT:0001` on one launch and
+    /// `BC125AT:unknown` on the next, each with its own channel cache (#570).
+    ///
+    /// Named for what the VALUE is, not for what Bearpaw does with it -- unlike
+    /// `has_backlight_control`, which names a capability. False here does not
+    /// mean "no serial"; it means "the serial does not distinguish units".
+    pub has_unique_usb_serial: bool,
     /// Serial baud rate this model speaks.
     pub default_baud: u32,
     /// Receive coverage, as inclusive `(low_mhz, high_mhz)` bands.
@@ -157,10 +271,24 @@ pub const BC125AT_FAMILY: ScannerCapabilities = ScannerCapabilities {
     has_battery_save: true,
     has_contrast: true,
     has_weather_alert: true,
+    has_service_search_groups: true,
+    has_search_options: true,
+    close_call_bands: &[
+        Some("VHF Low"),
+        Some("Air"),
+        Some("VHF High"),
+        Some("UHF"),
+        Some("800 MHz"),
+    ],
+    has_close_call_hit_scan: true,
+    has_priority_clear: true,
+    has_key_beep: true,
     key_beep_needs_program_mode: false,
     // Per docs/BC125AT_PROTOCOL.md §5.3. Negatives are pre-delays.
     valid_delays: &[-10, -5, 0, 1, 2, 3, 4, 5],
     cleared_delay: 2,
+    // Every unit reports `0001` (measured on both, 2026-08-26).
+    has_unique_usb_serial: false,
     default_baud: 115_200,
     // docs/SCANNER_PROTOCOL_REFERENCE.md §6.
     coverage_bands: &[(25.0, 54.0), (108.0, 174.0), (225.0, 380.0), (400.0, 512.0)],
@@ -188,11 +316,25 @@ pub const BC75XLT: ScannerCapabilities = ScannerCapabilities {
     has_battery_save: false,
     has_contrast: false,
     has_weather_alert: false,
+    has_service_search_groups: false,
+    has_search_options: false,
+    close_call_bands: &[
+        Some("VHF Low"),
+        Some("Air"),
+        Some("VHF High"),
+        None,
+        Some("UHF"),
+    ],
+    has_close_call_hit_scan: false,
+    has_priority_clear: false,
+    has_key_beep: false,
     key_beep_needs_program_mode: true,
     // Vendor spec: `[DLY] : Delay Time (0:OFF / 1:ON)`.
     valid_delays: &[0, 1],
     // Observed: `CIN,299 -> CIN,299,,00000000,,,0,1,0`.
     cleared_delay: 0,
+    // The CP2104 bridge is programmed per unit by Silicon Labs, e.g. 020D43D8.
+    has_unique_usb_serial: true,
     default_baud: 57_600,
     // Owner's manual, "FREQUENCY RANGE". No 225-380 band; UHF starts at 406.
     coverage_bands: &[(25.0, 54.0), (108.0, 174.0), (406.0, 512.0)],
@@ -339,6 +481,13 @@ mod tests {
         assert!(c.has_battery_save);
         assert!(c.has_contrast);
         assert!(c.has_weather_alert);
+        assert!(c.has_service_search_groups);
+        assert!(c.has_search_options);
+        assert!(c.has_close_call_hit_scan);
+        assert!(c.has_priority_clear);
+        assert_eq!(c.close_call_bands[3], Some("UHF"));
+        assert_eq!(c.close_call_bands[4], Some("800 MHz"));
+        assert!(c.has_key_beep);
         assert!(!c.key_beep_needs_program_mode);
     }
 
@@ -374,7 +523,16 @@ mod tests {
         assert!(!c.has_battery_save);
         assert!(!c.has_contrast);
         assert!(!c.has_weather_alert);
+        assert!(!c.has_service_search_groups);
+        assert!(!c.has_search_options);
+        assert!(!c.has_close_call_hit_scan);
+        assert!(!c.has_priority_clear);
+        // Position 4 is reserved and 5 is UHF -- the reverse of the BC125AT.
+        // Hardware 2026-08-28: writing 11111 reads back 11101.
+        assert_eq!(c.close_call_bands[3], None);
+        assert_eq!(c.close_call_bands[4], Some("UHF"));
         // KBP,NG outside program mode; KBP,,0 inside.
+        assert!(!c.has_key_beep);
         assert!(c.key_beep_needs_program_mode);
     }
 

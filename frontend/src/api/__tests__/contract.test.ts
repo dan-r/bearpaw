@@ -109,6 +109,7 @@ const CALLS: Array<[string, (c: ScannerAPIClient) => Promise<unknown>]> = [
   ['getLockouts', (c) => c.getLockouts()],
   ['clearTemporaryLockouts', (c) => c.clearTemporaryLockouts()],
   ['clearGlobalLockouts', (c) => c.clearGlobalLockouts()],
+  ['removeGlobalLockout', (c) => c.removeGlobalLockout(146.52)],
   ['clearChannelLockouts', (c) => c.clearChannelLockouts()],
   ['syncMemory', (c) => c.syncMemory()],
   ['cancelSync', (c) => c.cancelSync()],

@@ -39,9 +39,16 @@ const EXPECTED_KEYS = [
   'has_battery_save',
   'has_contrast',
   'has_weather_alert',
+  'has_service_search_groups',
+  'has_search_options',
+  'close_call_bands',
+  'has_close_call_hit_scan',
+  'has_priority_clear',
+  'has_key_beep',
   'key_beep_needs_program_mode',
   'valid_delays',
   'cleared_delay',
+  'has_unique_usb_serial',
   'default_baud',
   'coverage_bands',
 ] as const;
@@ -74,9 +81,16 @@ describe('ScannerCapabilities contract', () => {
     expect(typeof caps.has_battery_save).toBe('boolean');
     expect(typeof caps.has_contrast).toBe('boolean');
     expect(typeof caps.has_weather_alert).toBe('boolean');
+    expect(typeof caps.has_service_search_groups).toBe('boolean');
+    expect(Array.isArray(caps.close_call_bands)).toBe(true);
+    expect(caps.close_call_bands).toHaveLength(5);
+    expect(typeof caps.has_close_call_hit_scan).toBe('boolean');
+    expect(typeof caps.has_priority_clear).toBe('boolean');
+    expect(typeof caps.has_key_beep).toBe('boolean');
     expect(typeof caps.key_beep_needs_program_mode).toBe('boolean');
     expect(Array.isArray(caps.valid_delays)).toBe(true);
     expect(typeof caps.cleared_delay).toBe('number');
+    expect(typeof caps.has_unique_usb_serial).toBe('boolean');
     expect(typeof caps.default_baud).toBe('number');
     expect(Array.isArray(caps.coverage_bands)).toBe(true);
     for (const band of caps.coverage_bands) {

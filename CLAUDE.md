@@ -79,9 +79,16 @@ capabilities are always read under one lock.
 | `has_tone_squelch` | true | false (`[RSV]`) |
 | `has_backlight_control` | true | false (no `BLT` command) |
 | `has_battery_save` / `has_contrast` / `has_weather_alert` | true | false (`ERR`) |
+| `has_service_search_groups` | true | false (no `SSG` command) |
+| `has_search_options` | true | false (`SCO` writes rejected, incl. a write of the value it just reported — hardware 2026-09-02) |
+| `close_call_bands` | VHF Low, Air, VHF High, UHF, 800 MHz | VHF Low, Air, VHF High, **reserved**, UHF |
+| `has_close_call_hit_scan` | true | false (`CLC` field 5 is `[RSV]`) |
+| `has_priority_clear` | true (`DCH`+rewrite) | false — no `DCH`, and the firmware swaps within a bank itself |
+| `has_key_beep` | true | false (`KBP` beep field is `[RSV]`) |
 | `key_beep_needs_program_mode` | false | true (`KBP,NG` outside PRG) |
 | `valid_delays` | `-10,-5,0,1,2,3,4,5` (seconds) | `0,1` (boolean) |
 | `cleared_delay` | 2 | 0 |
+| `has_unique_usb_serial` | false (every unit reports `0001`) | true (per-unit CP2104) |
 | `default_baud` | 115200 | 57600 |
 | `coverage_bands` | 25–54, 108–174, 225–380, 400–512 | 25–54, 108–174, 406–512 |
 
@@ -99,6 +106,12 @@ capabilities are always read under one lock.
    before the wire, never "sent and hope".
 4. **Adding a model means adding a descriptor.** `every_accepted_model_resolves_to_capabilities`
    fails otherwise; without it a new model silently inherits BC125AT constants.
+5. **A half-fix can be worse than none.** `close_call_bands` is a labels list,
+   not a "position 4 is reserved" flag, because the families swap TWO facts at
+   once: which slot is dead, and what slot 5 is called. Hiding only the
+   obviously-wrong 800 MHz row on a BC75XLT would leave a "UHF" switch writing
+   the reserved slot — a control that looks right, reads back plausibly, and
+   does nothing. The visibly-absurd row at least prompts someone to look.
 
 The TypeScript mirror is verified against real Rust output: a backend test writes
 `frontend/src/test/fixtures/scanner-capabilities.json` from the actual allowlist
@@ -112,7 +125,7 @@ file. A hand-written fixture would pass whether or not it matched.
 - Live tone fields, populated only during a hit (`None` while squelch is closed): `tone_squelch_kind`, `tone_squelch`, `tone_dcs_code`, `tone_dcs_label`.
 - Updated by the poll loop in [`crates/bearpaw-api/src/api/poll.rs`](crates/bearpaw-api/src/api/poll.rs).
 
-**Channel memory** — every channel read once during memory sync via `PRG` → `CIN,1` … `CIN,<channel_count>` → `EPG` (500 on the BC125AT family, 300 on a BC75XLT — the bound comes from `ScannerCapabilities`, not a constant). Cached in `AppState.shadow` (`ShadowState.channels`). Channel memory is **not** persisted across restarts — SQLite holds only preferences and analytics; every backend start needs a fresh memory sync.
+**Channel memory** — every channel read once during memory sync via `PRG` → `CIN,1` … `CIN,<channel_count>` → `EPG` (500 on the BC125AT family, 300 on a BC75XLT — the bound comes from `ScannerCapabilities`, not a constant). Cached in `AppState.shadow` (`ShadowState.channels`) and **persisted to SQLite** since #413 ([`channel_cache.rs`](crates/bearpaw-api/src/api/channel_cache.rs)), so a restart adopts the previous session's channels at connect instead of paying the walk again. The cache is a **read accelerator, not the source of truth** — the scanner is the truth, every user write reaches hardware first, and nothing may write to the cache and upload later. See **Channel-memory cache** below.
 
 **`DeviceInfo`** — static metadata: model name (from `MDL`), port, connection_status. Same module.
 
@@ -199,8 +212,9 @@ Commonly used commands (all implemented in [`crates/bearpaw-api/src/protocol/mod
 | `SCG` | Bank-enable mask (10 chars, `'1'`=disabled) | PRG |
 | `VOL`, `SQL` | Volume / squelch | any |
 | `PRI` | Priority mode | PRG |
-| `KBP` | Key beep | either on the BC125AT family; **PRG only** on a BC75XLT (`KBP,NG` outside) |
+| `KBP` | Key beep + key lock | either on the BC125AT family; **PRG only** on a BC75XLT (`KBP,NG` outside), where the beep field is `[RSV]` and only the lock is settable |
 | `BLT`, `BSV`, `CNT`, `WXS` | Backlight, battery save, contrast, weather alert | either — **absent on the BC75XLT**, all reply `ERR` |
+| `SSG` | Service-search avoid mask (10 chars) | PRG — **absent on the BC75XLT**, which has service search but no way to enable a band remotely |
 | `BPL` | Band plan (USA/Canada). Where modulation lives on a BC75XLT | PRG |
 
 CTCSS/DCS codes (0–231) are decoded to Hz in [`crates/bearpaw-api/src/protocol/tones.rs`](crates/bearpaw-api/src/protocol/tones.rs).
@@ -250,13 +264,13 @@ VITE_WS_URL=                # auto-detect from window.location if empty
 - [`crates/bearpaw-api/src/api/poll.rs`](crates/bearpaw-api/src/api/poll.rs) — poll loop, hit detection
 - [`crates/bearpaw-api/src/api/program_mode.rs`](crates/bearpaw-api/src/api/program_mode.rs) — PRG/EPG RAII guard
 - [`crates/bearpaw-api/src/api/memory_sync.rs`](crates/bearpaw-api/src/api/memory_sync.rs) — `CIN,1..500` walker
+- [`crates/bearpaw-api/src/api/channel_cache.rs`](crates/bearpaw-api/src/api/channel_cache.rs) — channel-memory persistence: snapshot flush, guarded load
 - [`crates/bearpaw-api/src/api/ws.rs`](crates/bearpaw-api/src/api/ws.rs) — WebSocket broadcast
 - [`crates/bearpaw-api/src/api/security.rs`](crates/bearpaw-api/src/api/security.rs) — CORS + Host-header hardening. The API is an unauthenticated loopback server, so any web page the user visits is the threat; this closes the cross-origin-fetch and DNS-rebinding paths.
 - [`crates/bearpaw-api/src/api/handlers/`](crates/bearpaw-api/src/api/handlers/) — REST handlers (analytics, banks, commands, exports, import_ss, lockouts, memory, preferences, settings, status)
 - [`crates/bearpaw-api/src/protocol/mod.rs`](crates/bearpaw-api/src/protocol/mod.rs) — STS/GLG/CIN/PWR parsers
 - [`crates/bearpaw-api/src/protocol/capabilities.rs`](crates/bearpaw-api/src/protocol/capabilities.rs) — `ScannerCapabilities`: per-model memory model and feature set
 - [`crates/bearpaw-api/src/protocol/tones.rs`](crates/bearpaw-api/src/protocol/tones.rs) — CTCSS/DCS code → Hz
-- [`crates/bearpaw-api/src/protocol/defaults.rs`](crates/bearpaw-api/src/protocol/defaults.rs) — factory-default custom-search ranges (read-only; no `CSP` write path)
 - [`crates/bearpaw-api/src/logging.rs`](crates/bearpaw-api/src/logging.rs) — tracing setup, file + error log appenders
 - [`crates/bearpaw-api/src/transport.rs`](crates/bearpaw-api/src/transport.rs), [`transport_usb.rs`](crates/bearpaw-api/src/transport_usb.rs)
 - [`crates/bearpaw-api/src/state.rs`](crates/bearpaw-api/src/state.rs) — `LiveState`, `ChannelData`, `DeviceInfo`
@@ -286,6 +300,9 @@ Gated by the `check_updates_on_launch` preference (default `true`, toggled on th
 
 ## Documentation
 
+- [`docs/PROCESS.md`](docs/PROCESS.md) — how work is filed, labelled, built,
+  documented and released, and which check enforces each rule. Read it before
+  opening an issue or a PR.
 - [`docs/SCANNER_PROTOCOL_REFERENCE.md`](docs/SCANNER_PROTOCOL_REFERENCE.md) — canonical wire-protocol reference
 - [`docs/API_SPEC.md`](docs/API_SPEC.md) — REST + WebSocket API contract
 - [`docs/WEBSOCKET_SCHEMA.md`](docs/WEBSOCKET_SCHEMA.md) — WS message shapes
@@ -330,13 +347,35 @@ This resolves a long-standing note in [`docs/SCANNER_PROTOCOL_REFERENCE.md`](doc
 ## Testing and CI
 
 - **Backend:** `cargo test -p bearpaw-api --lib` and `cargo fmt --all -- --check`. Fixtures driven by captures in `docs/wire_captures/`.
-- **Frontend:** `npm test -- --run` (vitest), `npm run lint`, `npm run type-check`, `npm run format:check`. All four run on every PR via [`.github/workflows/tests.yml`](.github/workflows/tests.yml).
-- **CI also runs `cargo check --workspace --all-targets`** in the backend job — a deliberate guard against silent drift in the Tauri crate (see the comment in `tests.yml` citing PR #80). Run it locally if your change touches anything the Tauri shell links against.
+- **Frontend:** `npm test -- --run` (vitest), `npm run lint`, `npm run type-check`, `npm run format:check`.
+- **CI also runs `cargo check --workspace --all-targets`** in the backend job — a deliberate guard against silent drift in the Tauri crate (see the comment in `tests.yml` citing PR #80). Run it locally if your change touches anything the Tauri shell links against. It needs `frontend/dist` to exist: `tauri::generate_context!` reads `frontendDist` at **compile** time and panics if the directory is missing, which reads like a Rust regression and is not one. CI builds the frontend first for exactly this reason; in a fresh worktree you must too (`cd frontend && npm ci && npm run build`).
 - [`.github/workflows/build.yml`](.github/workflows/build.yml) is the release pipeline: tag-triggered (`v*`), multi-platform Tauri bundles (macOS aarch64/x86_64, Windows, Linux). It does not run on PRs.
+
+### The five required checks, and why `tests.yml` has no `paths:` filter
+
+As of 2026-08-29 `main` is branch-protected, and [`tests.yml`](.github/workflows/tests.yml)'s five jobs are **required status checks**:
+
+`Backend Tests` · `Frontend Tests` · `Frontend Lint` · `Frontend Type Check` · `Frontend Format Check`
+
+No required reviews (solo maintainer), `strict` off, `enforce_admins` off. CodeQL and `claude-review` deliberately are **not** required — `Analyze (rust)` alone takes ~7 min against ~3 for all of Tests, and `claude-review` is skipped on Dependabot and fork PRs, where a skipped required check would block the merge.
+
+**These two settings are coupled, and the coupling is easy to miss.** `tests.yml` used to carry a `paths:` allowlist so docs-only PRs skipped ~9 minutes of pointless build. That was correct while its stated premise held — the comment said so plainly: *"`main` has no branch protection, so a PR reporting zero checks is still mergeable."* Adding protection silently invalidated it: **a required check that never runs never reports, so a filtered-out PR becomes permanently unmergeable**, not fast. Every docs-only, `site/**`-only and workflow-bump PR was affected, Dependabot's included. Removed in #535.
+
+If a path filter is ever wanted back, it must ship together with a companion workflow reporting those same five job names for the excluded paths — and that companion is its own landmine, because renaming a job here without renaming it there blocks every PR with no visible cause.
 
 ## Definition of done / PR discipline
 
+[`docs/PROCESS.md`](docs/PROCESS.md) is the authoritative description of this
+process; what follows is the part that matters most while writing code. Where
+the two disagree, `PROCESS.md` is the one that is kept current against the
+checks.
+
 Every change lands via a PR to `main` — never push to `main` directly, even for one-line fixes.
+
+**Every PR links an issue** (`Fixes #123`), carries exactly one type label
+(`bug`, `feat`, `docs`, `chore`), and has a milestone. A `bug` or `feat` PR
+writes its own `CHANGELOG.md` entry under `[Unreleased]` — not at release time.
+The advisory `PR Preflight` check reports all four.
 
 1. **Branch off `main`** with a semantic prefix: `phase/`, `feat/`, `fix/`, `cleanup/`, `chore/`, `docs/`.
 2. **Tiny, single-purpose PRs.** One concern per PR, independently revertible, reviewable in under 10 minutes. If it's growing past ~250 LOC, split it.
@@ -344,6 +383,18 @@ Every change lands via a PR to `main` — never push to `main` directly, even fo
 
    Run `cargo fmt --all` (no `--check`) to fix Rust formatting. It is safe to run repo-wide: the drift that made it produce unreviewable diffs was cleared in #394, and CI now keeps it clean.
 4. **Never push to retry CI.** If a check fails, reproduce and fix locally first.
+5. **Merging is deliberate.** `allow_auto_merge` is `false` on this repo, and `--auto` does not fail cleanly when it is off — it silently degrades to merge-now, with no output that reliably signals which happened. Never pass `--auto`. Wait for the checks, confirm, then `gh pr merge <n> --squash`. See the `bearpaw-pr` skill.
+
+### Verify the setting before acting on the procedure that depends on it
+
+Every rule here was true when written. Some stopped being true without anyone editing the sentence — and a stale *procedure* is more dangerous than a stale *fact*, because a procedure gets followed rather than read.
+
+Two instances, both on 2026-08-29, both one API call away from being caught:
+
+- The `bearpaw-pr` skill instructed enabling auto-merge on every PR. The repo setting had since flipped off, so the flag degraded to merge-now and landed a PR **seven seconds** after opening, before any check started. `gh api repos/jeremyfuksa/bearpaw --jq .allow_auto_merge` says `false`.
+- Branch protection was added without checking what depended on the old unprotected state. `tests.yml`'s `paths:` filter — whose own comment named that dependency in plain English — would have made every docs-only PR unmergeable.
+
+So: before following a documented procedure that turns on a repo, service, or tool setting, **check the setting**. Docs are evidence; the API is truth. And when you find a conflict between two rules here, **surface it rather than silently picking a side** — picking quietly is what turned both of the above from a contradiction into an incident.
 
 ## Third-rail flows
 
@@ -354,24 +405,89 @@ When you touch code near one of these guards, **read the comment**, run the name
 | Flow | Code site | Test name | Why it broke before |
 | --- | --- | --- | --- |
 | WS subscription is stable across `liveState` updates | [`frontend/src/app/App.tsx`](frontend/src/app/App.tsx) WS-subscribe `useEffect` deps array | `frontend/src/app/__tests__/App.regression.test.tsx :: WS subscription is stable across liveState updates` | A PR added `liveState?.mode` to the deps array; the effect re-registered all four WS subscriptions on every poll tick (~5 Hz), cancelling in-flight scan-resume timers and producing visible "the app is misbehaving" churn. Handlers that need the latest mode must read it via `useStore.getState().liveState?.mode` at invocation time. |
-| Memory-sync overlay covers subsequent syncs | [`frontend/src/app/App.tsx`](frontend/src/app/App.tsx) overlay `<AnimatePresence>` block | `frontend/src/app/__tests__/App.regression.test.tsx :: memory-sync overlay covers subsequent syncs` | PR #102 lifted the overlay to cover the whole UI during sync but gated it on `isInitialSyncing = inProgress && !hasSyncedInitially`. After the first sync, `hasSyncedInitially` flipped permanently true, so File → Sync Memory ran 30-45 s of PRG/CIN/EPG with no overlay — users could click into Channels/Device and corrupt the in-flight bracket. Gate on `isMemorySyncing` directly. |
+| Memory-sync overlay covers subsequent syncs | [`frontend/src/app/App.tsx`](frontend/src/app/App.tsx) overlay `<AnimatePresence>` block | `frontend/src/app/__tests__/App.regression.test.tsx :: memory-sync overlay covers subsequent syncs` | PR #102 lifted the overlay to cover the whole UI during sync but gated it on `isInitialSyncing = inProgress && !hasSyncedInitially`. After the first sync, `hasSyncedInitially` flipped permanently true, so File → Sync Memory ran 30-45 s of PRG/CIN/EPG with no overlay — users could click into Channels/Device during a sync. **Corrected 2026-08-30: the stated hazard — "corrupt the in-flight PRG bracket" — is NOT reachable.** `ControlCommand::StartSync` dispatches `memory_sync::run_*` INLINE inside the poll thread's own `cmd_rx.try_recv()` drain loop, so the queue is not drained for the sync's duration and no user command can interleave with the PRG/CIN/EPG bytes. Every PRG-needing handler is refused before the wire anyway: `ProgramModeGuard::enter` returns 409 while `sync_task_id` is set. What the overlay actually buys is (a) suppression of a 409/timeout toast storm and (b) an honest display — the poll loop yields `STS`/`GLG` during program mode, so a non-blocking UI would show a frozen frequency that looks live. Both are real; neither is data corruption. Keep gating on `isMemorySyncing` directly, and do not justify the overlay on bracket-corruption grounds. Also stale: the sync is **~5 s** on a BC125AT over direct USB (measured three times, 2026-08-30), not 30–45 s. |
 | Cancel-sync runs the post-sync chain via the WS message | [`frontend/src/app/App.tsx`](frontend/src/app/App.tsx) `handleCancelSync` | `frontend/src/app/__tests__/App.regression.test.tsx :: handleCancelSync runs the post-sync chain via WS` | `handleCancelSync` synchronously set `inProgress: false` after the cancel API returned; the subsequent WS "Sync cancelled" message hit a progress handler that gated the post-sync chain on `currentSync.inProgress`, so channel-refresh and scan-resume were silently skipped on every cancel. The cancel handler must only request cancellation; the WS message is what flips `inProgress` and runs the chain. **One exception (#137):** on a `no_task` reply no WS message will ever come — that branch (and only that branch) clears `inProgress` locally. |
 | Sync-status reconnect probe only clears state on reconnects | [`frontend/src/app/App.tsx`](frontend/src/app/App.tsx) reconnect `getSyncStatus` `useEffect` | `frontend/src/app/__tests__/App.regression.test.tsx :: sync-status reconnect probe only clears state on reconnects` | The #137 stuck-overlay fix probes `GET /memory/sync/status` on WS connect. On the *initial* connect that probe races the auto-start-sync effect — the status snapshot can be served before `POST /memory/sync` registers the task, and acting on the stale "not syncing" answer drops the blocking overlay while a PRG bracket is open. Clear-direction reconciliation must stay gated on `isReconnect`; adopting a running sync is safe unconditionally. |
 | HOLD button label stays "HOLD" in both held/not-held states | [`frontend/src/app/components/ScannerUI.tsx`](frontend/src/app/components/ScannerUI.tsx) HOLD `<button>` | `frontend/src/app/components/__tests__/ScannerDisplay.test.tsx :: toggles HOLD button aria-pressed and aria-label when isHolding flips` | The visible label used to flip "HOLD" ↔ "SCAN" with `isHolding`, which implied "press here to resume" while simultaneously being the same control that entered HOLD. The held/not-held signal is now carried by `aria-pressed`, `aria-label`, and the highlight color — do not reintroduce a text-label flip. |
-| Priority swap is atomic (clear-old fails → new not set) | `set_channel_priority` in `crates/bearpaw-api/src/api/mod.rs` | `plan_priority_swap_orders_clear_before_set` (+ the `REGRESSION GUARD (priority swap atomicity)` comment at the code site) | Clearing a channel's priority is a destructive DCH+rewrite; setting the new priority channel before—or despite—a failed clear can leave a bank with two priority channels or a DCH-deleted, unrestored channel. The clear must run first, in a single ProgramModeGuard bracket, with its error propagated so a failed clear aborts the swap. |
+| Priority swap is atomic (clear-old fails → new not set) | `set_channel_priority` in `crates/bearpaw-api/src/api/mod.rs` | `plan_priority_swap_orders_clear_before_set`, `priority_swap_skips_the_clear_where_the_firmware_owns_it`, `priority_swap_still_clears_where_bearpaw_owns_it`, `priority_swap_survives_a_failed_post_set_reread` (+ the `REGRESSION GUARD (priority swap atomicity)` comments at the code site) | Clearing a channel's priority is a destructive DCH+rewrite; setting the new priority channel before—or despite—a failed clear can leave a bank with two priority channels or a DCH-deleted, unrestored channel. The clear must run first, in a single ProgramModeGuard bracket, with its error propagated so a failed clear aborts the swap. **#479 update:** that is true only where Bearpaw owns the clear. A BC75XLT has no `DCH` and refuses an in-place clear, but its firmware moves the flag within a bank itself (hardware 2026-08-28) — so the clear is skipped on `!has_priority_clear` and the old channel is re-read AFTER the set. Running the clear there was not merely redundant, it was the one step that could not work: every swap failed. The two guards are paired because asserting only the BC75XLT half would pass for a build that never clears on any model. **#532 update:** the two reads in this function are NOT symmetric and must not be made so. The clear-before-set read propagates with `?` because nothing is committed yet, so failing aborts the swap. The post-set re-read is informational — the `CIN` write is already sent and verified by readback when it runs — so its error is warned, not propagated. Propagating it reported a failed swap for a change the scanner had committed, on the one model whose CP210x bridge is documented to `ERR` a first command (pitfall #11). |
 | Channel reorder is keyboard-operable | [`frontend/src/app/components/views/ChannelsTab.tsx`](frontend/src/app/components/views/ChannelsTab.tsx) grip `<button>` in `ChannelRow` | `frontend/src/app/components/views/__tests__/ChannelsTab.test.tsx :: Keyboard reordering (#236)` | Reorder is driven by `react-dnd`'s **TouchBackend** (the HTML5 backend never fires `dragover`/`drop` in Tauri's WKWebView, #195), and pointer backends have no keyboard interaction at all — so the grab/move/drop path on the grip button is the *only* way a keyboard-only user can reorder (WCAG 2.1.1, Level A). If the grip reverts to a decorative `GripVertical` icon, the whole capability silently disappears with no visual change. The grab deliberately lives on its own focusable control rather than the row's Enter/Space, which is already claimed by the a11y C1 guard (open edit sheet). Reorder is also filter-unsafe — `rowIndex` is a position in the *filtered* list while `moveRow` splices the *unfiltered* bank order — so the grip must stay disabled while a search term is active. |
 | Leaving the Device page resumes scan | [`frontend/src/app/App.tsx`](frontend/src/app/App.tsx) `handleTabChange` (+ the `TabBar` wiring) | `frontend/src/app/__tests__/App.regression.test.tsx :: leaving the Device page resumes scan` | A Device-page write (unlock, bank/priority edit) runs inside a PRG/EPG bracket that parks the scanner in HOLD at ch1. Scan is intentionally NOT resumed on the page; it resumes when the user navigates away to Scan/Channels. Two regressions: dropping the `leavingDevice` resume in `handleTabChange`, or wiring `TabBar`'s `onTabChange` straight to `setCurrentTab` (bypassing the handler, so tab-bar clicks — the primary navigation — never resume and the scanner stays stuck at ch1). |
 | `buildEmptyDraft` describes a cleared channel as the SCANNER reports it | [`frontend/src/app/components/views/ChannelsTab.tsx`](frontend/src/app/components/views/ChannelsTab.tsx) `buildEmptyDraft` (+ the `isClearPending` gate in the row-render loop) | `frontend/src/app/components/views/__tests__/ChannelsTab.test.tsx :: buildEmptyDraft matches a cleared channel as the scanner reports it` (+ `buildDraft returns the empty-draft shape for a cleared channel`, `an uploaded clear stops counting as a pending change`) | `buildDraft` short-circuits to `buildEmptyDraft` for any zero-frequency channel, so after an uploaded clear the rebuilt draft is diffed against the refetched channel by `draftChanges`' `hasChanges`. Every field that disagrees keeps the channel in `pendingChannelIds` **forever** — the row keeps its pending/cleared styling AND Upload Changes stays lit, rewriting those channels on every upload. `buildEmptyDraft` was written as "zero everything out" (`delay: '0'`, `lockout: false`); the hardware reports `delay: 2, lockout: true` for a cleared slot. Measured on the dev unit: 150/150 cleared channels permanently pending before, 0/150 after. Neither field is a sentinel — 0 is a valid delay and `lockout: false` is a real, different state — so do not "simplify" this back to zeroes. Both helpers are exported **for the tests**: two earlier attempts at this guard hand-built the draft shape in the test file and passed happily with the bug reintroduced, so the guard must assert the real function. The related `isClearPending` gate (`isCleared && isPending`) is necessary but NOT sufficient on its own: it gates on a signal that this bug prevented from ever clearing. **#404 update:** the cleared-slot delay is MODEL-DEPENDENT and now comes from `ScannerCapabilities.cleared_delay` — the BC125AT family reports 2, a BC75XLT reports 0 (`CIN,299 -> CIN,299,,00000000,,,0,1,0`, hardware 2026-08-26). Hardcoding either value reproduces this exact bug on the other scanner. Lockout is `true` on both, so it stays a literal. |
 
 | Bank derivation follows the connected scanner | [`crates/bearpaw-api/src/protocol/mod.rs`](crates/bearpaw-api/src/protocol/mod.rs) `parse_cin_response` (leaves `bank: 0`) + `AppState::channels_with_banks` in [`api/mod.rs`](crates/bearpaw-api/src/api/mod.rs) + `deriveBankFromIndex` in [`ChannelsTab.tsx`](frontend/src/app/components/views/ChannelsTab.tsx) | `cin_does_not_derive_bank` **and** `channels_with_banks_derives_per_model` (+ `deriveBankFromIndex` suite in `ChannelsTab.test.tsx`) | Bank width is 50 channels on the BC125AT family and 30 on the BC75XLT, but a hardcoded `/ 50` lived in three places — the parser, the free function, and a frontend duplicate. All three agreed while all three were wrong: measured on hardware, 7 of 11 sampled BC75XLT channels were misfiled and channel 300 reported bank 6 instead of 10. Roughly a third of channels are correct by coincidence (channel 60 is bank 2 either way), which is why a spot check misses it. The parser CANNOT derive bank — it is pure, with no `AppState` and so no capability descriptor — and the wire carries no bank field at all (membership comes from `SCG`), so `bank: 0` there is an accurate statement rather than a placeholder. The two guards are paired on purpose: either alone passes while banks are broken. If the frontend and backend ever disagree, the UI files a channel in one bank while the scanner is told another — which is how a priority swap clears the wrong bank. |
+| An exported CSV can be re-imported | `export_csv` in [`api/handlers/exports.rs`](crates/bearpaw-api/src/api/handlers/exports.rs) — read through `AppState::channels_with_banks`, never `state.shadow` directly | `an_exported_csv_re_imports` | `export_csv` collected channels straight out of the cache and wrote `ch.bank` into the Bank column. Bank is not a wire field: `parse_cin_response` leaves it `0` (the row above) and ONLY `channels_with_banks` derives it, so every exported row said `Bank,0` — which `parse_import_csv_row` rejects with `Invalid bank: 0`. Bearpaw's own export could not be re-imported, and had not been since #421 moved the derivation out of the parser and updated every reader except this one. Measured on the dev unit 2026-09-01: **350 programmed channels, 350 errors, 0 imported.** The silent half is worse — the 150 cleared rows hit `Ok(None)` (frequency 0 is skipped BEFORE the bank check) and vanished from both the imported count and the error list, so the toast read "Imported 0 — 350 failed" while quietly dropping 150 more. Every other test in that module hand-builds its row with `("Bank", "1")`, a value the export never produced, so all of them passed for the whole life of the bug; `parse_empty_slot_is_skipped_not_error` even cites "the hundreds of import errors bug" while fixing only the cleared half. **The guard must drive the real `export_csv` and assert the derived VALUE** (indices 1, 60, 500 → banks 1, 2, 10): a parses-without-error check passes for an export hardcoding `1`, which misfiles every channel above bank 1. The bank column is decorative — it never reaches the wire — so this cost nothing but the round trip; see the follow-up issue on whether import should validate it at all. |
+| An empty `.ss` row is a CLEAR, not an absence | `parse_ss_channel` / `cleared_channel` / `carry_stuck_priority` in [`api/handlers/import_ss.rs`](crates/bearpaw-api/src/api/handlers/import_ss.rs) | `cfreq_zero_freq_is_a_clear_not_a_dropped_row`, `an_empty_row_is_shaped_for_the_connected_model`, `an_empty_row_encodes_to_a_writable_cin_payload`, `a_blank_bc75xlt_file_parses_to_a_clear_for_every_slot`, `a_blank_bc125at_file_parses_to_a_clear_for_every_slot`, `a_mixed_file_yields_a_row_per_slot_matching_the_file`, `a_clear_carries_the_slots_existing_priority_and_leaves_programmed_rows_alone` | `parse_ss_channel` returned `Ok(None)` for `freqHz=0` and `parse_ss_config` dropped it, so a UI promising "overwrites all channels and settings" cleared nothing: every slot the file said was empty kept whatever was already programmed. A blank fixture — 500/300 explicit clears, which is what `docs/SS_FILE_FORMAT.md` says the tool writes — reported `Config restored (0 channels)` and left the radio untouched. The old guards codified the bug: `cfreq_zero_freq_is_empty_slot` asserted `is_none()` and `a_blank_bc75xlt_file_parses_to_no_channels` asserted `channels.is_empty()`, so both passed for the whole life of it. **Three traps.** (a) The cleared shape is MODEL-DEPENDENT — `cleared_delay` is 2 on the BC125AT family, 0 on a BC75XLT — and getting it wrong fails `is_factory_empty` on readback, surfacing as `channel_not_persisted` AFTER the write landed (#402's shape). Both models are pinned; mutation-tested, hardcoding 2 turns four guards red and leaves the BC125AT-only ones green, which is why they are paired. (b) A clear must send the slot's EXISTING priority bit: the firmware refuses an in-place priority 1→0 `CIN` write and a BC75XLT has no `DCH` at all, so `readback_matches`' zero-frequency branch only tolerates a stuck priority when we WROTE 1. Sending the file's literal `Off` reports a spurious clear failure for every priority channel on every restore. (c) That guard's own first draft could not fail — the programmed row it asserted about was absent from the shadow, so `unwrap_or(false)` satisfied it either way; the row must be PRESENT and priority-holding for the assertion to mean anything. |
+| An export refuses a partial channel image | `require_complete_channel_image` in [`api/handlers/exports.rs`](crates/bearpaw-api/src/api/handlers/exports.rs), called by all three exporters | `an_export_from_an_incomplete_shadow_is_refused`, `a_complete_shadow_still_exports_every_row` | The three exporters failed DIFFERENTLY from one cause. `export_bc75xlt_ss_file` INVENTED a row for a channel missing from the shadow (`ch.map(..).unwrap_or(false)`), emitting `freq 0, lockout Off, priority Off` — indistinguishable from a real empty slot and wrong. `export_bc125at_ss_file` and `export_csv` OMITTED it instead, writing a short file where Uniden's own tool always writes every slot. Measured on the dev unit 2026-09-02: after an import left 49 empty slots absent from the shadow, all 49 exported as `lockout Off` where the radio reports `On`; a full sync then made the export byte-identical to the backup taken before. **This got worse the moment #636 landed:** an empty `.ss` row is now an explicit CLEAR, so a file written from a partial shadow is not merely wrong on disk — restoring it WRITES the invented state to the radio. The predicate is `is_complete_image`, the same one the cache-write side uses (#567, #569), reused rather than re-derived so one question has one answer. The two guards are paired and mutation-tested: making the check always pass fails only the refusal guard, making it always refuse fails the positive guard plus five golden `.ss` export tests. The refusal guard seeds the shape actually seen — every slot but one — because an EMPTY shadow passes for a build that only rejects `is_empty()`. Note the CSV *import* handler must NOT get this guard: importing is what you do when memory is not synced. |
 | A migration step is atomic and never bumps the version on failure | [`crates/bearpaw-api/src/api/mod.rs`](crates/bearpaw-api/src/api/mod.rs) `run_migration_step` | `a_failed_step_leaves_the_version_unchanged`, `a_partly_failing_step_rolls_back_entirely`, `a_failed_backup_aborts_the_migration` | Every migration statement was `let _ = conn.execute(...)` followed by an unconditional `set_schema_version`, so a failed step still marked the database migrated: the next launch read the new version, skipped the migration, and queried a schema that did not exist — invisible until a query hit a missing column. The version bump now lives INSIDE the step's transaction, so it cannot outlive a failure. Migrations are forward-only, which makes the pre-migration `.bak` the only recovery path — so a failed backup aborts rather than proceeding, and **nothing in Bearpaw deletes a `.bak`**. A database whose `user_version` is NEWER than this build is refused outright; running old code against a newer schema is silent misbehaviour. See `docs/DATA_LIFECYCLE.md`. |
 | Each test gets its own databases | [`crates/bearpaw-api/src/api/mod.rs`](crates/bearpaw-api/src/api/mod.rs) `fallback_db_path` (cfg-split) | `each_state_gets_its_own_databases` | `resolve_db_path` falls back to a fixed path when its env var is unset, and no test sets one — so all 29 `default_state()` calls opened the SAME two SQLite files and contended under parallel execution. `preferences_reset_alias_matches` deletes every preference row, which a concurrent test could observe mid-assertion. The suite passed with `--test-threads=1` and failed intermittently without it, and adding unrelated tests made it MORE likely to fire. That failure shape is the dangerous one: it trains people to rerun, and CLAUDE.md's "Never push to retry CI" depends on failures being real. |
+| The channel cache records when the RADIO was read | [`channel_cache.rs`](crates/bearpaw-api/src/api/channel_cache.rs) `flush_channel_cache` | `a_flush_records_the_sync_time_not_the_flush_time`, `a_flush_with_no_recorded_sync_stamps_now` | `flush_channel_cache` stamped `epoch_now()`. That was correct while the only caller was a completed sync — there, "now" and "when the radio was read" are the same instant — and #537 added a caller on a 30-second timer, which quietly broke the equivalence: a cache read three days ago relabelled itself as fresh twice a minute, and it overwrote the timestamp a cache load restores within one interval of launch. `synced_at` exists to answer "how stale is this?" (#413 wants "last synced 3 days ago" on screen), and an indicator that always reads "moments ago" is worse than none because it looks like it works. The stamp is `shadow.last_sync`, falling back to `epoch_now()` only when no sync is recorded. **Every test in #537 passed while this was broken** — they asserted `last_synced_at(...).is_some()`, and a guard that checks a value exists cannot notice the value is wrong. The two guards are paired: the first alone passes for a build stamping a hardcoded 0.0. |
+| A cached channel map is only adopted from the SAME scanner | [`channel_cache.rs`](crates/bearpaw-api/src/api/channel_cache.rs) `load_channel_cache` + the call site in [`poll.rs`](crates/bearpaw-api/src/api/poll.rs) `update_device_info_from_mdl` | `a_matching_cache_is_loaded_on_connect`, `a_cache_from_a_larger_scanner_is_discarded`, `a_cache_from_a_smaller_scanner_is_discarded`, `a_reconnect_does_not_overwrite_live_channels`, `a_loaded_cache_restores_the_sync_time` | Three separate traps. **(a)** The capacity comparison is `!=`, not `>`. Rejecting only the too-big direction still lets a BC75XLT's 300 rows load onto a 500-channel BC125AT, and because the frontend suppresses its startup sync whenever channels exist, the wrong radio's memory renders and never refreshes. Nothing panics either way — `index_to_bank` returns 0 above `channel_count` while the frontend's `deriveBankFromIndex` clamps to `bankCount`, so phantoms render in a bank the backend calls 0, and `export_csv` writes them to the user's file. **(b)** The load must run at the MDL chokepoint: before `MDL` is parsed `AppState::capabilities()` answers with the BC125AT default of 500, so an earlier load waves a 500-row cache onto a BC75XLT. Use the local `caps` — `state.capabilities()` takes `device.read()` and the function held `device.write()`. **(c)** It must NOT be gated on `transitioned_to_connected`, which is always false in production (#539) and true in tests: green CI, dead on hardware. Gate on an empty shadow instead — which is also what stops a reconnect (every few seconds on a flapping USB link, and nothing clears `shadow.channels` on disconnect) from stomping live edits with stale rows. The positive guard is not optional: with the load call removed, both discard guards stay green. |
+| Only a complete channel map is written to the cache | [`channel_cache.rs`](crates/bearpaw-api/src/api/channel_cache.rs) `is_complete_image`, applied in `flush_channel_cache` and `load_channel_cache`, plus the per-row error check in `save_channels` | `a_partial_shadow_does_not_overwrite_a_complete_cache`, `a_holed_walk_does_not_delete_the_good_cache`, `a_walk_missing_a_middle_channel_does_not_replace_the_cache`, `a_map_whose_indices_are_shifted_is_refused`, `a_save_whose_insert_fails_does_not_commit` | The write side had NO completeness guard at all — only "the map is not empty" — while the read side inferred it from `max(index)`. Same question, two different wrong answers (#567, #569). `save_channels` DELETEs before inserting, so any non-empty shadow replaced the whole cache: a `GET /memory/channels/:index` landing before the MDL probe leaves ONE row in the shadow, and the 30-second timer then wrote it over 500 good ones. The walk also skips a channel it could not read (a `Soft` error or an unparseable reply — expected over 300–500 commands on a CP210x, pitfall #11), and a skip at the TOP index destroyed the good cache and wrote rows that `load_channel_cache` then rejected on every launch **forever**. Both halves of `is_complete_image` are separately pinned and neither is redundant: delete `len` and only the middle-hole guard goes red, delete `max(index)` and only the shifted-index guard does. The shifted-index guard must assert cache CONTENT, not row count — a shifted map writes exactly `channel_count` rows too, so counting them passes either way (found by mutation, not review). **#569 is fixed by prevention, not tolerance:** a cache with a hole is still discarded at load, because telling "299 rows from a BC75XLT" from "299-of-500 from a BC125AT" needs the writer's capacity STORED, which needs a migration — and #574 says the pre-migration backup is incomplete, so that migration must not land first. |
+| Cached channels suppress the startup memory sync | [`frontend/src/hooks/useAutoMemorySync.ts`](frontend/src/hooks/useAutoMemorySync.ts) (lifted out of `App.tsx` in #568 so it can be MOUNTED) | `frontend/src/hooks/__tests__/useAutoMemorySync.test.tsx` (behavioural) + `frontend/src/app/__tests__/App.regression.test.tsx :: cached channels suppress the startup memory sync` (shape and order) | The early return is what turns "the backend already has channel memory" into "no startup sync" — the user-visible payoff of #413. **CONDITIONAL:** `if (!preferences.rereadMemoryOnConnect && channels.length > 0) return;`. The `reread_memory_on_connect` preference defaults ON, because a user poll (n=20, 2026-08-30) found 45% program their scanner on its own keypad "all the time" — for them a cached list is stale before Bearpaw opens. OFF is the cache-first path. **Both sides are pinned separately, and that is the point:** when this guard first went red against the conditional form, the tempting fix was to loosen it to "the body mentions `channels.length`", which passes for a build where NEITHER path works. **#568 REVERSED one instruction here.** This row used to say to assert "the preference's presence in the deps array". That was wrong, and the bug it let through was the toggle itself driving the radio: `reread_memory_on_connect` governs what happens at CONNECT, so as a dependency it made flipping the switch re-run the effect and start a blocking sync over the settings page the user was standing on. The preference is now read at invocation via `useStore.getState()` and must NOT be in the deps array; `preferencesLoaded` is what carries a stored value to an already-connected launch. The old guard could not have caught it — it asserted the deps array *contained a string*, which a build with the bug satisfies perfectly. That is why this flow now has a behavioural guard as well as source-level ones: source checks pin shape and order and are blind to timing, and this was a timing bug. Two earlier facts here were stale and are corrected: the connect-edge `device_info` broadcast DOES fire (#539 fixed in #551, and App.tsx refetches channels on it), and the sync is ~5 s, not 30–45. |
 
 When you add a flow to this table, also add a `REGRESSION GUARD:` comment at the code site pointing back to the test name.
 
+## Channel-memory cache
+
+Channel memory is persisted to SQLite (`channel_memory`, keyed by `scanner_id`)
+so a restart need not pay the ~5 s walk. Implementation in
+[`channel_cache.rs`](crates/bearpaw-api/src/api/channel_cache.rs); the schema
+arrived with `PREFERENCES_SCHEMA_VERSION` 1 → 2.
+
+**The cache is a read accelerator, not the source of truth.** The scanner is the
+truth. Every user-initiated write goes to hardware first and lands in the cache
+second. Nothing may write to the cache and upload later — that path diverges
+silently and is unrecoverable without a full re-read.
+
+### Writes are whole-map snapshots, never per-site write-through
+
+Eleven production sites across five files mutate `shadow.channels`, and the
+count grows with every handler. Per-site persistence means one missed site
+silently diverges the cache. `flush_channel_cache` writes the WHOLE map instead,
+from three callers — a periodic timer (`CHANNEL_CACHE_FLUSH_SECS`), the end of a
+completed sync, and clean shutdown. A snapshot cannot miss a site, and a
+redundant write costs a couple of milliseconds.
+
+### Rules
+
+1. **`save_channels`/`load_channels` are raw primitives; the guards live in
+   `flush_channel_cache`/`load_channel_cache`.** Production calls the guarded
+   pair. #414 adds a second caller, and a call-site check is a check someone
+   forgets.
+2. **Only flush a COMPLETE map** — `is_complete_image`: `channel_count`
+   entries covering `1..=channel_count`, read from the connected radio's
+   capabilities. `save_channels` DELETEs before inserting, so every flush is a
+   replace, and "not empty" was never enough evidence to justify one (#567).
+   Several handlers insert a single channel, and the walk skips a channel it
+   could not read — both produced a map that replaced the user's whole cache.
+   Both halves of the predicate are load-bearing and separately pinned: `len`
+   catches a hole in the middle, `max(index)` catches a shifted index range.
+3. **`synced_at` records when the RADIO was read, not when the cache was
+   written.** It comes from `shadow.last_sync`. Stamping the flush time made
+   every cache claim it was fresh within one flush interval, forever.
+4. **The load runs at the MDL chokepoint and nowhere earlier.** The capacity
+   guard needs `channel_count`; before `MDL` is parsed `AppState::capabilities()`
+   answers with the BC125AT default of 500, which would wave a 500-row cache
+   onto a BC75XLT. Use the local `caps`, never `state.capabilities()` — that
+   takes `device.read()` while `update_device_info_from_mdl` may hold
+   `device.write()`.
+5. **Never gate anything on `transitioned_to_connected`.** It is always false in
+   production (#539) and true in tests, so a feature gated on it passes CI and
+   is dead on hardware.
+6. **No `bank` column, ever.** Bank width differs per model and is derived from
+   the connected scanner by `channels_with_banks`. A persisted bank would let a
+   cache written under one model be read under another and reproduce the
+   bank-derivation third rail by a new route.
+
 ## Memory sync performance
 
-Reading all 500 channels is slow (~30–45 s):
+Reading all 500 channels takes **~5 s** on a BC125AT over the macOS direct-USB path
+(measured three times, 2026-08-30, POST to `in_progress:false`). This section long said
+30–45 s; that figure predates the current transport and is wrong by roughly 8x. The
+BC75XLT is unmeasured — 300 channels at 57600 through a CP210x is a different transport,
+so do not assume it matches.
+
+Why it is not instant:
 - Each channel is one `CIN,N` round-trip inside the PRG bracket.
 - Progress events go out via WebSocket every ~10 channels.
 - Frontend shows progress bar in the Scan view's sync banner.

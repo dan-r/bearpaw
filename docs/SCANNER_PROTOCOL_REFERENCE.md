@@ -103,7 +103,7 @@ The protocol is **half-duplex, synchronous, ASCII, case-sensitive, single-line b
 
 - **Fields** for "get" commands (`MDL,BC125AT\r`, `GLG,01545500,FM,…\r`)
 - **`OK`** for "set" commands (`KEY,OK\r`, `PRG,OK\r`)
-- **`NG`** when the command is syntactically correct but invalid in the current mode (`PRG,NG\r` if already in a menu)
+- **`NG`** when the command is syntactically correct but invalid in the current mode (`CSG,NG\r` outside program mode, captured on a BC75XLT in `docs/wire_captures/2026-08-28/custom-search-probe.txt`). `PRG` was documented as answering `PRG,NG` in a menu or mid direct entry; a BC125AT accepts it in both (audit-reconciliation Conflict 6)
 - **`ERR\r`** (bare token, no command echo) for syntax or out-of-range errors
 
 The scanner **sends no unsolicited data**, no banner, and no echo of your raw command bytes. **Pipelining is not supported** — wait for the response to each command before sending the next. Pipelined commands produce `ERR`, `NG`, or mangled output.
@@ -307,7 +307,7 @@ The BC125AT/BCT125AT protocol does **not expose battery level**. Treat any `batt
 |---|---|---|---|
 | `MDL` | get | `MDL,BC125AT` | Both modes |
 | `VER` | get | `VER,Version 1.04.02` | Both modes |
-| `PRG` | enter | `PRG,OK` or `PRG,NG` | NG if in menu / direct entry |
+| `PRG` | enter | `PRG,OK` or `PRG,NG` | Accepted in a menu and mid direct entry on a BC125AT (audit-reconciliation Conflict 6); what yields NG is unobserved |
 | `EPG` | exit | `EPG,OK` | Returns to scan or hold |
 | `VOL` / `VOL,n` | get/set | `VOL,8` / `VOL,OK` | Range 0–15; both modes |
 | `SQL` / `SQL,n` | get/set | `SQL,5` / `SQL,OK` | Range 0–15; both modes |
@@ -357,7 +357,7 @@ The BC125AT/BCT125AT protocol does **not expose battery level**. Treat any `batt
 | 7 | Lockout | 0 = not locked, 1 = locked |
 | 8 | Priority | 0 = no, 1 = yes |
 
-**There is no `bank` field in `CIN`.** Bank membership is controlled by `SCG` (see below), which is a 10-digit mask covering all 500 channels' bank assignments. Do not look for a 9th `CIN` field — it doesn't exist.
+**There is no `bank` field in `CIN`.** Bank membership is controlled by `SCG` (see below), which is a 10-digit mask — one digit per bank on both families, regardless of how many channels each bank holds. Do not look for a 9th `CIN` field — it doesn't exist.
 
 > **Write-side field order: VERIFIED 2026-07-08** (`docs/wire_captures/2026-07-08/cin-write-order-probe.txt`, firmware 1.06.06, reproducible via `cargo run -p bearpaw-api --example cin_write_probe`). The write order **equals the read order**: `name, freq, mod, ctcss, delay, lockout, priority`. A probe payload with delay-slot=1 / lockout-slot=0 (both values legal in either slot) read back as `delay=1, lockout=0`, and tone code 76 round-tripped intact. The decompiled reference's delay/lockout swap claim is **wrong for this hardware** — captures win. Two more empirical confirmations from the same probe: **an empty write field really means "unchanged"** (an empty name field left the previous name in place — to clear a name, send 16 spaces), and **`DCH,<n>` restores a channel to factory-empty** (`,00000000,AUTO,0,2,1,0`). CIN writes are implemented in `write_channel_to_scanner`, which writes the fixed order above and read-back-verifies every write.
 
@@ -365,26 +365,33 @@ The BC125AT/BCT125AT protocol does **not expose battery level**. Treat any `batt
 
 | Command | Purpose | Notes |
 |---|---|---|
-| `DCH,n` | Delete channel `n` | |
-| `CLR` | Factory-reset all 500 channels + settings | **Takes ~30 s; scanner unresponsive during it.** Extend read timeout to 45–60 s for this command only. |
+| `DCH,n` | Delete channel `n` | **BC125AT family only, as far as anyone has checked** -- absent from the BC75XLT's 20-command table and not yet probed there (#479). |
+| `CLR` | Factory-reset every channel + settings | **Takes ~30 s; scanner unresponsive during it.** Extend read timeout to 45–60 s for this command only. |
 | `SCG` / `SCG,<mask>` | Get/set channel-storage bank mask | 10-digit string; **`0` = bank enabled, `1` = bank disabled** (inverted from intuition). Order matches LCD icons 1,2,…,9,0 (bank "0" is bank 10). **Write persistence verified 2026-07-08** on firmware 1.06.06 via live write→read-back inside one PRG bracket (`SCG,0000111110` → `SCG,OK` → read-back matched, both directions); Bearpaw's `set_banks` re-verifies on every write regardless. |
-| `SSG` / `SSG,<mask>` | Service-search bank mask | Same 0=on / 1=off convention. Banks: Police, Fire/Emerg, Ham, Marine, Railroad, Civil Air, Mil Air, CB, FRS/GMRS/MURS, Racing. |
-| `CSG` / `CSG,<mask>` | Custom-search range mask | Same convention |
-| `CSP,n` | Get/set custom range `n` upper/lower limits | |
-| `CLC` | Close Call config (mode, alert, band mask, lockout) | Mode digits **verified 2026-08-03**: `0` off / `1` priority / `2` DND / `3` **only**. Mode 3 (`CC Only`) is absent from `BC125AT_PROTOCOL.md` §7.6 — the reference is incomplete, not wrong. See Conflict 4. **Band-bit layout still differs between PDF v1.00 and v1.01** — that part remains unverified. |
+| `SSG` / `SSG,<mask>` | Service-search bank mask | Same 0=on / 1=off convention. Banks: Police, Fire/Emerg, Ham, Marine, Railroad, Civil Air, Mil Air, CB, FRS/GMRS/MURS, Racing. **BC125AT family only** — absent from the BC75XLT's command table; that model has service search but no remote enable, and its band list differs (`WX` first, no Mil Air). |
+| `CSG` / `CSG,<mask>` | Custom-search range mask | Same convention. **Field count is per-family and self-describing on the read**: the BC125AT answers a bare mask, the BC75XLT answers `CSG,<mask>,[DLY],[DIR]` and rejects the bare form with `ERR` (**verified 2026-08-28**, `wire_captures/2026-08-28/findings.md` §1). Echo the shape the read returned. |
+| `CSP,n` | Get/set custom range `n` upper/lower limits | 8-digit, units of 100 Hz. **Writes verified on a BC75XLT 2026-08-28** (write -> read-back -> match -> restore); the BC125AT side remains unprobed. |
+| `CLC` | Close Call config (mode, alert, band mask, lockout) | Mode digits **verified 2026-08-03** on a BC125AT and **2026-08-28** on a BC75XLT: `0` off / `1` priority / `2` DND / `3` **only**. Mode 3 (`CC Only`) is absent from `BC125AT_PROTOCOL.md` §7.6 AND from the BC75XLT vendor spec AND from that model's owner's manual, yet **both families accept and retain it** — the references are incomplete, not wrong. See Conflict 4. **Band-bit layout is per-family, verified 2026-08-28**: the BC75XLT's position 4 is reserved (writing `11111` reads back `11101`), so its order is VHF Low / AIR / VHF High / — / UHF against the BC125AT's VHF Low / AIR / VHF High / UHF / 800 MHz. **Field 5 (`hit_scan`) is reserved on the BC75XLT** — written `1`, reads back empty. See `wire_captures/2026-08-28/findings.md` §3–5. |
 | `PRI` / `PRI,n` | Priority mode | 0 off / 1 on / 2 plus / 3 DND, all four **verified 2026-08-03**. Undocumented precondition (Conflict 5): the radio refuses to enter *any* priority mode while no channel carries the priority flag — it shows "Priority Scan: No Channel" and the selection does not stick. Mode reachability therefore depends on channel state outside the priority UI. |
 | `KBP` | Key beep & keypad lock | |
 | `BSV,n` | Battery save / charge time | 1–16 hours |
 | `WXS` | Weather alert priority | |
 | `CNT` | LCD contrast | 1–15 |
 | `BLT` | Backlight behavior | `AO` always on / `AF` off / `KY` on keypress / `SQ` on squelch / `KS` keypress+squelch |
-| `GLF` | Walk the global lockout list | Returns one freq per call until end |
+| `GLF` | Walk the global lockout list | Returns one freq per call until end. **The BARE form is the iterator on BOTH families** -- the parameterized `GLF,***` documented in the BC75XLT spec answers a payload-less `GLF,OK` and does not iterate, same as on a BC125AT (#142). Verified on a BC75XLT 2026-08-28 across a **six-entry** list built with `LOF`: six frequencies returned in insertion order, then `-1`, and all six removed to net zero. `LOF` appends rather than sorting. The cursor rewinds after `-1`. Note it answers `GLF,-1` OUTSIDE program mode on a BC75XLT rather than `NG`, so an unbracketed walk reports "no lockouts" instead of "wrong mode". |
 | `LOF,freq` | Add frequency to lockout list | Up to 200 entries |
 | `ULF,freq` | Remove from lockout list | |
 
 ### Memory architecture
 
-- **500 channels in a flat namespace**, divided into **10 banks of 50** (bank 1 = ch 1–50, bank 2 = 51–100, …, bank 10 = 451–500 — the "0" key on the LCD).
+- **Channels live in a flat namespace, divided into 10 banks on both families.** The width differs:
+
+  | | Channels | Banks | Bank 1 | Bank 10 |
+  |---|---|---|---|---|
+  | BC125AT family | 500 | 10 × 50 | ch 1–50 | ch 451–500 |
+  | BC75XLT | 300 | 10 × 30 | ch 1–30 | ch 271–300 |
+
+  Bank 10 is the "0" key on the LCD. Read the width from `ScannerCapabilities.channels_per_bank`, never a literal — see the bank-derivation note in [§9](#9-bearpaw-channeldata-structure).
 - **One priority channel per bank max.**
 
 > **Priority clear via DCH+rewrite: VERIFIED ON HARDWARE 2026-08-03** (issue #251, firmware as shipped on this unit). The firmware refuses an in-place priority `1`→`0` CIN write (#203 probe), so the only mechanism is `DCH,<n>` (wipe to factory-empty) followed by a full CIN rewrite with priority=0 — implemented in `clear_channel_priority_locked`. Both hazards were exercised end-to-end against the physical scanner and confirmed on the front panel:
@@ -615,7 +622,11 @@ class ChannelData:
 ### Mapping rules
 
 - `tone_squelch` is **decoded** from the integer code in `CIN[5]` via the table in [§7](#7-ctcss--dcs-tone-codes). Bearpaw stores Hz for UI convenience but must remember to re-encode to a code when writing channels back.
-- `bank` is **synthesised**, not read from `CIN`. After memory sync, query `SCG` and apply the bank-membership rules to every channel index. (For a flat 10×50 layout: channel `n` belongs to bank `ceil(n/50)`, with the SCG mask determining whether that bank is currently *active* in scan, which is a separate concept from channel-to-bank assignment. On the BC125AT, channel-to-bank is fixed by index, not user-assignable. Document this in the UI.)
+- `bank` is **synthesised**, not read from `CIN` — the wire carries no bank field at all. Channel-to-bank is fixed by index and is not user-assignable on either family.
+
+  **Bank width is model-dependent: 50 on the BC125AT family, 30 on a BC75XLT.** Channel `n` belongs to bank `ceil(n / channels_per_bank)`, read from `ScannerCapabilities` — never a literal. This paragraph used to say `ceil(n/50)`, which is wrong for a BC75XLT and is the documented form of a bug that reached production: the same hardcoded `/ 50` lived in the parser, a backend accessor and a frontend duplicate, misfiling 7 of 11 sampled channels and reporting channel 300 as bank 6 instead of 10. Roughly a third of channels are correct by coincidence, which is why spot checks missed it. See the bank-derivation entry in CLAUDE.md's third-rail table and `AppState::channels_with_banks`.
+
+  The `SCG` mask is a separate concept: it says whether a bank is *active in scan*, not which channels belong to it.
 - `delay` accepts the full Uniden range `-10, -5, 0, 1, 2, 3, 4, 5`. Negative values are "pre-delays" (start delaying *before* squelch closes). UI must validate against this set.
 - `alpha_tag` is space-padded on the wire to 16 chars. Strip trailing spaces for display, but **pad to 16 spaces when writing** to clear an existing tag.
 
@@ -651,10 +662,10 @@ The invariant is **one outstanding command at a time** — build that into the A
 
 ## 11. Memory sync process
 
-Reading all 500 channels takes ~60 seconds.
+Reading a full channel map takes **~5 s** on a BC125AT over the macOS direct-USB path (measured three times, 2026-08-30). This section previously said ~60 s, which predates the current transport and was wrong by an order of magnitude. The BC75XLT is unmeasured: 300 channels at 57600 through a CP210x is a different transport, so do not assume it matches.
 
 1. Backend: `PRG\r` → wait for `PRG,OK\r`, sleep 100 ms.
-2. For each channel 1..500:
+2. For each channel `1..=channel_count` (500 or 300 — from `ScannerCapabilities`):
    - `CIN,<index>\r` → parse response into `ChannelData`.
    - Yield to higher-priority commands periodically (the scheduler should preempt for user `KEY` / `DO`).
    - Broadcast progress every ~10 channels.
@@ -665,7 +676,7 @@ Reading all 500 channels takes ~60 seconds.
 Progress messages:
 ```jsonc
 {"type": "progress", "task_id": "sync-abc123", "percent": 0,   "message": "Starting memory sync..."}
-{"type": "progress", "task_id": "sync-abc123", "percent": 10,  "message": "Read 50 of 500 channels"}
+{"type": "progress", "task_id": "sync-abc123", "percent": 10,  "message": "Read 50 of 500 channels"}  // counts are per-model
 ...
 {"type": "progress", "task_id": "sync-abc123", "percent": 100, "message": "Memory sync complete"}
 ```

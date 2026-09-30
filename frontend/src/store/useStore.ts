@@ -11,6 +11,16 @@ export interface Preferences {
   /** #273: gates the automatic update check the desktop shell runs at launch. */
   checkUpdatesOnLaunch: boolean;
   /**
+   * Whether channel memory is re-read from the scanner at every connect, or
+   * rendered from the SQLite cache (#413) until the user asks.
+   *
+   * Defaults true -- the pre-cache behaviour. A scanner programmed on its own
+   * keypad has a cache that is stale before Bearpaw opens, and a user poll
+   * found that is the majority case. Off is right for anyone who only programs
+   * from a computer: their cache is never stale, and startup is instant.
+   */
+  rereadMemoryOnConnect: boolean;
+  /**
    * Whether the Scan page's analytics count only the connected scanner
    * ('scanner') or every scanner ever attached ('all').
    *
@@ -19,6 +29,19 @@ export interface Preferences {
    * rather than a choice.
    */
   analyticsScope: 'scanner' | 'all';
+  /**
+   * Timezone the activity-log CSV is stamped in (#498).
+   *
+   * Local is the default because the export sheet already SELECTS in local
+   * time. UTC exists because amateur radio logs in it by convention, so the
+   * two constituencies want genuinely opposite things and neither can be
+   * derived from the other without work in a spreadsheet.
+   *
+   * Labelling only. It deliberately does NOT move the timeframe filters: a
+   * display preference that silently changed which rows you got would be a
+   * worse surprise than a UTC-stamped export of your local day.
+   */
+  activityExportTimezone: 'local' | 'utc';
 }
 
 /**
@@ -35,6 +58,15 @@ export interface SyncState {
   taskId: string | null;
   message: string;
   percent: number;
+  /**
+   * Epoch seconds for when channel memory was last read from the scanner, or
+   * null if it never has been. From `GET /memory/sync/status` (#413).
+   *
+   * NOT the same question as `hasSyncedInitially`, which means "a sync
+   * completed in THIS session". Channel memory persists across restarts, so a
+   * cache-loaded session has a real `syncedAt` and `hasSyncedInitially: false`.
+   */
+  syncedAt: number | null;
 }
 
 /**
@@ -84,7 +116,10 @@ export interface AppStore {
   setMemoryDraft: (index: number, draft: ChannelDraft) => void;
   clearMemoryDrafts: () => void;
   addToFullActivityLog: (entry: ActivityLogEntry) => void;
-  hydrateActivityLogs: (entries: ActivityLogEntry[]) => void;
+  hydrateActivityLogs: (
+    entries: ActivityLogEntry[],
+    options?: { replace?: boolean; preserveSince?: number },
+  ) => void;
 }
 
 const defaultPreferences: Preferences = {
@@ -95,8 +130,50 @@ const defaultPreferences: Preferences = {
   dataRetentionDays: 30,
   audioOutputDevice: 'default',
   checkUpdatesOnLaunch: true,
+  rereadMemoryOnConnect: true,
   analyticsScope: 'scanner',
+  activityExportTimezone: 'local',
 };
+
+/**
+ * Map the backend's stored preferences onto the store's shape.
+ *
+ * REGRESSION GUARD (#509): the return type is `Preferences`, NOT
+ * `Partial<Preferences>`. That `Partial` is what let `analyticsScope` be
+ * omitted here for its whole life: it was wired into PREFERENCE_KEY_MAP so it
+ * SAVED correctly, and the backend honoured it when scoping /activity-log, but
+ * nothing ever read it back. Every launch reset the store to 'scanner' while
+ * the API kept returning every scanner's hits, so the data and the toggle
+ * disagreed and neither looked broken alone.
+ *
+ * A preference needs both halves. Requiring the full type means the compiler
+ * refuses the next omission instead of a person having to notice it.
+ *
+ * Deliberately NOT derived from PREFERENCE_KEY_MAP. This is not a key rename:
+ * each line carries its own coercion and default, and `checkUpdatesOnLaunch`
+ * documents why `??` and `||` are not interchangeable. A generic mapping would
+ * erase exactly the per-key logic that matters.
+ */
+export function mapStoredPreferences(stored: Record<string, unknown>): Preferences {
+  const prefs = stored as Record<string, any>;
+  return {
+    theme: prefs.theme === 'field' ? 'field' : 'night',
+    displayMode: prefs.displayMode || 'frequency',
+    reducedMotion: prefs.reduced_motion || false,
+    hitMinDuration: prefs.hit_min_duration || 2,
+    dataRetentionDays: prefs.data_retention_days || 30,
+    audioOutputDevice: prefs.audio_output_device || 'default',
+    // `??`, not `||`: this defaults to true, so `||` would coerce a stored
+    // `false` back to `true` and the toggle would silently revert on every
+    // launch. Only null/undefined mean "unset".
+    checkUpdatesOnLaunch: prefs.check_updates_on_launch ?? true,
+    // `??` for the same reason as above: defaults true, so `||` would coerce
+    // a stored `false` back on every launch.
+    rereadMemoryOnConnect: prefs.reread_memory_on_connect ?? true,
+    analyticsScope: prefs.analytics_scope === 'all' ? 'all' : 'scanner',
+    activityExportTimezone: prefs.activity_export_timezone === 'utc' ? 'utc' : 'local',
+  };
+}
 
 const defaultLiveState: LiveState = {
   timestamp: 0,
@@ -121,6 +198,7 @@ const defaultSync: SyncState = {
   taskId: null,
   message: 'Loading channels from device...',
   percent: 0,
+  syncedAt: null,
 };
 
 const defaultImportProgress: ImportProgressState = {
@@ -189,15 +267,29 @@ export const useStore = create<AppStore>((set) => ({
       fullActivityLog: [entry, ...prev.fullActivityLog],
     })),
 
-  hydrateActivityLogs: (entries) =>
+  hydrateActivityLogs: (entries, options) =>
     set((prev) => {
-      // Only seed from history when nothing is in memory yet. Lets the
-      // user see historical hits at launch without clobbering anything a
-      // WS event might have prepended while the fetch was in flight.
-      if (prev.fullActivityLog.length > 0) {
-        return prev;
-      }
-      const sorted = [...entries].sort((a, b) => b.timestamp - a.timestamp);
+      // Initial hydration merges with live WS hits that may have arrived while
+      // the request was in flight. A scope refresh replaces the old scoped
+      // history, retaining only hits that arrived after that request began.
+      const retained = options?.replace
+        ? prev.fullActivityLog.filter(
+            (entry) => entry.timestamp >= (options.preserveSince ?? Number.POSITIVE_INFINITY),
+          )
+        : prev.fullActivityLog;
+      const byHit = new Map<string, ActivityLogEntry>();
+      const key = (entry: ActivityLogEntry) =>
+        [
+          entry.timestamp,
+          entry.frequency,
+          entry.channel ?? '',
+          entry.alpha_tag ?? '',
+          entry.ended_at ?? '',
+        ].join('|');
+      for (const entry of entries) byHit.set(key(entry), entry);
+      // Live entries win when the backend returned the same just-finished hit.
+      for (const entry of retained) byHit.set(key(entry), entry);
+      const sorted = [...byHit.values()].sort((a, b) => b.timestamp - a.timestamp);
       return {
         fullActivityLog: sorted,
       };

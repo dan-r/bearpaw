@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { toast } from 'sonner';
 import { motion } from 'motion/react';
 import {
@@ -24,6 +24,7 @@ import { useScannerCapabilities } from '../../../hooks/useScannerCapabilities';
 import { Slider } from '../ui/slider';
 import { Switch } from '../ui/switch';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../ui/select';
+import { SearchRangeEditSheet } from './SearchRangeEditSheet';
 
 type DeviceCategory =
   | 'Locked Channels'
@@ -33,10 +34,23 @@ type DeviceCategory =
   | 'Custom Search'
   | 'Preferences';
 
+/**
+ * Categories whose contents are read from the scanner and can therefore drift.
+ *
+ * Locked Channels is absent because it already refetches whenever it is
+ * selected and shows its own sync time. Preferences is absent because it is
+ * app state in SQLite, not device state -- nothing on the radio can change it.
+ */
+const REFRESHABLE_CATEGORIES: DeviceCategory[] = [
+  'Device Config',
+  'Close Call',
+  'Service Search',
+  'Custom Search',
+];
+
 interface SearchRange {
   id: number;
   enabled: boolean;
-  label: string;
   start: string;
   end: string;
 }
@@ -50,7 +64,9 @@ export const PREFERENCE_KEY_MAP: Partial<Record<keyof Preferences, string>> = {
   hitMinDuration: 'hit_min_duration',
   dataRetentionDays: 'data_retention_days',
   checkUpdatesOnLaunch: 'check_updates_on_launch',
+  rereadMemoryOnConnect: 'reread_memory_on_connect',
   analyticsScope: 'analytics_scope',
+  activityExportTimezone: 'activity_export_timezone',
 };
 
 // Close Call (CLC) mode: UI value -> wire digit. Digits confirmed on hardware
@@ -178,12 +194,22 @@ export function DeviceTab({ onCheckForUpdates, checkingForUpdates }: DeviceTabPr
   // defeats that memo (react-hooks/exhaustive-deps).
   const channels = useStore((state) => state.channels);
   const setChannels = useStore((state) => state.setChannels);
+  // A memory sync 409s every settings read (`ProgramModeGuard` refuses while
+  // `sync_task_id` is set), so a sync running when this page mounts is the
+  // ordinary way the read fails. See the retry effect below.
+  const syncInProgress = useStore((state) => state.sync.inProgress);
   const preferences = useStore((state) => state.preferences);
   const updatePreferences = useStore((state) => state.updatePreferences);
 
   const [lockedChannelIds, setLockedChannelIds] = useState<number[]>([]);
+  // The GLOBAL avoid list (#522). Separate state from `lockedChannelIds`
+  // because it is a separate list on the radio: these are bare frequencies
+  // that Search and Close Call skip, attached to no channel.
+  const [lockedFrequencies, setLockedFrequencies] = useState<number[]>([]);
+  const [removingFrequency, setRemovingFrequency] = useState<number | null>(null);
   const [lockedFetchedAt, setLockedFetchedAt] = useState<number | null>(null);
   const [selectedCategory, setSelectedCategory] = useState<DeviceCategory>('Device Config');
+
   const [firmware, setFirmware] = useState<string | null>(null);
   const [selectedChannels, setSelectedChannels] = useState<number[]>([]);
   const [isClearing, setIsClearing] = useState(false);
@@ -193,16 +219,17 @@ export function DeviceTab({ onCheckForUpdates, checkingForUpdates }: DeviceTabPr
   const handlePreferenceChange = useCallback(
     async <K extends keyof Preferences>(key: K, value: Preferences[K]) => {
       const backendKey = PREFERENCE_KEY_MAP[key] ?? key;
-      updatePreferences({ [key]: value } as Partial<Preferences>);
       try {
-        await fetch(`${API_BASE}/preferences`, {
+        const response = await fetch(`${API_BASE}/preferences`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ [backendKey]: value }),
         });
+        if (!response.ok) throw new Error(`Preference save failed (${response.status})`);
+        updatePreferences({ [key]: value } as Partial<Preferences>);
       } catch (error) {
         console.error('Failed to save preference', error);
-        toast.error('Failed to save preference');
+        toast.error('Failed to save preference. Your previous setting is still active.');
       }
     },
     [updatePreferences],
@@ -215,6 +242,52 @@ export function DeviceTab({ onCheckForUpdates, checkingForUpdates }: DeviceTabPr
   // 2026-08-26, docs/wire_captures/2026-08-26/). A visible control that cannot
   // work is worse than an absent one -- it invites a click that silently fails.
   const capabilities = useScannerCapabilities();
+
+  // Service Search is hidden on a scanner with no `SSG` command. The BC75XLT
+  // HAS service search -- ten bands on the `Svc` key -- but no way to enable or
+  // disable one remotely, so all ten toggles here would be dead. Hidden rather
+  // than disabled: a page of controls the scanner cannot honour asks the same
+  // question on every visit (CLAUDE.md frontend pitfall #5). The band names are
+  // wrong for that model too -- `WX` leads its list and it has no Military Air.
+  const categories = useMemo<DeviceCategory[]>(() => {
+    const all: DeviceCategory[] = [
+      'Device Config',
+      'Close Call',
+      'Service Search',
+      'Custom Search',
+      'Locked Channels',
+    ];
+    return capabilities.has_service_search_groups
+      ? all
+      : all.filter((cat) => cat !== 'Service Search');
+  }, [capabilities.has_service_search_groups]);
+
+  // Derived during render rather than corrected by an effect: swapping scanners
+  // can strip the category the user is standing on, and an effect-synced copy is
+  // stale for the render in which capabilities changed -- one frame of a page
+  // with no content. Same reasoning as `visibleSelectedChannels` below.
+  // The Display & System card holds only capability-gated controls, so on a
+  // scanner with none of them it renders as an empty titled box -- which is
+  // what a BC75XLT got once #471 gated Key Beep alongside BLT and CNT. Gate the
+  // card on its own contents rather than adding a fourth ungated control to
+  // justify it.
+  // The Locked Channels table drops its Tag column on a scanner that has no
+  // alpha tags, rather than rendering a full column of "Untitled" and a search
+  // box advertising something it cannot do (#434). Same reasoning #404 applied
+  // to the channel table, in a table #404 did not touch: with no tag, a
+  // fabricated placeholder is noise on every row and tells a screen reader
+  // nothing that distinguishes one row from the next.
+  const lockedGridCols = capabilities.has_alpha_tags
+    ? 'grid-cols-[40px_60px_120px_1fr_80px_100px]'
+    : 'grid-cols-[40px_60px_1fr_80px_100px]';
+
+  const showDisplayCard =
+    capabilities.has_backlight_control || capabilities.has_contrast || capabilities.has_key_beep;
+
+  const activeCategory: DeviceCategory =
+    selectedCategory === 'Preferences' || categories.includes(selectedCategory)
+      ? selectedCategory
+      : 'Device Config';
   const [batterySaver, setBatterySaver] = useState(1);
   const [backlight, setBacklight] = useState('AO');
   const [contrast, setContrast] = useState(7);
@@ -245,19 +318,23 @@ export function DeviceTab({ onCheckForUpdates, checkingForUpdates }: DeviceTabPr
   const [searchDelay, setSearchDelay] = useState(3);
   const [codeSearchEnabled, setCodeSearchEnabled] = useState(false);
 
-  // Custom Search Settings
-  const [searchRanges, setSearchRanges] = useState<SearchRange[]>([
-    { id: 1, enabled: true, label: 'VHF Low', start: '25.0000', end: '54.0000' },
-    { id: 2, enabled: true, label: 'Civil Air', start: '108.0000', end: '136.9916' },
-    { id: 3, enabled: true, label: 'VHF High', start: '137.0000', end: '174.0000' },
-    { id: 4, enabled: false, label: 'UHF Air', start: '225.0000', end: '380.0000' },
-    { id: 5, enabled: false, label: 'UHF', start: '400.0000', end: '512.0000' },
-    { id: 6, enabled: false, label: '800 MHz', start: '806.0000', end: '960.0000' },
-    { id: 7, enabled: false, label: 'Range 7', start: '1240.0000', end: '1300.0000' },
-    { id: 8, enabled: false, label: 'Range 8', start: '0.0000', end: '0.0000' },
-    { id: 9, enabled: false, label: 'Range 9', start: '0.0000', end: '0.0000' },
-    { id: 10, enabled: false, label: 'Range 10', start: '0.0000', end: '0.0000' },
-  ]);
+  // Custom Search Settings.
+  //
+  // Placeholders until `CSP,1..10` hydrates them, so they say nothing rather
+  // than something false. The previous seed named bands the ranges were not
+  // ('VHF Low' on 25-54, which is CB) and two the scanner cannot receive at all
+  // ('800 MHz', 1240-1300) -- see #477. A row that reads `Range 4  —  —` is
+  // obviously waiting for the radio; one that reads `800 MHz  806.0000` looks
+  // like a setting.
+  const [editingRangeId, setEditingRangeId] = useState<number | null>(null);
+  const [searchRanges, setSearchRanges] = useState<SearchRange[]>(() =>
+    Array.from({ length: 10 }, (_, i) => ({
+      id: i + 1,
+      enabled: false,
+      start: '',
+      end: '',
+    })),
+  );
 
   const connectionStatusLabel =
     connectionStatus === 'connected'
@@ -308,13 +385,18 @@ export function DeviceTab({ onCheckForUpdates, checkingForUpdates }: DeviceTabPr
     filteredLockedChannels.every((channel) => visibleSelectedChannels.includes(channel.index));
 
   useEffect(() => {
-    if (selectedCategory !== 'Locked Channels') return;
+    if (activeCategory !== 'Locked Channels') return;
     let active = true;
+    // `includeFrequencies` is ON here and nowhere else. It makes the backend
+    // walk `GLF`, which costs a program-mode bracket and parks the scanner --
+    // so it is scoped to this one category, where the list is actually shown,
+    // rather than paid by every consumer of /lockouts.
     api
-      .getLockouts({ includeFrequencies: false })
+      .getLockouts({ includeFrequencies: true })
       .then((result) => {
         if (!active) return;
         setLockedChannelIds(result.channels ?? []);
+        setLockedFrequencies(result.frequencies ?? []);
         setLockedFetchedAt(Date.now());
       })
       .catch((error) => {
@@ -323,17 +405,29 @@ export function DeviceTab({ onCheckForUpdates, checkingForUpdates }: DeviceTabPr
     return () => {
       active = false;
     };
-  }, [api, selectedCategory]);
+  }, [api, activeCategory]);
 
-  const programModeSettingsLoaded = useRef(false);
+  // Whether a settings read has EVER succeeded. Until it has, every control on
+  // this page is showing its useState default rather than the scanner's value.
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
 
-  // Load all device settings when component mounts
-  useEffect(() => {
-    let active = true;
-    const loadAllSettings = async () => {
+  /**
+   * Read every device setting in one pass.
+   *
+   * Runs on mount and from the Refresh control. Deliberately NOT polled: the
+   * backend answers this by opening a program-mode bracket, which parks the
+   * scanner in HOLD at channel 1 for the duration. On a timer that would make
+   * the radio unusable.
+   *
+   * `shouldContinue` lets the mount effect abandon a load whose component has
+   * unmounted; the Refresh path passes nothing and always applies.
+   */
+  const loadAllSettings = useCallback(
+    async (shouldContinue: () => boolean = () => true) => {
       try {
         const settings = await api.getAllSettings();
 
+        const active = shouldContinue();
         if (!active) return;
 
         // Firmware comes from the settings snapshot (VER), not DeviceInfo —
@@ -410,43 +504,84 @@ export function DeviceTab({ onCheckForUpdates, checkingForUpdates }: DeviceTabPr
 
         // Populate custom search settings and ranges
         if (settings.custom_search && settings.custom_search_ranges) {
-          const defaultLabels = [
-            'VHF Low',
-            'Civil Air',
-            'VHF High',
-            'UHF Air',
-            'UHF',
-            '800 MHz',
-            'Range 7',
-            'Range 8',
-            'Range 9',
-            'Range 10',
-          ];
-
           setSearchRanges(
             settings.custom_search_ranges.map((r, idx) => ({
               id: r.index,
               enabled: settings.custom_search?.groups[idx] || false,
-              label: defaultLabels[idx] || `Range ${r.index}`,
               start: r.lower.toFixed(4),
               end: r.upper.toFixed(4),
             })),
           );
         }
-
-        programModeSettingsLoaded.current = true;
+        setSettingsLoaded(true);
       } catch (error) {
         console.error('Failed to load all settings', error);
-        toast.error('Failed to load device settings');
+        // Naming Refresh matters: on failure every control below keeps its
+        // useState default, and the first one the user touches writes that
+        // default to the scanner. The retry effect covers the common cause (a
+        // memory sync); this covers the rest, e.g. `PRG,NG` when the radio is
+        // sitting in its own menu.
+        toast.error('Could not read device settings. Press Refresh to try again.');
       }
-    };
+    },
+    [api],
+  );
 
-    loadAllSettings();
-
+  // REGRESSION GUARD (`retries once a blocking memory sync finishes`):
+  // ONE effect loads the settings, on mount and again after a failure clears.
+  //
+  // The mount effect above runs EXACTLY ONCE -- `loadAllSettings` is
+  // `useCallback(..., [api])` and the effect depends only on it, so both are
+  // stable for the life of the page. A read that failed therefore stayed
+  // failed forever, and the failure is not exotic: every settings read 409s
+  // while a memory sync holds program mode, and since #413 a sync can start at
+  // connect. Opening Device during those seconds left all ~20 controls showing
+  // useState defaults, and the first one touched wrote its default to the
+  // radio.
+  //
+  // Mirrors the bank-refetch effect in App.tsx, which already uses this exact
+  // edge for the same reason.
+  //
+  // Deliberately ONE effect, not a mount effect plus a retry effect. Two would
+  // both fire on mount -- `setSettingsLoaded(true)` happens inside the async
+  // load, so the second effect sees `settingsLoaded: false` before the first
+  // has resolved -- and every visit to this page would open TWO program-mode
+  // brackets, parking the scanner in HOLD twice. Caught by `does not re-read
+  // once a read has succeeded`.
+  //
+  // `settingsLoaded` is terminal on purpose: the read parks the scanner in
+  // HOLD at channel 1 for its duration, so re-reading on every sync would make
+  // the radio unusable. Refresh is the deliberate re-read.
+  useEffect(() => {
+    if (settingsLoaded || syncInProgress) return;
+    let mounted = true;
+    // `loadAllSettings` is async and every setState inside it happens after an
+    // await, so nothing is set synchronously here -- the rule cannot see past
+    // the call. The `mounted` flag is what actually prevents a late response
+    // from setting state on an unmounted component.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    loadAllSettings(() => mounted);
     return () => {
-      active = false;
+      mounted = false;
     };
-  }, [api]);
+  }, [settingsLoaded, syncInProgress, loadAllSettings]);
+
+  // The scanner has no change notification -- it answers questions and never
+  // volunteers that something moved. So anything changed on the front panel
+  // stays invisible here until this runs again. Refresh makes that recoverable
+  // and, via the timestamp, visible.
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [settingsReadAt, setSettingsReadAt] = useState<number | null>(null);
+
+  const handleRefreshSettings = useCallback(async () => {
+    setIsRefreshing(true);
+    try {
+      await loadAllSettings();
+      setSettingsReadAt(Date.now());
+    } finally {
+      setIsRefreshing(false);
+    }
+  }, [loadAllSettings]);
 
   const toggleSelection = useCallback((channelId: number) => {
     setSelectedChannels((prev) =>
@@ -461,6 +596,27 @@ export function DeviceTab({ onCheckForUpdates, checkingForUpdates }: DeviceTabPr
       setSelectedChannels(checked ? filteredLockedChannels.map((ch) => ch.index) : []);
     },
     [filteredLockedChannels],
+  );
+
+  const handleRemoveFrequency = useCallback(
+    async (frequency: number) => {
+      setRemovingFrequency(frequency);
+      try {
+        await api.removeGlobalLockout(frequency);
+        // Refetch rather than splicing local state: `ULF` can be refused, and
+        // the walk is the only thing that knows what the radio actually holds.
+        const result = await api.getLockouts({ includeFrequencies: true });
+        setLockedFrequencies(result.frequencies ?? []);
+        setLockedFetchedAt(Date.now());
+        toast.success(`Removed ${frequency.toFixed(4)} MHz from the avoid list`);
+      } catch (error) {
+        console.error('Failed to remove global lockout', error);
+        toast.error('Failed to remove frequency');
+      } finally {
+        setRemovingFrequency(null);
+      }
+    },
+    [api],
   );
 
   const handleUnlockSelected = useCallback(
@@ -617,16 +773,31 @@ export function DeviceTab({ onCheckForUpdates, checkingForUpdates }: DeviceTabPr
   // Priority is bank-exclusive but not bank-scoped for this precondition: one
   // flagged channel anywhere in memory satisfies the radio.
   //
-  // Gated on `hasSyncedInitially`, not on `channels.length`: before memory
-  // sync the channel list is empty, which is indistinguishable from "synced,
-  // nothing flagged" — warning then would be a false alarm on every cold
-  // start. This is the one place `hasSyncedInitially` means what it says
-  // ("has memory ever been read?"); do NOT copy this gate to the sync overlay,
-  // where it is the known #102 regression.
-  const hasSyncedInitially = useStore((state) => state.sync.hasSyncedInitially);
+  // REGRESSION GUARD (#413): gated on `channels.length`, NOT on
+  // `sync.hasSyncedInitially`. An empty channel list means "memory has not
+  // been read", and warning then would be a false alarm on every cold start —
+  // that part is unchanged, and `stays silent before memory sync` still pins
+  // it.
+  //
+  // This used to gate on `hasSyncedInitially` for exactly that reason, because
+  // an empty list was the only signal available. Channel memory now persists
+  // and is adopted from SQLite at connect (#540), so a session can hold real,
+  // read channel memory with no sync this session — and `hasSyncedInitially`
+  // is false for the whole of it. Gating on the flag made this hint vanish on
+  // precisely the fast-start launches the cache exists to create: the user
+  // picks a priority mode, the radio ignores it ("Priority Scan: No Channel",
+  // #346), and the one thing that explains why is absent.
+  //
+  // `hasSyncedInitially` still means "a sync completed this session". That is
+  // no longer the same question as "has memory ever been read", which is what
+  // this gate needs. Do NOT copy either gate to the sync overlay, where it is
+  // the known #102 regression.
+  //
+  // Test: `DeviceTab.test.tsx :: warns when channels came from the cache with
+  // no sync this session`.
   const noPriorityChannel = useMemo(
-    () => hasSyncedInitially && !channels.some((c) => c.priority),
-    [hasSyncedInitially, channels],
+    () => channels.length > 0 && !channels.some((c) => c.priority),
+    [channels],
   );
 
   const handlePriorityModeChange = useCallback(
@@ -782,35 +953,31 @@ export function DeviceTab({ onCheckForUpdates, checkingForUpdates }: DeviceTabPr
     [api, searchRanges],
   );
 
-  const updateRange = useCallback(
-    async (id: number, field: 'start' | 'end' | 'label', value: string) => {
-      // Always write the raw typed string to state so these controlled inputs
-      // reflect what was typed (#264). Gating the state write on a successful
-      // parse swallowed keystrokes like clearing the field or a leading '.';
-      // the parse guard below is what keeps a non-numeric value off the wire.
-      const newRanges = searchRanges.map((r) => (r.id === id ? { ...r, [field]: value } : r));
-      setSearchRanges(newRanges);
-
-      if (field === 'start' || field === 'end') {
-        const range = newRanges.find((r) => r.id === id);
-        if (range) {
-          try {
-            const startVal = parseFloat(range.start);
-            const endVal = parseFloat(range.end);
-            if (isNaN(startVal) || isNaN(endVal)) {
-              console.error('Invalid frequency range');
-              return;
-            }
-            await api.setCustomSearchRange(id, startVal, endVal);
-          } catch (error) {
-            console.error('Failed to update search range', error);
-            toast.error('Failed to update search range');
-          }
-        }
+  // Batched behind the edit sheet's Save button. This used to fire
+  // `setCustomSearchRange` from the table's `onChange`, so every keystroke that
+  // left both fields parseable wrote to the radio: typing `146.5` into an empty
+  // lower limit sent CSP writes for `1`, `14`, `146` and `146.5`, three of them
+  // values nobody chose. Each opens a program-mode bracket, which parks the
+  // scanner in HOLD at channel 1.
+  const saveRange = useCallback(
+    async (id: number, draft: { start: string; end: string }) => {
+      const startVal = parseFloat(draft.start);
+      const endVal = parseFloat(draft.end);
+      if (isNaN(startVal) || isNaN(endVal)) return;
+      try {
+        await api.setCustomSearchRange(id, startVal, endVal);
+        setSearchRanges((prev) =>
+          prev.map((r) => (r.id === id ? { ...r, start: draft.start, end: draft.end } : r)),
+        );
+      } catch (error) {
+        console.error('Failed to update search range', error);
+        toast.error('Failed to update search range');
       }
     },
-    [api, searchRanges],
+    [api],
   );
+
+  const editingRange = searchRanges.find((r) => r.id === editingRangeId) ?? null;
 
   const activeRangeCount = searchRanges.filter((r) => r.enabled).length;
 
@@ -820,31 +987,29 @@ export function DeviceTab({ onCheckForUpdates, checkingForUpdates }: DeviceTabPr
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex h-full gap-6">
       {/* Side Nav */}
       <div className="scanner-surface flex h-full w-[var(--layout-sidebar-device-width)] flex-col p-2">
-        {['Device Config', 'Close Call', 'Service Search', 'Custom Search', 'Locked Channels'].map(
-          (cat) => (
-            <button
-              key={cat}
-              onClick={() => setSelectedCategory(cat as DeviceCategory)}
-              aria-current={selectedCategory === cat ? 'page' : undefined}
-              className={cn(
-                'text-left px-3 py-2 rounded text-sm font-medium transition-colors',
-                selectedCategory === cat
-                  ? 'bg-brand-hover/20 text-brand-hover'
-                  : 'text-white/60 hover:bg-white/5 hover:text-white',
-              )}
-            >
-              {cat}
-            </button>
-          ),
-        )}
+        {categories.map((cat) => (
+          <button
+            key={cat}
+            onClick={() => setSelectedCategory(cat)}
+            aria-current={activeCategory === cat ? 'page' : undefined}
+            className={cn(
+              'text-left px-3 py-2 rounded text-sm font-medium transition-colors',
+              activeCategory === cat
+                ? 'bg-brand-hover/20 text-brand-hover'
+                : 'text-white/60 hover:bg-white/5 hover:text-white',
+            )}
+          >
+            {cat}
+          </button>
+        ))}
 
         {/* Preferences at bottom */}
         <button
           onClick={() => setSelectedCategory('Preferences')}
-          aria-current={selectedCategory === 'Preferences' ? 'page' : undefined}
+          aria-current={activeCategory === 'Preferences' ? 'page' : undefined}
           className={cn(
             'text-left px-3 py-2 rounded text-sm font-medium transition-colors mt-auto border-t border-white/10 pt-3',
-            selectedCategory === 'Preferences'
+            activeCategory === 'Preferences'
               ? 'bg-brand-hover/20 text-brand-hover'
               : 'text-white/60 hover:bg-white/5 hover:text-white',
           )}
@@ -855,19 +1020,51 @@ export function DeviceTab({ onCheckForUpdates, checkingForUpdates }: DeviceTabPr
 
       {/* Content */}
       <div className="flex-1 bg-black/20 rounded-lg border border-white/5 p-6 h-full overflow-y-auto">
-        {selectedCategory !== 'Locked Channels' && (
-          <h2 className="text-lg font-bold mb-6 border-b border-white/10 pb-2 flex items-center justify-between">
-            <span>{selectedCategory}</span>
-            {selectedCategory === 'Custom Search' && (
-              <span className="text-sm font-normal text-white/50">
-                {activeRangeCount} of 10 active
-              </span>
-            )}
+        {activeCategory !== 'Locked Channels' && (
+          <h2 className="text-lg font-bold mb-6 border-b border-white/10 pb-2 flex items-center justify-between gap-4">
+            {/*
+              REGRESSION GUARD (#533): name the category being RENDERED, not the
+              one last clicked. `selectedCategory` survives a capability change
+              that removes it from `categories`; `activeCategory` is the
+              fallback that absorbs exactly that. Reading the raw value here put
+              Device Config's controls under a "Service Search" heading. See
+              `category heading follows the rendered panel (#533)`.
+            */}
+            <span>{activeCategory}</span>
+            <span className="flex items-center gap-4">
+              {activeCategory === 'Custom Search' && (
+                <span className="text-sm font-normal text-white/50">
+                  {activeRangeCount} of 10 active
+                </span>
+              )}
+              {REFRESHABLE_CATEGORIES.includes(activeCategory) && (
+                <>
+                  {settingsReadAt && (
+                    <span className="text-sm font-normal text-white/40">
+                      Read {new Date(settingsReadAt).toLocaleTimeString()}
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    onClick={handleRefreshSettings}
+                    disabled={isRefreshing}
+                    className="flex items-center gap-1.5 rounded border border-white/5 bg-black/20 px-2.5 py-1 text-sm font-normal text-white/70 transition-colors hover:bg-black/40 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <RefreshCw
+                      size={14}
+                      aria-hidden
+                      className={cn(isRefreshing && 'animate-spin')}
+                    />
+                    {isRefreshing ? 'Reading…' : 'Refresh'}
+                  </button>
+                </>
+              )}
+            </span>
           </h2>
         )}
 
         {/* Locked Channels */}
-        {selectedCategory === 'Locked Channels' && (
+        {activeCategory === 'Locked Channels' && (
           <div className="flex flex-col h-full gap-4">
             <div className="flex flex-col gap-4 rounded-lg border border-white/5 bg-white/5 p-4">
               <div className="flex flex-wrap items-center gap-4">
@@ -909,7 +1106,9 @@ export function DeviceTab({ onCheckForUpdates, checkingForUpdates }: DeviceTabPr
                     type="text"
                     value={searchTerm}
                     onChange={(e) => setSearchTerm(e.target.value)}
-                    placeholder="Search frequency or tag"
+                    placeholder={
+                      capabilities.has_alpha_tags ? 'Search frequency or tag' : 'Search frequency'
+                    }
                     className="w-56 bg-black/30 border border-white/40 rounded px-3 py-2 text-sm text-white placeholder:text-white/40 focus:outline-none focus:border-brand-primary"
                   />
                   <Select
@@ -954,14 +1153,17 @@ export function DeviceTab({ onCheckForUpdates, checkingForUpdates }: DeviceTabPr
             >
               <div
                 role="row"
-                className="grid grid-cols-[40px_60px_120px_1fr_80px_100px] text-sm font-bold uppercase tracking-wider text-white/60 bg-white/5 border-b border-white/10 px-3 py-2"
+                className={cn(
+                  'grid text-sm font-bold uppercase tracking-wider text-white/60 bg-white/5 border-b border-white/10 px-3 py-2',
+                  lockedGridCols,
+                )}
               >
                 <div role="columnheader">Select</div>
                 <div role="columnheader" className="text-center">
                   CH
                 </div>
                 <div role="columnheader">Freq (MHz)</div>
-                <div role="columnheader">Tag</div>
+                {capabilities.has_alpha_tags && <div role="columnheader">Tag</div>}
                 <div role="columnheader" className="text-center">
                   Bank
                 </div>
@@ -978,7 +1180,11 @@ export function DeviceTab({ onCheckForUpdates, checkingForUpdates }: DeviceTabPr
                       key={channel.index}
                       role="row"
                       className={cn(
-                        'grid grid-cols-[40px_60px_120px_1fr_80px_100px] items-center px-3 py-2 text-base',
+                        'grid items-center px-3 py-2 text-base',
+                        // Must be the SAME track list as the header above, or
+                        // the columns drift apart the moment one of them drops
+                        // the Tag column.
+                        lockedGridCols,
                         isSelected ? 'bg-brand-primary/10' : 'hover:bg-white/5',
                       )}
                     >
@@ -997,9 +1203,11 @@ export function DeviceTab({ onCheckForUpdates, checkingForUpdates }: DeviceTabPr
                       <div role="cell" className="text-sm font-mono text-white">
                         {channel.frequency.toFixed(4)}
                       </div>
-                      <div role="cell" className="text-sm text-white/80 truncate">
-                        {channel.alpha_tag || 'Untitled'}
-                      </div>
+                      {capabilities.has_alpha_tags && (
+                        <div role="cell" className="text-sm text-white/80 truncate">
+                          {channel.alpha_tag || 'Untitled'}
+                        </div>
+                      )}
                       <div role="cell" className="text-center text-sm text-white/60">
                         {channel.bank}
                       </div>
@@ -1023,11 +1231,66 @@ export function DeviceTab({ onCheckForUpdates, checkingForUpdates }: DeviceTabPr
                 )}
               </div>
             </div>
+
+            {/* The GLOBAL avoid list (#522). A SECOND list, not a filter of the
+                one above: these are bare frequencies with no channel, and they
+                are what Search and Close Call skip. Kept visually separate for
+                that reason -- merging them into one table would imply a
+                relationship the radio does not have. */}
+            <div className="shrink-0 space-y-2">
+              <div className="flex items-baseline justify-between">
+                <h3 className="text-sm font-bold uppercase tracking-wider text-white/60">
+                  Avoided frequencies
+                </h3>
+                <span className="text-xs text-white/50">
+                  {lockedFrequencies.length} on the global list
+                </span>
+              </div>
+              <p className="text-xs text-white/50">
+                Skipped during Search and Close Call, regardless of channel. Add one on the scanner
+                itself: start a Search, then press L/O when it stops on the frequency.
+              </p>
+              <div
+                role="table"
+                aria-label="Avoided frequencies"
+                className="rounded-lg border border-white/5 bg-black/10 overflow-hidden"
+              >
+                {lockedFrequencies.length === 0 ? (
+                  <div className="py-6 text-center text-sm text-white/50">
+                    No avoided frequencies
+                  </div>
+                ) : (
+                  lockedFrequencies.map((frequency) => (
+                    <div
+                      key={frequency}
+                      role="row"
+                      className="flex items-center justify-between border-b border-white/5 px-3 py-2 last:border-b-0"
+                    >
+                      <div role="cell" className="font-mono text-sm text-white">
+                        {frequency.toFixed(4)}
+                        <span className="ml-1 text-white/50">MHz</span>
+                      </div>
+                      <div role="cell">
+                        <button
+                          type="button"
+                          onClick={() => void handleRemoveFrequency(frequency)}
+                          disabled={removingFrequency !== null}
+                          aria-label={`Remove ${frequency.toFixed(4)} MHz from the avoid list`}
+                          className="rounded px-3 py-1 text-xs font-medium text-white/70 transition-colors hover:bg-white/5 hover:text-white disabled:opacity-40"
+                        >
+                          {removingFrequency === frequency ? 'Removing…' : 'Remove'}
+                        </button>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
           </div>
         )}
 
         {/* Device Config */}
-        {selectedCategory === 'Device Config' && (
+        {activeCategory === 'Device Config' && (
           <div className="space-y-4 max-w-4xl">
             <div className="grid grid-cols-2 gap-6">
               {/* Audio Control */}
@@ -1085,126 +1348,138 @@ export function DeviceTab({ onCheckForUpdates, checkingForUpdates }: DeviceTabPr
                 )}
               </div>
 
-              {/* Display Settings */}
-              <div className="bg-white/5 rounded-lg border border-white/10 p-4 space-y-3">
-                <div className="flex items-center gap-2 mb-2">
-                  <div className="p-1.5 bg-blue-500/20 rounded text-blue-400">
-                    <Maximize2 size={16} aria-hidden />
+              {/* Display Settings. Gated as a whole, not control by control:
+                  every control it holds is capability-gated, so on a BC75XLT
+                  (no BLT, no CNT, and KBP's beep field reserved) it rendered as
+                  an empty titled box. Scanning Logic takes the grid slot instead
+                  of leaving the row half empty. */}
+              {showDisplayCard && (
+                <div className="bg-white/5 rounded-lg border border-white/10 p-4 space-y-3">
+                  <div className="flex items-center gap-2 mb-2">
+                    <div className="p-1.5 bg-blue-500/20 rounded text-blue-400">
+                      <Maximize2 size={16} aria-hidden />
+                    </div>
+                    <h3 className="font-bold text-white">Display & System</h3>
                   </div>
-                  <h3 className="font-bold text-white">Display & System</h3>
+
+                  <div className="space-y-4">
+                    {capabilities.has_backlight_control && (
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-medium text-white/70">Backlight</span>
+                        <Select value={backlight} onValueChange={handleBacklightChange}>
+                          <SelectTrigger
+                            aria-label="Backlight"
+                            className="scanner-input h-7 w-[var(--size-select-medium)] text-sm"
+                          >
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent className="scanner-select-content">
+                            <SelectItem value="AO">Always On</SelectItem>
+                            <SelectItem value="AF">Always Off</SelectItem>
+                            <SelectItem value="KY">Keypress</SelectItem>
+                            <SelectItem value="SQ">Squelch</SelectItem>
+                            <SelectItem value="KS">Key + Squelch</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    )}
+
+                    {capabilities.has_contrast && (
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-medium text-white/70">Contrast</span>
+                        <Slider
+                          aria-label="Contrast"
+                          value={[contrast]}
+                          min={1}
+                          max={15}
+                          step={1}
+                          className="w-[var(--size-select-medium)]"
+                          onValueChange={handleContrastChange}
+                        />
+                      </div>
+                    )}
+
+                    {capabilities.has_key_beep && (
+                      <div className="flex items-center justify-between pt-2 border-t border-white/5">
+                        <label
+                          htmlFor="key-beep"
+                          className="text-sm font-medium text-white/70 cursor-pointer"
+                        >
+                          Key Beep
+                        </label>
+                        <Switch
+                          id="key-beep"
+                          className="data-[state=checked]:bg-brand-primary"
+                          checked={keyBeepEnabled}
+                          onCheckedChange={handleKeyBeepChange}
+                        />
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+              {/* Scanning Logic */}
+              <div
+                className={cn(
+                  'bg-white/5 rounded-lg border border-white/10 p-4 space-y-3',
+                  showDisplayCard && 'col-span-2',
+                )}
+              >
+                <div className="flex items-center gap-2 mb-2">
+                  <div className="p-1.5 bg-green-500/20 rounded text-green-400">
+                    <Signal size={16} aria-hidden />
+                  </div>
+                  <h3 className="font-bold text-white">Scanning Logic</h3>
                 </div>
 
-                <div className="space-y-4">
-                  {capabilities.has_backlight_control && (
+                <div className="grid grid-cols-2 gap-6">
+                  <div className="space-y-2">
                     <div className="flex items-center justify-between">
-                      <span className="text-sm font-medium text-white/70">Backlight</span>
-                      <Select value={backlight} onValueChange={handleBacklightChange}>
+                      <span className="text-sm font-medium text-white/70">Priority Mode</span>
+                      <Select value={priorityMode} onValueChange={handlePriorityModeChange}>
                         <SelectTrigger
-                          aria-label="Backlight"
+                          aria-label="Priority Mode"
+                          aria-describedby={noPriorityChannel ? 'priority-no-channel' : undefined}
                           className="scanner-input h-7 w-[var(--size-select-medium)] text-sm"
                         >
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent className="scanner-select-content">
-                          <SelectItem value="AO">Always On</SelectItem>
-                          <SelectItem value="AF">Always Off</SelectItem>
-                          <SelectItem value="KY">Keypress</SelectItem>
-                          <SelectItem value="SQ">Squelch</SelectItem>
-                          <SelectItem value="KS">Key + Squelch</SelectItem>
+                          <SelectItem value="off">Off</SelectItem>
+                          <SelectItem value="on">On</SelectItem>
+                          <SelectItem value="plus">Plus</SelectItem>
+                          <SelectItem value="dnd">DND</SelectItem>
                         </SelectContent>
                       </Select>
                     </div>
-                  )}
+                    {noPriorityChannel && (
+                      <p
+                        id="priority-no-channel"
+                        className="rounded-md border border-amber-400/20 bg-amber-500/10 p-2 text-xs leading-relaxed text-amber-100"
+                      >
+                        No channel is flagged as priority, so these modes will not engage. Flag one
+                        on the Channels page.
+                      </p>
+                    )}
+                  </div>
 
-                  {capabilities.has_contrast && (
-                    <div className="flex items-center justify-between">
-                      <span className="text-sm font-medium text-white/70">Contrast</span>
-                      <Slider
-                        aria-label="Contrast"
-                        value={[contrast]}
-                        min={1}
-                        max={15}
-                        step={1}
-                        className="w-[var(--size-select-medium)]"
-                        onValueChange={handleContrastChange}
+                  {capabilities.has_weather_alert && (
+                    <div className="flex items-center gap-3">
+                      <Switch
+                        id="weather-alert"
+                        className="scale-75 data-[state=checked]:bg-brand-primary"
+                        checked={weatherAlert}
+                        onCheckedChange={handleWeatherAlertChange}
                       />
+                      <label
+                        htmlFor="weather-alert"
+                        className="text-sm font-medium text-white/70 cursor-pointer"
+                      >
+                        Weather Alert Priority
+                      </label>
                     </div>
                   )}
-
-                  <div className="flex items-center justify-between pt-2 border-t border-white/5">
-                    <label
-                      htmlFor="key-beep"
-                      className="text-sm font-medium text-white/70 cursor-pointer"
-                    >
-                      Key Beep
-                    </label>
-                    <Switch
-                      id="key-beep"
-                      className="data-[state=checked]:bg-brand-primary"
-                      checked={keyBeepEnabled}
-                      onCheckedChange={handleKeyBeepChange}
-                    />
-                  </div>
                 </div>
-              </div>
-            </div>
-
-            {/* Scanning Logic */}
-            <div className="bg-white/5 rounded-lg border border-white/10 p-4 space-y-3">
-              <div className="flex items-center gap-2 mb-2">
-                <div className="p-1.5 bg-green-500/20 rounded text-green-400">
-                  <Signal size={16} aria-hidden />
-                </div>
-                <h3 className="font-bold text-white">Scanning Logic</h3>
-              </div>
-
-              <div className="grid grid-cols-2 gap-6">
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm font-medium text-white/70">Priority Mode</span>
-                    <Select value={priorityMode} onValueChange={handlePriorityModeChange}>
-                      <SelectTrigger
-                        aria-label="Priority Mode"
-                        aria-describedby={noPriorityChannel ? 'priority-no-channel' : undefined}
-                        className="scanner-input h-7 w-[var(--size-select-medium)] text-sm"
-                      >
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent className="scanner-select-content">
-                        <SelectItem value="off">Off</SelectItem>
-                        <SelectItem value="on">On</SelectItem>
-                        <SelectItem value="plus">Plus</SelectItem>
-                        <SelectItem value="dnd">DND</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  {noPriorityChannel && (
-                    <p
-                      id="priority-no-channel"
-                      className="rounded-md border border-amber-400/20 bg-amber-500/10 p-2 text-xs leading-relaxed text-amber-100"
-                    >
-                      No channel is flagged as priority, so these modes will not engage. Flag one on
-                      the Channels page.
-                    </p>
-                  )}
-                </div>
-
-                {capabilities.has_weather_alert && (
-                  <div className="flex items-center gap-3">
-                    <Switch
-                      id="weather-alert"
-                      className="scale-75 data-[state=checked]:bg-brand-primary"
-                      checked={weatherAlert}
-                      onCheckedChange={handleWeatherAlertChange}
-                    />
-                    <label
-                      htmlFor="weather-alert"
-                      className="text-sm font-medium text-white/70 cursor-pointer"
-                    >
-                      Weather Alert Priority
-                    </label>
-                  </div>
-                )}
               </div>
             </div>
 
@@ -1265,135 +1540,176 @@ export function DeviceTab({ onCheckForUpdates, checkingForUpdates }: DeviceTabPr
         )}
 
         {/* Close Call */}
-        {selectedCategory === 'Close Call' && (
-          <div className="grid grid-cols-2 gap-8 max-w-4xl">
-            <div className="space-y-8">
-              <section className="space-y-4">
-                <h3 className="text-lg font-bold text-white">Settings</h3>
+        {activeCategory === 'Close Call' && (
+          <div className="max-w-4xl space-y-6">
+            {/* Deliberately NOT the "press a key to resume" line the two search
+                pages carry. Close Call Priority and DND run in the background
+                during an ordinary scan, and Bearpaw resumes scanning by itself
+                when you leave the Device page (see the "Leaving the Device page
+                resumes scan" third rail). So there is nothing for the user to
+                press -- the honest note is that the writes are immediate and
+                where they take effect. */}
+            <p className="text-base text-white/60">
+              Close Call settings are written to the scanner immediately. Each write leaves it in
+              Hold; Bearpaw resumes scanning when you leave the Device page, and Close Call Priority
+              and DND take effect from there.
+            </p>
+            <div className="grid grid-cols-2 gap-8">
+              <div className="space-y-8">
+                <section className="space-y-4">
+                  <h3 className="text-lg font-bold text-white">Settings</h3>
 
-                <div className="flex items-center justify-between">
-                  <div className="flex flex-col">
-                    <span className="text-sm font-medium text-white/70">Mode</span>
-                    <span className="text-sm text-white/60">Operation mode</span>
+                  <div className="flex items-center justify-between">
+                    <div className="flex flex-col">
+                      <span className="text-sm font-medium text-white/70">Mode</span>
+                      <span className="text-sm text-white/60">Operation mode</span>
+                    </div>
+                    <Select value={closeCallMode} onValueChange={handleCloseCallModeChange}>
+                      <SelectTrigger
+                        aria-label="Mode"
+                        className="h-8 w-[var(--size-select-wide)] border-white/10 bg-white/5 text-sm"
+                      >
+                        <SelectValue placeholder="Select mode" />
+                      </SelectTrigger>
+                      <SelectContent className="scanner-select-content">
+                        <SelectItem value="off">Off</SelectItem>
+                        <SelectItem value="cc_dnd">CC DND</SelectItem>
+                        <SelectItem value="cc_priority">CC Priority</SelectItem>
+                        <SelectItem value="cc_only">CC Only</SelectItem>
+                      </SelectContent>
+                    </Select>
                   </div>
-                  <Select value={closeCallMode} onValueChange={handleCloseCallModeChange}>
-                    <SelectTrigger
-                      aria-label="Mode"
-                      className="h-8 w-[var(--size-select-wide)] border-white/10 bg-white/5 text-sm"
-                    >
-                      <SelectValue placeholder="Select mode" />
-                    </SelectTrigger>
-                    <SelectContent className="scanner-select-content">
-                      <SelectItem value="off">Off</SelectItem>
-                      <SelectItem value="cc_dnd">CC DND</SelectItem>
-                      <SelectItem value="cc_priority">CC Priority</SelectItem>
-                      <SelectItem value="cc_only">CC Only</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
 
-                <div className="flex items-center gap-3 pt-2">
-                  <Switch
-                    id="cc-lockout"
-                    className="data-[state=checked]:bg-brand-primary"
-                    checked={closeCallLockout}
-                    disabled={closeCallMode === 'off'}
-                    onCheckedChange={(checked) => handleCloseCallSettingChange('lockout', checked)}
-                  />
-                  <label
-                    htmlFor="cc-lockout"
-                    className={cn(
-                      'text-sm font-medium cursor-pointer',
-                      closeCallMode === 'off' ? 'text-white/30' : 'text-white/70',
-                    )}
-                  >
-                    Lockout Hits While Scanning
-                  </label>
-                </div>
-              </section>
+                  {/* CLC field 5 is reserved on some models: written `1` on a
+                    BC75XLT it reads back empty (hardware 2026-08-28). It is
+                    accepted without an error and silently discarded, so
+                    nothing but a read-back would ever reveal the failure. */}
+                  {capabilities.has_close_call_hit_scan && (
+                    <div className="flex items-center gap-3 pt-2">
+                      <Switch
+                        id="cc-lockout"
+                        className="data-[state=checked]:bg-brand-primary"
+                        checked={closeCallLockout}
+                        disabled={closeCallMode === 'off'}
+                        onCheckedChange={(checked) =>
+                          handleCloseCallSettingChange('lockout', checked)
+                        }
+                      />
+                      <label
+                        htmlFor="cc-lockout"
+                        className={cn(
+                          'text-sm font-medium cursor-pointer',
+                          closeCallMode === 'off' ? 'text-white/30' : 'text-white/70',
+                        )}
+                      >
+                        Lockout Hits While Scanning
+                      </label>
+                    </div>
+                  )}
+                </section>
 
-              <section className="space-y-4">
-                <h3 className="text-lg font-bold text-white">Alerts</h3>
+                <section className="space-y-4">
+                  <h3 className="text-lg font-bold text-white">Alerts</h3>
 
-                <div className="flex items-center gap-3">
-                  <Switch
-                    id="cc-beep"
-                    className="data-[state=checked]:bg-brand-primary"
-                    checked={closeCallBeep}
-                    disabled={closeCallMode === 'off'}
-                    onCheckedChange={(checked) =>
-                      handleCloseCallSettingChange('alert_beep', checked)
-                    }
-                  />
-                  <label
-                    htmlFor="cc-beep"
-                    className={cn(
-                      'text-sm font-medium cursor-pointer',
-                      closeCallMode === 'off' ? 'text-white/30' : 'text-white/70',
-                    )}
-                  >
-                    Alert Beep
-                  </label>
-                </div>
-
-                <div className="flex items-center gap-3">
-                  <Switch
-                    id="cc-light"
-                    className="data-[state=checked]:bg-brand-primary"
-                    checked={closeCallLight}
-                    disabled={closeCallMode === 'off'}
-                    onCheckedChange={(checked) =>
-                      handleCloseCallSettingChange('alert_light', checked)
-                    }
-                  />
-                  <label
-                    htmlFor="cc-light"
-                    className={cn(
-                      'text-sm font-medium cursor-pointer',
-                      closeCallMode === 'off' ? 'text-white/30' : 'text-white/70',
-                    )}
-                  >
-                    Alert Light
-                  </label>
-                </div>
-              </section>
-            </div>
-
-            <section className="space-y-4">
-              <h3 className="text-lg font-bold text-white">Enabled Bands</h3>
-              <div className="bg-white/5 rounded-lg p-4 space-y-4 border border-white/10">
-                {['VHF Low', 'Air', 'VHF High', 'UHF', '800 MHz'].map((band, index) => (
-                  <div key={band} className="flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <Switch
+                      id="cc-beep"
+                      className="data-[state=checked]:bg-brand-primary"
+                      checked={closeCallBeep}
+                      disabled={closeCallMode === 'off'}
+                      onCheckedChange={(checked) =>
+                        handleCloseCallSettingChange('alert_beep', checked)
+                      }
+                    />
                     <label
-                      htmlFor={`band-${band}`}
+                      htmlFor="cc-beep"
                       className={cn(
                         'text-sm font-medium cursor-pointer',
                         closeCallMode === 'off' ? 'text-white/30' : 'text-white/70',
                       )}
                     >
-                      {band}
+                      Alert Beep
                     </label>
-                    <Switch
-                      id={`band-${band}`}
-                      className="data-[state=checked]:bg-brand-primary"
-                      checked={closeCallBands[index]}
-                      disabled={closeCallMode === 'off'}
-                      onCheckedChange={() => handleCloseCallBandToggle(index)}
-                    />
                   </div>
-                ))}
+
+                  <div className="flex items-center gap-3">
+                    <Switch
+                      id="cc-light"
+                      className="data-[state=checked]:bg-brand-primary"
+                      checked={closeCallLight}
+                      disabled={closeCallMode === 'off'}
+                      onCheckedChange={(checked) =>
+                        handleCloseCallSettingChange('alert_light', checked)
+                      }
+                    />
+                    <label
+                      htmlFor="cc-light"
+                      className={cn(
+                        'text-sm font-medium cursor-pointer',
+                        closeCallMode === 'off' ? 'text-white/30' : 'text-white/70',
+                      )}
+                    >
+                      Alert Light
+                    </label>
+                  </div>
+                </section>
               </div>
-            </section>
+
+              <section className="space-y-4">
+                <h3 className="text-lg font-bold text-white">Enabled Bands</h3>
+                <div className="bg-white/5 rounded-lg p-4 space-y-4 border border-white/10">
+                  {/* Index IS the wire position in the 5-character CLC mask, so
+                    the reserved slot is skipped in place rather than filtered
+                    out -- `entries()` keeps the index after the null is gone.
+                    The families disagree on positions 4 and 5 (BC125AT: UHF,
+                    800 MHz; BC75XLT: reserved, UHF), verified on hardware
+                    2026-08-28. Remapping only one of the two would leave a
+                    "UHF" switch writing the reserved slot. */}
+                  {[...capabilities.close_call_bands.entries()]
+                    .filter((entry): entry is [number, string] => entry[1] !== null)
+                    .map(([index, band]) => (
+                      <div key={band} className="flex items-center justify-between">
+                        <label
+                          htmlFor={`band-${band}`}
+                          className={cn(
+                            'text-sm font-medium cursor-pointer',
+                            closeCallMode === 'off' ? 'text-white/30' : 'text-white/70',
+                          )}
+                        >
+                          {band}
+                        </label>
+                        <Switch
+                          id={`band-${band}`}
+                          className="data-[state=checked]:bg-brand-primary"
+                          checked={closeCallBands[index]}
+                          disabled={closeCallMode === 'off'}
+                          onCheckedChange={() => handleCloseCallBandToggle(index)}
+                        />
+                      </div>
+                    ))}
+                </div>
+              </section>
+            </div>
           </div>
         )}
 
         {/* Service Search */}
-        {selectedCategory === 'Service Search' && (
+        {activeCategory === 'Service Search' && (
           <div className="max-w-3xl">
             <div className="bg-white/5 rounded-lg border border-white/10 p-6">
+              {/* Same correction as Custom Search: "then start Service Search"
+                  implied the toggles were staged, when each one reaches the
+                  scanner immediately. EPG leaves it in Scan Hold, so the write
+                  lands and then looks like it did nothing. This page only shows
+                  on a BC125AT-family scanner (a BC75XLT has no SSG), where the
+                  documented start is Func then Srch -- `KEY,F,P` then `KEY,R,P`,
+                  and `R` is the Srch button. */}
               <p className="text-base text-white/60 mb-4">
-                Service Search runs on the scanner itself. Enable the service banks you want to use,
-                then start Service Search directly on the device.
+                Service Search runs on the scanner itself. Bank toggles are written to the scanner
+                immediately, but each write leaves it in Hold. Press{' '}
+                <span className="font-bold text-white/80">Func</span> then{' '}
+                <span className="font-bold text-white/80">Srch</span> on the scanner to resume
+                searching with the new settings.
               </p>
               <div className="grid grid-cols-2 gap-x-16 gap-y-4">
                 {SERVICE_SEARCH_LABELS[capabilities.ss_region]?.map((service, index) => (
@@ -1414,56 +1730,77 @@ export function DeviceTab({ onCheckForUpdates, checkingForUpdates }: DeviceTabPr
                 ))}
               </div>
 
-              <div className="mt-6 pt-6 border-t border-white/10 space-y-4">
-                <h3 className="text-base font-bold text-white">Search Settings</h3>
+              {/* Hidden, not disabled, on a model that cannot take `SCO`: the
+                  BC75XLT answers a SCO read but rejects every write, including
+                  a write of the value it just reported (hardware 2026-09-02).
+                  A greyed-out control the scanner cannot honour is noise; an
+                  absent one asks no questions. See CLAUDE.md frontend pitfall
+                  #5 and #638. */}
+              {capabilities.has_search_options && (
+                <div className="mt-6 pt-6 border-t border-white/10 space-y-4">
+                  <h3 className="text-base font-bold text-white">Search Settings</h3>
 
-                <div className="flex items-center justify-between">
-                  <label htmlFor="code-search" className="text-base font-medium text-white/70">
-                    Code Search
-                  </label>
-                  <Switch
-                    id="code-search"
-                    className="data-[state=checked]:bg-brand-primary"
-                    checked={codeSearchEnabled}
-                    onCheckedChange={handleCodeSearchToggle}
-                  />
-                </div>
-
-                <div>
-                  <div className="flex justify-between text-sm font-medium text-white/70 mb-2">
-                    {/* Radix puts an id on the slider Root, not the role=slider
-                        thumb, so htmlFor can't target it — name via aria-label. */}
-                    <span>Search Delay</span>
-                    <span className="text-white">{searchDelay}s</span>
+                  <div className="flex items-center justify-between">
+                    <label htmlFor="code-search" className="text-base font-medium text-white/70">
+                      Code Search
+                    </label>
+                    <Switch
+                      id="code-search"
+                      className="data-[state=checked]:bg-brand-primary"
+                      checked={codeSearchEnabled}
+                      onCheckedChange={handleCodeSearchToggle}
+                    />
                   </div>
-                  <Slider
-                    aria-label="Search Delay"
-                    min={0}
-                    max={5}
-                    step={1}
-                    value={[searchDelay]}
-                    onValueChange={handleSearchDelayChange}
-                    className="w-full"
-                  />
+
+                  <div>
+                    <div className="flex justify-between text-sm font-medium text-white/70 mb-2">
+                      {/* Radix puts an id on the slider Root, not the role=slider
+                        thumb, so htmlFor can't target it — name via aria-label. */}
+                      <span>Search Delay</span>
+                      <span className="text-white">{searchDelay}s</span>
+                    </div>
+                    <Slider
+                      aria-label="Search Delay"
+                      min={0}
+                      max={5}
+                      step={1}
+                      value={[searchDelay]}
+                      onValueChange={handleSearchDelayChange}
+                      className="w-full"
+                    />
+                  </div>
                 </div>
-              </div>
+              )}
             </div>
           </div>
         )}
 
         {/* Custom Search */}
-        {selectedCategory === 'Custom Search' && (
+        {activeCategory === 'Custom Search' && (
           <div className="flex flex-col max-w-5xl mx-auto overflow-hidden gap-4">
+            {/* Both halves of this are load-bearing. Writes ARE immediate --
+                a range edit or an Active toggle reaches the scanner as soon as
+                it is made -- but every write runs inside a PRG/EPG bracket, and
+                the vendor spec is explicit that EPG leaves the scanner in Scan
+                Hold. So the change lands and then appears to do nothing, which
+                reads as a failed write rather than a parked radio. Naming Srch
+                is the recovery; the manual's own procedure is "Press Srch to
+                start searching your custom search range". */}
             <p className="text-base text-white/60">
-              Custom Search runs on the scanner itself. Configure these ranges here, then start
-              Custom Search directly on the device.
+              Custom Search runs on the scanner itself. Range edits and Active toggles are written
+              to the scanner immediately, but each write leaves it in Hold. Press{' '}
+              <span className="font-bold text-white/80">Srch</span> on the scanner to resume
+              searching with the new settings.
             </p>
             <div className="flex-1 h-full bg-black/20 rounded-lg border border-white/5 overflow-hidden flex flex-col shadow-inner">
               {/* Table Header */}
-              <div className="grid grid-cols-[50px_60px_1fr_100px_100px] gap-2 px-4 py-2 bg-white/5 text-sm font-bold text-white/60 uppercase tracking-wider border-b border-white/5 shrink-0 select-none">
+              {/* Table Header. No Label column: `CSP` has no name field on
+                  either model, so a label could never be saved -- the old one
+                  wrote to local state and vanished on reload. `R-n` already
+                  names the row. */}
+              <div className="grid grid-cols-[72px_80px_1fr_1fr] gap-2 px-4 py-2 bg-white/5 text-sm font-bold text-white/60 uppercase tracking-wider border-b border-white/5 shrink-0 select-none">
                 <div className="text-center">Active</div>
                 <div>Range</div>
-                <div>Label</div>
                 <div className="text-center">Lower (MHz)</div>
                 <div className="text-center">Upper (MHz)</div>
               </div>
@@ -1473,13 +1810,29 @@ export function DeviceTab({ onCheckForUpdates, checkingForUpdates }: DeviceTabPr
                 {searchRanges.map((range) => (
                   <div
                     key={range.id}
+                    role="button"
+                    tabIndex={0}
+                    aria-label={`Edit search range ${range.id}`}
+                    onClick={() => setEditingRangeId(range.id)}
+                    // Enter/Space opens the sheet -- the row's primary action.
+                    // The target===currentTarget guard leaves a Space press on
+                    // the Active switch toggling the switch instead. Same shape
+                    // as ChannelsTab's row (a11y C1).
+                    onKeyDown={(event) => {
+                      if (event.target !== event.currentTarget) return;
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        setEditingRangeId(range.id);
+                      }
+                    }}
                     className={cn(
-                      'group flex-1 grid min-h-[var(--size-panel-stat-min-height)] grid-cols-[50px_60px_1fr_100px_100px] items-center gap-2 border-b border-white/5 px-4 transition-colors last:border-0 hover:bg-white/5',
+                      'group flex-1 grid min-h-[var(--size-panel-stat-min-height)] cursor-pointer grid-cols-[72px_80px_1fr_1fr] items-center gap-2 border-b border-white/5 px-4 text-left transition-colors last:border-0 hover:bg-white/5 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-primary',
                       range.enabled && 'bg-brand-primary/5',
                     )}
                   >
-                    <div className="flex justify-center">
+                    <div className="flex justify-center" onClick={(e) => e.stopPropagation()}>
                       <Switch
+                        aria-label={`Range ${range.id} active`}
                         checked={range.enabled}
                         onCheckedChange={() => toggleRange(range.id)}
                         className={cn(
@@ -1493,57 +1846,45 @@ export function DeviceTab({ onCheckForUpdates, checkingForUpdates }: DeviceTabPr
                       R-{range.id}
                     </div>
 
-                    <div className="relative">
-                      <input
-                        aria-label={`Range ${range.id} label`}
-                        value={range.label}
-                        onChange={(e) => updateRange(range.id, 'label', e.target.value)}
-                        className={cn(
-                          'w-full bg-transparent border-none outline-none text-sm font-medium tracking-wide transition-colors placeholder:text-white/10',
-                          range.enabled ? 'text-white/80' : 'text-white/30',
-                        )}
-                        placeholder="Label..."
-                      />
+                    <div
+                      className={cn(
+                        'text-center text-sm font-mono font-bold',
+                        range.enabled
+                          ? 'text-brand-primary group-hover:text-brand-light'
+                          : 'text-white/30',
+                      )}
+                    >
+                      {range.start || '—'}
                     </div>
 
-                    <div className="relative">
-                      <input
-                        type="text"
-                        aria-label={`Range ${range.id} lower MHz`}
-                        value={range.start}
-                        onChange={(e) => updateRange(range.id, 'start', e.target.value)}
-                        className={cn(
-                          'w-full bg-transparent border-b border-transparent focus:border-brand-primary text-sm font-mono font-bold text-center outline-none transition-all py-0',
-                          range.enabled
-                            ? 'text-brand-primary group-hover:text-brand-light'
-                            : 'text-white/30 group-hover:border-white/10',
-                        )}
-                      />
-                    </div>
-
-                    <div className="relative">
-                      <input
-                        type="text"
-                        aria-label={`Range ${range.id} upper MHz`}
-                        value={range.end}
-                        onChange={(e) => updateRange(range.id, 'end', e.target.value)}
-                        className={cn(
-                          'w-full bg-transparent border-b border-transparent focus:border-brand-primary text-sm font-mono font-bold text-center outline-none transition-all py-0',
-                          range.enabled
-                            ? 'text-brand-primary group-hover:text-brand-light'
-                            : 'text-white/30 group-hover:border-white/10',
-                        )}
-                      />
+                    <div
+                      className={cn(
+                        'text-center text-sm font-mono font-bold',
+                        range.enabled
+                          ? 'text-brand-primary group-hover:text-brand-light'
+                          : 'text-white/30',
+                      )}
+                    >
+                      {range.end || '—'}
                     </div>
                   </div>
                 ))}
               </div>
             </div>
+            {editingRange && (
+              <SearchRangeEditSheet
+                index={editingRange.id}
+                draft={{ start: editingRange.start, end: editingRange.end }}
+                isOpen
+                onClose={() => setEditingRangeId(null)}
+                onSave={(draft) => saveRange(editingRange.id, draft)}
+              />
+            )}
           </div>
         )}
 
         {/* Preferences */}
-        {selectedCategory === 'Preferences' && (
+        {activeCategory === 'Preferences' && (
           <div className="flex h-[calc(100%-4rem)] gap-6 overflow-hidden">
             {/* Info Sidebar (Left) */}
             <div className="w-[var(--layout-detail-sidebar-width)] shrink-0 space-y-4 overflow-y-auto border-r border-white/5 pb-4 pr-4">
@@ -1693,6 +2034,31 @@ export function DeviceTab({ onCheckForUpdates, checkingForUpdates }: DeviceTabPr
                       />
                     </div>
                   )}
+
+                  {/* Not gated on capabilities: both scanner families cache
+                    channel memory and both can be programmed on their own
+                    keypad, so the choice applies to every model. */}
+                  <div className="flex items-center justify-between">
+                    <div className="space-y-0.5">
+                      <label
+                        htmlFor="reread-memory-on-connect"
+                        className="text-base font-medium text-white"
+                      >
+                        Re-read Channels on Connect
+                      </label>
+                      <p className="text-sm text-white/60">
+                        Read channel memory from the scanner at every launch. Turn off for an
+                        instant start from the saved copy.
+                      </p>
+                    </div>
+                    <Switch
+                      id="reread-memory-on-connect"
+                      checked={preferences.rereadMemoryOnConnect}
+                      onCheckedChange={(checked) =>
+                        handlePreferenceChange('rereadMemoryOnConnect', checked)
+                      }
+                    />
+                  </div>
 
                   {/* Not gated on capabilities: the choice is about the stored
                     history, which can contain hits from a scanner that is not

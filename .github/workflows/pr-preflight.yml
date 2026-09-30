@@ -1,0 +1,115 @@
+# Advisory checks on every pull request.
+#
+# This workflow is DELIBERATELY NOT a required status check, and must not
+# become one. CLAUDE.md records what happens when a required check does not
+# report: the pull request becomes permanently unmergeable rather than fast.
+# Dependabot and fork pull requests are exactly the cases that would hit it.
+#
+# Its job is to make a missing issue link, label, milestone or changelog entry
+# visible at review time. It fails a check you can see and override.
+name: PR Preflight
+
+on:
+  pull_request:
+    # Every PR field the script reads needs its own event here, because it
+    # reads the event's payload and a re-run reuses the original one. Labels
+    # change on labeled/unlabeled, the body on edited, files on synchronize,
+    # and the milestone ONLY on milestoned/demilestoned — without those, a
+    # milestone added after the last push stays "No milestone" for good (#685).
+    types: [opened, edited, reopened, synchronize, labeled, unlabeled, milestoned, demilestoned, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  preflight:
+    name: PR Preflight (advisory)
+    runs-on: ubuntu-latest
+    if: github.actor != 'dependabot[bot]'
+    steps:
+      - uses: actions/github-script@v9
+        with:
+          script: |
+            const TYPES = ['bug', 'feat', 'docs', 'chore'];
+            const pr = context.payload.pull_request;
+            const labels = pr.labels.map((l) => l.name);
+            const problems = [];
+
+            // 1. Exactly one type label. Two answers to one question is the
+            //    defect this process exists to prevent. Checked first, because
+            //    the issue-link and changelog rules below key off it.
+            const types = labels.filter((l) => TYPES.includes(l));
+            if (types.length === 0) {
+              problems.push(`No type label. Add exactly one of: ${TYPES.join(', ')}.`);
+            } else if (types.length > 1) {
+              problems.push(
+                `More than one type label (${types.join(', ')}). A change is one ` +
+                  'kind of thing. If it is genuinely two, it is two pull requests.'
+              );
+            }
+
+            // 2. A FEATURE links an issue. Deliberately not every pull request:
+            //    a feature is planned work and should have a stated user story
+            //    and a milestone, but a fix is usually discovered work. 94 of
+            //    the 1.1 fixes were found on the bench, and demanding an issue
+            //    for each would have fired this check constantly during the
+            //    busiest week. An advisory check that fires on legitimate pull
+            //    requests teaches people to ignore it, which is worse than not
+            //    having it at all.
+            if (types.includes('feat')) {
+              const closes = /\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\s+#\d+/i;
+              if (!closes.test(pr.body || '')) {
+                problems.push(
+                  'A `feat` needs a linked issue — a closing keyword and a number, ' +
+                    'e.g. `Fixes #123`. The issue is where the user story, the ' +
+                    'labels and the milestone live; this pull request points at it.'
+                );
+              }
+            }
+
+            // 3. Belongs to a release.
+            if (!pr.milestone) {
+              problems.push(
+                'No milestone. A milestone is what makes "what is in this release" ' +
+                  'a query instead of an archaeology dig, and it is what the release ' +
+                  'gate reads. No milestone means this is not in a release.'
+              );
+            }
+
+            // 4. Says what changed for a user, in the pull request that changed it.
+            const exempt = types.some((t) => t === 'docs' || t === 'chore');
+            if (!exempt) {
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+                per_page: 100,
+              });
+              if (!files.some((f) => f.filename === 'CHANGELOG.md')) {
+                problems.push(
+                  'CHANGELOG.md is untouched. A `bug` or `feat` change writes its ' +
+                    'own entry under the current version\'s heading, in this ' +
+                    'pull request. ' +
+                    'Reconstructing the changelog at release time is how five 1.1 ' +
+                    'fixes went unrecorded. If there is genuinely nothing a user ' +
+                    'would notice, label it `chore`.'
+                );
+              }
+            }
+
+            const summary = core.summary.addHeading('PR Preflight', 2);
+            if (problems.length === 0) {
+              summary.addRaw('All advisory checks passed.');
+              await summary.write();
+              return;
+            }
+            summary
+              .addRaw(
+                'These are advisory. This check is not required and does not block ' +
+                  'the merge — but each item below is one the 1.1 cycle actually got ' +
+                  'wrong. See `docs/PROCESS.md`.'
+              )
+              .addList(problems);
+            await summary.write();
+            core.setFailed(`${problems.length} preflight problem(s); see the job summary.`);

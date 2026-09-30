@@ -15,14 +15,28 @@ Define how Bearpaw stores, migrates, retains, and cleans up local data so app up
 
 ## Databases
 
-- Preferences DB: `scanner.db` (key/value preferences)
+- Preferences DB: `scanner.db` — key/value preferences, plus the
+  `channel_memory` table (schema version 2, #413): cached channel memory keyed
+  by `(scanner_id, channel_index)`. `scanner_id` is the fixed placeholder
+  `_default` until #414 introduces real scanner identity.
 - Analytics DB: `analytics.db` (scan hit history and aggregates)
+
+Cached channel memory is **disposable**. It is a read accelerator; the scanner
+is the source of truth, and losing the cache costs a memory sync, never data.
+Deleting `scanner.db` therefore loses real preferences but only a convenience
+for channels.
 
 ## Update & Migration Rules
 
 - Each DB uses SQLite `PRAGMA user_version`.
 - Migrations are forward-only and idempotent.
 - Before applying a version bump migration, backend creates a `.bak` copy in the same directory.
+  It is taken with SQLite's `VACUUM INTO`, **not** a file copy (#574). The databases run in WAL
+  mode, so a committed transaction lives in the `-wal` sidecar until something checkpoints it —
+  copying the main file alone silently omitted the most recent committed state, and restoring
+  such a file next to a newer `-wal` produced a mismatched pair rather than the old database.
+  `VACUUM INTO` is consistent by construction and writes ONE self-contained file, which is what
+  makes "put the `.bak` back" a complete instruction. It preserves `user_version`.
 - On startup, backend runs migrations before reads/writes.
 
 ### What forward-only obligates (#418)

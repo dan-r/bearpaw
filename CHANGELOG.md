@@ -6,6 +6,75 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Quitting Bearpaw now lets go of the scanner cleanly.** Quitting the app, or
+  stopping the backend with Ctrl-C or `kill`, used to end it in the middle of
+  talking to the scanner over USB. Bearpaw now finishes its current exchange
+  and releases the scanner before it exits. Quitting can take up to a few
+  seconds longer while it does.
+
+- **Channel edits and lockouts no longer stall during a memory sync.** Locking
+  out, reading or editing a channel, or loading settings while a memory sync is
+  running is now turned away straight away, instead of waiting three seconds and
+  timing out. And if the scanner ever refuses to be programmed, these actions
+  now stop and say so, instead of carrying on and reporting a confusing failure.
+
+## [1.1.2] — 2026-09-22
+
+Fixes for scanning after a channel lockout, a blank window on older Macs, and
+Linux downloads that would not start on 2022-era releases.
+
+### Fixed
+
+- **Bearpaw no longer opens to a blank white window on older Macs.** The app
+  was built for the newest web engines only, so a Mac running an older version
+  of macOS or Safari could open it and show nothing at all. It is now built to
+  run on macOS 10.15 or later with Safari 15.4 or later. If it still cannot
+  start, it now says so and shows details you can include in a bug report,
+  instead of a blank window.
+
+- **Bearpaw now runs on Ubuntu 22.04, Linux Mint 21 and Debian 12.** The Linux
+  downloads needed a newer system library than those releases have, so they
+  installed but would not start. They are now built to run on Linux from 2022
+  onward.
+
+- **Locking out a channel no longer stops the scan.** Using Temporary or
+  Permanent Lockout while scanning left the scanner stopped on channel 1, while
+  Bearpaw still showed "Scanning...". Scanning now carries on after the lockout,
+  the way pressing L/O on the scanner itself does. This applies to the lockout
+  button and the Ctrl+L shortcut alike.
+
+## [1.1.1] — 2026-09-03
+
+A single reliability fix for macOS, plus test and process work a user does not
+see.
+
+### Fixed
+
+- **Restarting Bearpaw now recovers a scanner that stopped responding after a
+  crash.** On macOS, if Bearpaw was force-quit or crashed while it was talking
+  to a BC125AT, the connection could be left in a state that survived the app
+  closing — so every restart found the scanner, then failed to read from it,
+  and the only way out was to unplug the scanner and plug it back in. Bearpaw
+  now asks the system to re-establish the connection itself, which is the same
+  thing unplugging does. Restarting the app is the first thing anyone tries, so
+  it should now be the last thing you need. If a scanner ever does still refuse
+  to connect after a restart, unplugging it and plugging it back in remains the
+  sure cure.
+
+## [1.1.0] — 2026-09-02
+
+Adds support for a second scanner family, the BC75XLT, and fixes a set of
+issues found by running Bearpaw against both radios on the bench.
+
+> **Upgrading changes how your data is stored, and it is one-way.** The first
+> time you open this version, your channels, settings and activity history are
+> upgraded to a new format, and a backup of the old data is saved next to it.
+> Bearpaw 1.0.0 cannot open the upgraded data — if you go back, it will tell you
+> so and point at that backup. Bearpaw now says this on screen when it happens,
+> rather than doing it silently.
+
 ### Added
 
 - **BC75XLT support.** Bearpaw now drives a second scanner family. The BC75XLT
@@ -20,7 +89,34 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and bank layout — so it's obvious which radio Bearpaw picked up when more than
   one is on the desk.
 
+### Security
+
+- **A web page you visit can no longer drive your scanner.** Bearpaw's local
+  API had no protection against requests sent from another site open in your
+  browser. Blocking a site from _reading_ Bearpaw's replies was never enough:
+  the request still arrived and still took effect, so a page could clear
+  channels, rewrite banks or start an import while only the response was
+  withheld. Requests from unknown websites are now refused before they reach
+  anything. Local tools that aren't a browser, such as scripts using `curl`,
+  are unaffected. Tracked as GHSA-fwgr-5f9j-r7q6.
+
 ### Fixed
+
+- **Exporting channels to CSV and importing them back now works.** Every
+  exported row carried a bank number of zero, and the importer refused any row
+  whose bank wasn't between 1 and 10 — so Bearpaw's own export failed on every
+  programmed channel. On a full scanner that was 350 rows rejected and nothing
+  imported. Empty channels were skipped without being counted at all, so the
+  error message under-reported the damage. The bank column is now filled in on
+  the way out and worked out from the channel number on the way back in, which
+  is how the scanner decides it anyway.
+
+- **One scanner's activity no longer crowds out another's.** Recorded hits were
+  loaded newest-first up to a fixed limit across all scanners together, so a busy
+  radio could fill the entire budget and a quieter one's history would be missing
+  from the activity list and every dashboard built on it — while sitting intact
+  in the database, which made it look like a display problem rather than a
+  loading one. The limit now applies per scanner.
 
 - **Channel banks now follow the connected scanner.** Bank width was fixed at 50
   channels in three places, so on a 300-channel scanner every channel above 30
@@ -48,6 +144,73 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   claim a generic serial adapter — including unrelated devices like development
   boards — and on Linux that could take the device's serial port away until it
   was unplugged.
+
+- **Restoring a settings file now clears the channels the file says are empty,
+  which means it can erase channels it previously left alone.** Bearpaw asks
+  "this overwrites all channels and settings" before a restore, and it did not:
+  any slot the file recorded as empty was skipped, so channels programmed since
+  the file was saved survived a restore that was supposed to replace them. A
+  file saved from a blank scanner reported "0 channels" and changed nothing.
+  Restoring now makes the scanner match the file exactly — **including emptying
+  slots** — so treat a settings file as a complete picture of the radio, not a
+  set of additions. Verified on a BC75XLT.
+
+- **Restoring a settings file on a BC75XLT now restores its settings.** It
+  applied channels only and always reported no settings written, while the same
+  confirmation promised "all channels and settings". Bank enablement, priority,
+  squelch, custom search and Close Call are all restored now. The handful of
+  settings that radio genuinely cannot accept are named in the result instead of
+  being dropped in silence, so a restore no longer claims to have done more than
+  it did.
+
+- **Exporting can no longer write a backup with invented data in it.** If
+  Bearpaw had not yet read the whole channel list from the radio, the export
+  filled the gaps: one format made up plausible-looking empty channels, the
+  other left rows out entirely. Either way the file looked complete and was not
+  — and with the restore change above, restoring such a file would write that
+  invented state back to the scanner. Exporting now refuses and tells you to
+  sync first.
+
+- **The scanner no longer reports a failed command at launch.** Starting a
+  memory sync registered it a moment after queueing it, and anything that
+  slipped into that gap waited behind a five-second sync and timed out. It
+  showed up as a failure reading banks on almost every launch.
+
+- **Search settings on a BC75XLT no longer pretend to work.** That radio accepts
+  the command that reads them but rejects every attempt to change them, and
+  Bearpaw treated the rejection as success — the slider moved, the confirmation
+  appeared, and the radio never changed. Those controls are now hidden on models
+  that cannot accept them, and a rejected write is reported as one.
+
+- **Channels no longer go missing when you reorder them.** Uploading a reorder
+  wrote the moved channels one at a time, so a later write could read a slot an
+  earlier write had already changed — a swap or a rotation could duplicate one
+  channel and lose another. Every source channel is now read before any of them
+  is written. Edits made on the scanner's own keypad that Bearpaw hadn't loaded
+  survive the move, and a channel's tone survives a reorder that didn't
+  otherwise touch it.
+
+- **Restoring a BC125AT settings file keeps your channel tones.** Tone values as
+  Uniden's own tools write them — off, a CTCSS frequency, a DCS code, or search
+  — weren't understood, so every restored channel came back with its tone turned
+  off. They're read correctly now, and a tone value Bearpaw can't make sense of
+  is reported as an error on that row instead of quietly becoming "off".
+
+- **Exporting a BC75XLT now includes its search settings.** Custom search
+  ranges, per-service search, Close Call mode and search direction were left out
+  of the native export, so a backup taken from that radio couldn't put them
+  back.
+
+- **A setting that fails to save now says so.** When Bearpaw couldn't write a
+  preference to disk, the control moved on screen and silently reverted later.
+  Preferences are written to storage before the interface changes, and a failure
+  is reported instead of hidden.
+
+- **The activity list no longer shows the wrong scanner's history.** Switching
+  between a single scanner and all scanners could show the previous selection's
+  data, because the request didn't say which scope it was being made for. Hits
+  arriving live while the list was loading are no longer dropped or counted
+  twice.
 
 ## [1.0.0] — 2026-08-26
 
@@ -133,6 +296,7 @@ each confirmed against the radio rather than the reference docs.
   "Priority Scan: No Channel" on its own display and the mode doesn't stick.
   Bearpaw now says so, and points at the Channels page.
 
+[1.1.0]: https://github.com/jeremyfuksa/bearpaw/releases/tag/v1.1.0
 [1.0.0]: https://github.com/jeremyfuksa/bearpaw/releases/tag/v1.0.0
 [1.0.0-beta.3]: https://github.com/jeremyfuksa/bearpaw/releases/tag/v1.0.0-beta.3
 
