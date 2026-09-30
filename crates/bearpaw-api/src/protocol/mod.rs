@@ -1008,7 +1008,8 @@ mod tests {
         let sts = parse_sts_frame(STS_SIGNAL_PRESENT).unwrap();
         let glg = parse_glg_response(GLG_SIGNAL_PRESENT).unwrap();
         let pwr = parse_pwr_response(PWR_SAMPLE).unwrap();
-        let live = livestate_from_frames(Some(&sts), Some(&glg), Some(&pwr), ScannerMode::Scan, 7, 0);
+        let live =
+            livestate_from_frames(Some(&sts), Some(&glg), Some(&pwr), ScannerMode::Scan, 7, 0);
         assert_eq!(live.frequency, 462.6125);
         assert_eq!(live.modulation, "NFM");
         assert!(live.squelch_open);

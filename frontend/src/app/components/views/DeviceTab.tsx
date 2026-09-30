@@ -150,15 +150,7 @@ export const SERVICE_SEARCH_LABELS: Record<string, string[]> = {
     'FRS/GMRS/MURS',
     'Racing',
   ],
-  EUR: [
-    'Emergency',
-    'Freenet',
-    'PMR',
-    'Marine',
-    'Aircraft',
-    'CB Radio',
-    'HAM Radio',
-  ],
+  EUR: ['Emergency', 'Freenet', 'PMR', 'Marine', 'Aircraft', 'CB Radio', 'HAM Radio'],
 };
 
 export interface DeviceTabProps {
